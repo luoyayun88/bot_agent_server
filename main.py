@@ -140,19 +140,36 @@ def timeframe_to_seconds(tf: Optional[str]) -> int:
         unit, num = m.group(1).upper(), int(m.group(2))
     return (num * 60) if unit == "M" else (num * 3600)
 
+def _parse_bar_time_string(t: str) -> Optional[datetime]:
+    if not t or not isinstance(t, str):
+        return None
+    t = t.strip()
+    if not t:
+        return None
+    try:
+        iso = t[:-1] + "+00:00" if t.endswith("Z") else t
+        dt = datetime.fromisoformat(iso)
+        return dt.replace(tzinfo=dt.tzinfo or timezone.utc).astimezone(timezone.utc)
+    except Exception:
+        pass
+    for fmt in ("%Y.%m.%d %H:%M:%S", "%Y.%m.%d %H:%M"):
+        try:
+            return datetime.strptime(t, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
 def parse_first_bar_time(payload: Dict[str, Any]) -> Optional[datetime]:
     try:
         bars = payload.get("bars") or []
-        if not bars:
-            return None
-        t = bars[0].get("t")
-        if not t or not isinstance(t, str):
-            return None
-        if t.endswith("Z"):
-            t = t[:-1] + "+00:00"
-        dt = datetime.fromisoformat(t)
-        dt = dt.replace(tzinfo=dt.tzinfo or timezone.utc).astimezone(timezone.utc)
-        return dt
+        if bars and isinstance(bars[0], dict):
+            t = bars[0].get("t")
+            dt = _parse_bar_time_string(t)
+            if dt:
+                return dt
+        meta = payload.get("meta") or {}
+        t_fallback = payload.get("bar1_close_time", meta.get("bar1_close_time"))
+        return _parse_bar_time_string(t_fallback)
     except Exception as e:
         print("⚠️ parse_first_bar_time error:", e)
         return None
@@ -363,6 +380,8 @@ async def evaluate(request: Request):
             payload = parse_json_strict_but_safe(body_bytes)
 
             meta = payload.get("meta") or {}
+            print("Payload keys:", list(payload.keys()))
+            print("Payload meta:", meta)
             gpt_exp = coerce_bool(payload.get("gpt_exp", meta.get("gpt_exp")))
             news_within_90m = payload.get("news_within_90m", meta.get("news_within_90m"))
             if coerce_bool(news_within_90m):
