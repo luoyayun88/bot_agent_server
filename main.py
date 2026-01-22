@@ -284,7 +284,7 @@ def run_neuro_refresh(pid, source_id, table_name, limit):
     vs_name = f"neuro_{source_id}_{ts}"
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        out_path = Path(tmpdir) / f"neuro_{source_id}.jsonl"
+        out_path = Path(tmpdir) / f"neuro_{source_id}.txt"
         row_count = export_neuro_jsonl(db_url, table_name, source_id, limit, out_path)
 
         local_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -298,6 +298,18 @@ def run_neuro_refresh(pid, source_id, table_name, limit):
         old_ids = update_assistant_vector_store(local_client, assistant_id, vector_store.id)
         vs_file_count = get_vector_store_file_count(local_client, vector_store.id)
         print(f"[NEURO_WS] vector store files for assistant {assistant_id}: {vs_file_count}")
+
+    if old_ids:
+        try:
+            vs_api = vector_store_api(local_client)
+            for vs_id in old_ids:
+                try:
+                    vs_api.delete(vector_store_id=vs_id)
+                    print(f"[NEURO_WS] deleted old vector store: {vs_id}")
+                except Exception as del_exc:
+                    print(f"[NEURO_WS] failed to delete old vector store {vs_id}: {del_exc}")
+        except Exception as exc:
+            print(f"[NEURO_WS] delete old vector stores error: {exc}")
 
     return {
         "db_row_count": db_row_count,
