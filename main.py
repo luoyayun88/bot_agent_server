@@ -51,6 +51,9 @@ class NeuroRefreshRequest(BaseModel):
 
 
 def load_db_url(path=NEURO_DB_CONF):
+    env_url = os.getenv("DATABASE_URL", "").strip()
+    if env_url:
+        return env_url
     cfg_path = Path(path)
     if not cfg_path.is_file():
         alt = Path(__file__).resolve().parent / "db.conf"
