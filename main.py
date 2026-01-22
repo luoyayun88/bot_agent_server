@@ -2,13 +2,18 @@ from email.policy import default
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from openai import OpenAI, BadRequestError
-import os, json, traceback, re, threading, asyncio, time
+import os, json, traceback, re, threading, asyncio, time, tempfile
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import psycopg2
+from psycopg2.extras import DictCursor
+from pydantic import BaseModel
 
 app = FastAPI()
 
-CODE_VERSION = "v1.01"
+CODE_VERSION = "v1.02"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -26,6 +31,270 @@ ASSISTANTS_MAP = {
     "m50": m50_KEY, 
     "default": s2_KEY,
 }
+
+# ===================== NEURO REFRESH =====================
+NEURO_DB_CONF = Path(__file__).resolve().parent / "analytics" / "db.conf"
+NEURO_TABLE_DEFAULT = "neuro.gpt_base"
+NEURO_SOURCE_DEFAULT = "s2"
+
+
+class NeuroRefreshRequest(BaseModel):
+    pid: str = "s2"
+    source_id: Optional[str] = None
+    table: str = NEURO_TABLE_DEFAULT
+    limit: Optional[int] = None
+
+
+def load_db_url(path=NEURO_DB_CONF):
+    cfg_path = Path(path)
+    if not cfg_path.is_file():
+        alt = Path(__file__).resolve().parent / "db.conf"
+        cfg_path = alt if alt.is_file() else cfg_path
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("DATABASE_URL="):
+                return line.strip().split("=", 1)[1]
+    raise RuntimeError("DATABASE_URL not found")
+
+
+def split_table_name(value):
+    parts = (value or "").split(".")
+    if len(parts) == 1:
+        return "public", parts[0].lower()
+    if len(parts) == 2:
+        return parts[0].lower(), parts[1].lower()
+    raise ValueError(f"Invalid table name: {value}")
+
+
+def is_safe_ident(value):
+    return bool(re.match(r"^[a-z_][a-z0-9_]*$", value or ""))
+
+
+def ensure_column_exists(cur, schema, table, column):
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND table_name = %s
+          AND column_name = %s
+        """,
+        (schema, table, column),
+    )
+    return cur.fetchone() is not None
+
+
+def format_neuro_text(row):
+    sym = row["sym"] or ""
+    tf = row["tf"] or ""
+    target = row["target"]
+    lcb_hour = row["lcb_hour"]
+    lcb_dow = row["lcb_dow"]
+    rsi_mom = row["rsi_mom"]
+    vol_ratio = row["vol_ratio"]
+    sma_slope = row["sma_slope"]
+    htf_rsi = row["htf_rsi"]
+    desc = (row["description"] or "").strip()
+    header = (
+        f"[{sym} {tf}] target={target} hour={lcb_hour} dow={lcb_dow} "
+        f"rsi_mom={rsi_mom} vol_ratio={vol_ratio} sma_slope={sma_slope} "
+        f"htf_rsi={htf_rsi}."
+    )
+    return f"{header} {desc}".strip()
+
+
+def get_source_row_count(db_url, table_name, source_id):
+    schema, table = split_table_name(table_name)
+    if not is_safe_ident(schema) or not is_safe_ident(table):
+        raise ValueError(f"Unsafe table name: {table_name}")
+    conn = psycopg2.connect(db_url, sslmode="require")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) FROM {schema}.{table} WHERE source_id = %s",
+                (source_id,),
+            )
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def export_neuro_jsonl(db_url, table_name, source_id, limit, out_path):
+    schema, table = split_table_name(table_name)
+    if not is_safe_ident(schema) or not is_safe_ident(table):
+        raise ValueError(f"Unsafe table name: {table_name}")
+
+    conn = psycopg2.connect(db_url, sslmode="require")
+    try:
+        with conn.cursor() as cur:
+            if not ensure_column_exists(cur, schema, table, "source_id"):
+                raise RuntimeError(f"{schema}.{table} missing source_id column")
+
+        query = (
+            f"SELECT sym, tf, target, lcb_hour, lcb_dow, rsi_mom, vol_ratio, "
+            f"sma_slope, htf_rsi, description "
+            f"FROM {schema}.{table} "
+            f"WHERE source_id = %s"
+        )
+        params = [source_id]
+        if limit:
+            query += " LIMIT %s"
+            params.append(limit)
+
+        count = 0
+        with conn.cursor(name="neuro_export", cursor_factory=DictCursor) as cur:
+            cur.itersize = 2000
+            cur.execute(query, params)
+            with open(out_path, "w", encoding="utf-8", newline="") as f:
+                for row in cur:
+                    text = format_neuro_text(row)
+                    doc = {
+                        "text": text,
+                        "metadata": {
+                            "sym": row["sym"],
+                            "tf": row["tf"],
+                            "target": row["target"],
+                            "lcb_hour": row["lcb_hour"],
+                            "lcb_dow": row["lcb_dow"],
+                            "rsi_mom": row["rsi_mom"],
+                            "vol_ratio": row["vol_ratio"],
+                            "sma_slope": row["sma_slope"],
+                            "htf_rsi": row["htf_rsi"],
+                        },
+                    }
+                    f.write(json.dumps(doc, ensure_ascii=True))
+                    f.write("\n")
+                    count += 1
+        return count
+    finally:
+        conn.close()
+
+
+def vector_store_api(client_obj):
+    if hasattr(client_obj, "beta") and hasattr(client_obj.beta, "vector_stores"):
+        return client_obj.beta.vector_stores
+    if hasattr(client_obj, "vector_stores"):
+        return client_obj.vector_stores
+    raise RuntimeError("Vector store API not available in client")
+
+
+def assistant_api(client_obj):
+    if hasattr(client_obj, "beta") and hasattr(client_obj.beta, "assistants"):
+        return client_obj.beta.assistants
+    if hasattr(client_obj, "assistants"):
+        return client_obj.assistants
+    raise RuntimeError("Assistant API not available in client")
+
+
+def attach_file_to_vector_store(client_obj, vector_store_id, file_id):
+    vs_api = vector_store_api(client_obj)
+    if hasattr(vs_api, "file_batches"):
+        fb_api = vs_api.file_batches
+        if hasattr(fb_api, "create_and_poll"):
+            return fb_api.create_and_poll(vector_store_id=vector_store_id, file_ids=[file_id])
+        batch = fb_api.create(vector_store_id=vector_store_id, file_ids=[file_id])
+        return wait_for_batch(fb_api, vector_store_id, batch.id)
+    if hasattr(vs_api, "files"):
+        return vs_api.files.create(vector_store_id=vector_store_id, file_id=file_id)
+    raise RuntimeError("Vector store file attach API not available")
+
+
+def wait_for_batch(fb_api, vector_store_id, batch_id, timeout_s=900, interval_s=2):
+    start = time.time()
+    while True:
+        batch = fb_api.retrieve(vector_store_id=vector_store_id, batch_id=batch_id)
+        status = getattr(batch, "status", None) or batch.get("status", None)
+        if status in ("completed", "failed", "cancelled"):
+            return batch
+        if time.time() - start > timeout_s:
+            raise TimeoutError("Vector store indexing timed out")
+        time.sleep(interval_s)
+
+
+def update_assistant_vector_store(client_obj, assistant_id, vector_store_id):
+    as_api = assistant_api(client_obj)
+    assistant = as_api.retrieve(assistant_id=assistant_id)
+    tool_resources = getattr(assistant, "tool_resources", None) or {}
+    old_ids = []
+    if isinstance(tool_resources, dict):
+        file_search = tool_resources.get("file_search") or {}
+        old_ids = file_search.get("vector_store_ids") or []
+    as_api.update(
+        assistant_id=assistant_id,
+        tool_resources={"file_search": {"vector_store_ids": [vector_store_id]}},
+    )
+    return old_ids
+
+
+def get_vector_store_file_count(client_obj, vector_store_id):
+    vs_api = vector_store_api(client_obj)
+    store = vs_api.retrieve(vector_store_id=vector_store_id)
+    file_counts = getattr(store, "file_counts", None) or {}
+    if isinstance(file_counts, dict):
+        total = file_counts.get("total")
+        if total is not None:
+            return total
+    if hasattr(vs_api, "files"):
+        files_api = vs_api.files
+        total = 0
+        cursor = None
+        while True:
+            if cursor:
+                page = files_api.list(vector_store_id=vector_store_id, after=cursor, limit=100)
+            else:
+                page = files_api.list(vector_store_id=vector_store_id, limit=100)
+            data = getattr(page, "data", None) or page.get("data", [])
+            total += len(data)
+            has_more = getattr(page, "has_more", None)
+            if has_more is None:
+                has_more = page.get("has_more", False)
+            if not has_more:
+                break
+            cursor = data[-1].id if data else None
+            if not cursor:
+                break
+        return total
+    return None
+
+
+def run_neuro_refresh(pid, source_id, table_name, limit):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    assistant_id = assistant_id_for_pid(pid)
+    if not assistant_id:
+        raise RuntimeError(f"Assistant id not configured for pid: {pid}")
+
+    db_url = load_db_url()
+    db_row_count = get_source_row_count(db_url, table_name, source_id)
+    print(f"[NEURO_WS] db rows for {table_name} source_id={source_id}: {db_row_count}")
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    vs_name = f"neuro_{source_id}_{ts}"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = Path(tmpdir) / f"neuro_{source_id}.jsonl"
+        row_count = export_neuro_jsonl(db_url, table_name, source_id, limit, out_path)
+
+        local_client = OpenAI(api_key=OPENAI_API_KEY)
+        vs_api = vector_store_api(local_client)
+        vector_store = vs_api.create(name=vs_name)
+
+        with open(out_path, "rb") as f:
+            file_obj = local_client.files.create(file=f, purpose="assistants")
+        attach_file_to_vector_store(local_client, vector_store.id, file_obj.id)
+
+        old_ids = update_assistant_vector_store(local_client, assistant_id, vector_store.id)
+        vs_file_count = get_vector_store_file_count(local_client, vector_store.id)
+        print(f"[NEURO_WS] vector store files for assistant {assistant_id}: {vs_file_count}")
+
+    return {
+        "db_row_count": db_row_count,
+        "rows": row_count,
+        "assistant_id": assistant_id,
+        "vector_store_id": vector_store.id,
+        "vector_store_file_count": vs_file_count,
+        "old_vector_store_ids": old_ids,
+    }
 
 # ===================== CACHE (GPTarr) =====================
 # Structure: {sym, tf, pid, time (iso), time_dt (UTC), answer, explain, key, ts_added}
@@ -81,16 +350,45 @@ def extract_probability(text: str) -> Optional[float]:
             return None
     return None
 
+def strip_code_fences(text: str) -> str:
+    s = (text or "").replace("\r", "").strip()
+    if s.startswith("```"):
+        first_nl = s.find("\n")
+        if first_nl != -1:
+            s = s[first_nl + 1:]
+        s = s.strip()
+        if s.endswith("```"):
+            s = s[:-3]
+    return s.strip()
+
+def sanitize_explain(explain: Optional[str]) -> Optional[str]:
+    if explain is None:
+        return None
+    s = strip_code_fences(str(explain).strip())
+    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        s = s[1:-1].strip()
+    s = s.replace("\r", " ")
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", s or ""):
+        return None
+    s = s.replace("\\n", " ").replace("\n", " ").strip()
+    return s or None
+
 
 def extract_prob_and_explain(text: str) -> Tuple[Optional[float], Optional[str]]:
     if not text:
         return None, None
-    s = text.strip()
-    if s.startswith("{") and s.endswith("}"):
+    s = strip_code_fences(text.strip())
+    obj_text = s
+    if not (s.startswith("{") and s.endswith("}")):
+        start = s.find("{")
+        end = s.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            obj_text = s[start:end + 1]
+    if obj_text.startswith("{") and obj_text.endswith("}"):
         try:
-            obj = json.loads(s)
+            obj = json.loads(obj_text)
             prob = obj.get("prob") if "prob" in obj else obj.get("probability")
-            explain = obj.get("explain") or obj.get("reason")
+            explain = sanitize_explain(obj.get("explain") or obj.get("reason"))
             if prob is not None:
                 try:
                     prob = float(prob)
@@ -111,19 +409,20 @@ def extract_prob_and_explain(text: str) -> Tuple[Optional[float], Optional[str]]
     explain = None
     m2 = re.search(r"explain\s*[:=]\s*(.+)", s, re.IGNORECASE)
     if m2:
-        explain = m2.group(1).strip()
-        explain = explain.rstrip("}").strip()
-    return prob, explain
+        explain = sanitize_explain(m2.group(1))
+        if explain:
+            explain = explain.rstrip("}").strip()
+    return prob, sanitize_explain(explain)
 
 def fallback_explain_from_text(text: str) -> Optional[str]:
-    s = (text or "").strip()
+    s = strip_code_fences((text or "").strip())
     if not s:
         return None
     s = s.strip("{}").strip()
     s = re.sub(r"(?i)\bprob(?:ability)?\s*[:=]\s*[01](?:\.0+)?\s*[;,\s]*", "", s)
     s = re.sub(r"(?i)\bexplain\s*[:=]\s*", "", s)
     s = s.strip(" ;,")
-    return s or None
+    return sanitize_explain(s or None)
 
 _TF_RE = re.compile(r"^\s*([mMhH])\s*([0-9]+)\s*$")
 
@@ -518,6 +817,15 @@ async def evaluate(request: Request):
         print("❌ Unhandled ERROR:", str(e))
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e), "version": CODE_VERSION})
+
+@app.post("/neuro/refresh")
+async def neuro_refresh(req: NeuroRefreshRequest):
+    source_id = req.source_id or req.pid or NEURO_SOURCE_DEFAULT
+    try:
+        result = await asyncio.to_thread(run_neuro_refresh, req.pid, source_id, req.table, req.limit)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc), "version": CODE_VERSION})
+    return result
 
 @app.get("/", response_class=PlainTextResponse)
 async def root():
