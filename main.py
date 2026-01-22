@@ -7,8 +7,13 @@ from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-import psycopg2
-from psycopg2.extras import DictCursor
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+except Exception as _pg_exc:  # Allow app to start without psycopg2
+    psycopg2 = None
+    DictCursor = None
+    _PSYCOPG2_IMPORT_ERROR = _pg_exc
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -258,6 +263,8 @@ def get_vector_store_file_count(client_obj, vector_store_id):
 
 
 def run_neuro_refresh(pid, source_id, table_name, limit):
+    if psycopg2 is None:
+        raise RuntimeError(f"psycopg2 not available: {_PSYCOPG2_IMPORT_ERROR}")
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set")
     assistant_id = assistant_id_for_pid(pid)
