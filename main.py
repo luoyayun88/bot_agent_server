@@ -313,9 +313,20 @@ def run_neuro_refresh(pid, source_id, table_name, limit):
         files_page = list_vector_store_files(local_client, VS_ID)
         file_items = []
         if files_page is not None:
-            file_items = getattr(files_page, "data", None) or files_page.get("data", [])
+            data_attr = getattr(files_page, "data", None)
+            if data_attr is not None:
+                file_items = data_attr
+            elif isinstance(files_page, dict):
+                file_items = files_page.get("data", [])
+            else:
+                try:
+                    file_items = list(files_page)
+                except Exception:
+                    file_items = []
         for item in file_items:
-            file_id = getattr(item, "id", None) or item.get("id")
+            file_id = getattr(item, "id", None)
+            if not file_id and isinstance(item, dict):
+                file_id = item.get("id")
             if file_id:
                 delete_vector_store_file(local_client, VS_ID, file_id)
 
