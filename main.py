@@ -724,20 +724,27 @@ async def inflight_finish(key: str, result: Tuple[float, str] = None, err: Excep
 def adjust_prompt_for_explain(prompt: str, gpt_exp: bool) -> str:
     if not prompt or not gpt_exp:
         return prompt
-    replacement = 'OUTPUT FORMAT (JSON ONLY): {"prob": 0.00, "explain": "<25 words max>"}'
-    pat1 = r'OUTPUT FORMAT \(JSON ONLY\):\s*\{[^\n]*\}'
+    replacement = 'Output JSON only: {"prob": 0.00, "explain": "<25 words max>"}'
+    pat1 = r'Output JSON only:\s*\{[^\n]*\}'
     if re.search(pat1, prompt):
         return re.sub(pat1, replacement, prompt)
     pat2 = r'OUTPUT FORMAT:\s*\{[^\n]*\}'
     if re.search(pat2, prompt):
         return re.sub(pat2, replacement, prompt)
+    pat3 = r'Output JSON only:\s*\{[^\n]*\}'
+    if re.search(pat3, prompt, flags=re.IGNORECASE):
+        return re.sub(pat3, replacement, prompt, flags=re.IGNORECASE)
     if '{"prob": 0.00}' in prompt:
         return prompt.replace('{"prob": 0.00}', '{"prob": 0.00, "explain": "<25 words max>"}')
+    if '{"prob": number}' in prompt:
+        return prompt.replace('{"prob": number}', '{"prob": 0.00, "explain": "<25 words max>"}')
     return prompt + "\n" + replacement
 
 def run_response(model: str, description_text: str, gpt_exp: bool, pid: Optional[str] = None) -> dict:
     prompt = PROMPT_S2_MA50 or DEFAULT_PROMPT
     prompt = adjust_prompt_for_explain(prompt, gpt_exp)
+    if prompt and ("json" not in prompt.lower()):
+        prompt = prompt + "\nRespond in JSON only."
     user_text = description_text or ""
     input_payload = [{"role": "user", "content": user_text}]
     kwargs = {
