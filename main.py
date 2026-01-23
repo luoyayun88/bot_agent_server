@@ -93,6 +93,7 @@ def ensure_column_exists(cur, schema, table, column):
 
 
 def format_neuro_text(row):
+    pid = row.get("source_id") or ""
     sym = row["sym"] or ""
     tf = row["tf"] or ""
     target = row["target"]
@@ -105,7 +106,7 @@ def format_neuro_text(row):
     htf_rsi = row["htf_rsi"]
     desc = (row["description"] or "").strip()
     header = (
-        f"[{sym} {tf}] target={target} hour={lcb_hour} dow={lcb_dow} "
+        f"[{pid}] [{sym} {tf}] target={target} hour={lcb_hour} dow={lcb_dow} "
         f"dist_sma={dist_sma} rsi_mom={rsi_mom} vol_ratio={vol_ratio} "
         f"sma_slope={sma_slope} htf_rsi={htf_rsi}."
     )
@@ -140,12 +141,12 @@ def export_neuro_jsonl(db_url, table_name, source_id, limit, out_path):
                 raise RuntimeError(f"{schema}.{table} missing source_id column")
 
         query = (
-            f"SELECT sym, tf, target, lcb_hour, lcb_dow, dist_sma, rsi_mom, vol_ratio, "
+            f"SELECT source_id, sym, tf, target, lcb_hour, lcb_dow, dist_sma, rsi_mom, vol_ratio, "
             f"sma_slope, htf_rsi, description "
             f"FROM {schema}.{table} "
-            f"WHERE source_id = %s"
+            # f"WHERE source_id = %s"
         )
-        params = [source_id]
+        params = []
         if limit:
             query += " LIMIT %s"
             params.append(limit)
@@ -160,15 +161,16 @@ def export_neuro_jsonl(db_url, table_name, source_id, limit, out_path):
                     doc = {
                         "text": text,
                         "metadata": {
-                        "sym": row["sym"],
-                        "tf": row["tf"],
-                        "target": row["target"],
-                        "lcb_hour": row["lcb_hour"],
-                        "lcb_dow": row["lcb_dow"],
-                        "dist_sma": row["dist_sma"],
-                        "rsi_mom": row["rsi_mom"],
-                        "vol_ratio": row["vol_ratio"],
-                        "sma_slope": row["sma_slope"],
+                            "pid": row["source_id"],
+                            "sym": row["sym"],
+                            "tf": row["tf"],
+                            "target": row["target"],
+                            "lcb_hour": row["lcb_hour"],
+                            "lcb_dow": row["lcb_dow"],
+                            "dist_sma": row["dist_sma"],
+                            "rsi_mom": row["rsi_mom"],
+                            "vol_ratio": row["vol_ratio"],
+                            "sma_slope": row["sma_slope"],
                             "htf_rsi": row["htf_rsi"],
                         },
                     }
@@ -854,5 +856,4 @@ async def neuro_refresh(req: NeuroRefreshRequest):
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
-
 
