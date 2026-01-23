@@ -72,6 +72,11 @@ class DbWriteRequest(BaseModel):
     table: str
     rows: List[Dict[str, Any]]
 
+class DbDeleteRequest(BaseModel):
+    schema: str
+    table: str
+    where: Dict[str, Any]
+
 
 class NeuroRefreshRequest(BaseModel):
     pid: str = "s2"
@@ -1023,6 +1028,42 @@ async def db_read(req: DbReadRequest, request: Request):
         return {"ok": True, "rows": rows, "count": len(rows), "version": CODE_VERSION}
     finally:
         conn.close()
+
+@app.post("/db/delete")
+async def db_delete(req: DbDeleteRequest, request: Request):
+    auth = require_api_key(request)
+    if auth:
+        return auth
+    if psycopg2 is None:
+        return JSONResponse(status_code=500, content={"error": f"psycopg2 not available: {_PSYCOPG2_IMPORT_ERROR}", "version": CODE_VERSION})
+    schema = (req.schema or "").lower()
+    table = (req.table or "").lower()
+    if not is_safe_ident(schema) or not is_safe_ident(table):
+        return JSONResponse(status_code=400, content={"error": "Invalid schema/table", "version": CODE_VERSION})
+    where = req.where or {}
+    if not isinstance(where, dict) or not where:
+        return JSONResponse(status_code=400, content={"error": "where must be non-empty object", "version": CODE_VERSION})
+
+    clauses = []
+    params = []
+    for k, v in where.items():
+        if not is_safe_ident(k):
+            return JSONResponse(status_code=400, content={"error": "Invalid column in where", "version": CODE_VERSION})
+        if v is None:
+            clauses.append(f"{k} IS NULL")
+        else:
+            clauses.append(f"{k} = %s")
+            params.append(v)
+    sql = f"DELETE FROM {schema}.{table} WHERE " + " AND ".join(clauses)
+    try:
+        conn = psycopg2.connect(load_db_url(), sslmode="require")
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                deleted = cur.rowcount
+        return {"ok": True, "deleted": deleted, "version": CODE_VERSION}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc), "version": CODE_VERSION})
 
 
 @app.post("/db/write")
