@@ -667,6 +667,7 @@ def run_response(model: str, description_text: str) -> str:
         "input": input_text,
         "temperature": 0.1,
         "top_p": 0.1,
+        "max_output_tokens": 80,
     }
     if VS_ID:
         kwargs["tools"] = [{"type": "file_search", "vector_store_ids": [VS_ID]}]
@@ -692,6 +693,37 @@ def auto_heal_and_call(args):
         if "stop" in msg and "Unsupported" in msg:
             args.pop("stop", None)
         return client.chat.completions.create(**args)
+
+
+
+def extract_first_json_object(text: str) -> str:
+    if not text:
+        return ""
+    start = text.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+    return ""
 
 # ===================== ROUTES =====================
 @app.get("/health")
@@ -803,6 +835,9 @@ async def evaluate(request: Request):
         try:
             reply = await asyncio.to_thread(run_response, model, description_text)
             reply = (reply or "").strip()
+            reply_json = extract_first_json_object(reply)
+            if reply_json:
+                reply = reply_json
             explain = ""
             if gpt_exp:
                 prob, explain = extract_prob_and_explain(reply)
