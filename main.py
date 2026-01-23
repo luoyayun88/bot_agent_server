@@ -33,7 +33,7 @@ STRICT_FAIL_ON_UNPARSABLE = os.getenv("STRICT_FAIL_ON_UNPARSABLE", "0").strip() 
 # ===================== ASSISTANTS (pid -> assistant_id) =====================
 ASSISTANTS_MAP = {
     "s2": s2_KEY,
-    "m50": m50_KEY, 
+    "m50": s2_KEY, 
     "default": s2_KEY,
 }
 
@@ -854,4 +854,5 @@ async def neuro_refresh(req: NeuroRefreshRequest):
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
+
 
