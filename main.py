@@ -29,6 +29,8 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+PROMPT_S2_MA50 = os.getenv("PROMT_S2_MA50", "").strip()
+VS_ID = os.getenv("VS_ID", "").strip()
 
 
 
@@ -217,6 +219,20 @@ def attach_file_to_vector_store(client_obj, vector_store_id, file_id):
     raise RuntimeError("Vector store file attach API not available")
 
 
+def list_vector_store_files(client_obj, vector_store_id):
+    vs_api = vector_store_api(client_obj)
+    if hasattr(vs_api, "files") and hasattr(vs_api.files, "list"):
+        return vs_api.files.list(vector_store_id=vector_store_id, limit=100)
+    return None
+
+
+def delete_vector_store_file(client_obj, vector_store_id, file_id):
+    vs_api = vector_store_api(client_obj)
+    if hasattr(vs_api, "files") and hasattr(vs_api.files, "delete"):
+        return vs_api.files.delete(vector_store_id=vector_store_id, file_id=file_id)
+    return None
+
+
 def wait_for_batch(fb_api, vector_store_id, batch_id, timeout_s=900, interval_s=2):
     start = time.time()
     while True:
@@ -280,16 +296,12 @@ def run_neuro_refresh(pid, source_id, table_name, limit):
         raise RuntimeError(f"psycopg2 not available: {_PSYCOPG2_IMPORT_ERROR}")
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set")
-    assistant_id = assistant_id_for_pid(pid)
-    if not assistant_id:
-        raise RuntimeError(f"Assistant id not configured for pid: {pid}")
+    if not VS_ID:
+        raise RuntimeError("VS_ID is not set")
 
     db_url = load_db_url()
     db_row_count = get_source_row_count(db_url, table_name, source_id)
     print(f"[NEURO_WS] db rows for {table_name} source_id={source_id}: {db_row_count}")
-
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    vs_name = f"neuro_{source_id}_{ts}"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out_path = Path(tmpdir) / f"neuro_{source_id}.txt"
@@ -297,39 +309,29 @@ def run_neuro_refresh(pid, source_id, table_name, limit):
 
         local_client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-
-
         vs_api = vector_store_api(local_client)
-        vector_store = vs_api.create(name=vs_name)
+        files_page = list_vector_store_files(local_client, VS_ID)
+        file_items = []
+        if files_page is not None:
+            file_items = getattr(files_page, "data", None) or files_page.get("data", [])
+        for item in file_items:
+            file_id = getattr(item, "id", None) or item.get("id")
+            if file_id:
+                delete_vector_store_file(local_client, VS_ID, file_id)
 
         with open(out_path, "rb") as f:
             file_obj = local_client.files.create(file=f, purpose="assistants")
-        attach_file_to_vector_store(local_client, vector_store.id, file_obj.id)
-
-        old_ids = update_assistant_vector_store(local_client, assistant_id, vector_store.id)
-        vs_file_count = get_vector_store_file_count(local_client, vector_store.id)
-        print(f"[NEURO_WS] vector store files for assistant {assistant_id}: {vs_file_count}")
-
-    if old_ids:
-        try:
-            vs_api = vector_store_api(local_client)
-            for vs_id in old_ids:
-                try:
-                    vs_api.delete(vector_store_id=vs_id)
-                    print(f"[NEURO_WS] deleted old vector store: {vs_id}")
-                except Exception as del_exc:
-                    print(f"[NEURO_WS] failed to delete old vector store {vs_id}: {del_exc}")
-        except Exception as exc:
-            print(f"[NEURO_WS] delete old vector stores error: {exc}")
+        attach_file_to_vector_store(local_client, VS_ID, file_obj.id)
+        vs_file_count = get_vector_store_file_count(local_client, VS_ID)
+        print(f"[NEURO_WS] vector store files for VS_ID={VS_ID}: {vs_file_count}")
 
     return {
         "db_row_count": db_row_count,
         "rows": row_count,
-        "assistant_id": assistant_id,
-        "vector_store_id": vector_store.id,
+        "assistant_id": None,
+        "vector_store_id": VS_ID,
         "vector_store_file_count": vs_file_count,
-        "old_vector_store_ids": old_ids,
+        "old_vector_store_ids": [],
     }
 
 # ===================== CACHE (GPTarr) =====================
@@ -646,10 +648,20 @@ async def inflight_finish(key: str, result: Tuple[float, str] = None, err: Excep
 
 # ===================== ASSISTANT CALLERS =====================
 def run_response(model: str, description_text: str) -> str:
-    response = client.responses.create(
-        model=model,
-        input=description_text or "",
-    )
+    input_text = description_text or ""
+    if PROMPT_S2_MA50:
+        input_text = f"{PROMPT_S2_MA50}\n\n{input_text}".strip()
+    kwargs = {
+        "model": model,
+        "input": input_text,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
+        "top_p": 0.1,
+    }
+    if VS_ID:
+        kwargs["tools"] = [{"type": "file_search"}]
+        kwargs["tool_resources"] = {"file_search": {"vector_store_ids": [VS_ID]}}
+    response = client.responses.create(**kwargs)
     return (getattr(response, "output_text", "") or "").strip()
 
 def auto_heal_and_call(args):
