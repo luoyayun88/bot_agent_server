@@ -669,8 +669,7 @@ def run_response(model: str, description_text: str) -> str:
         "top_p": 0.1,
     }
     if VS_ID:
-        kwargs["tools"] = [{"type": "file_search"}]
-        kwargs["tool_resources"] = {"file_search": {"vector_store_ids": [VS_ID]}}
+        kwargs["tools"] = [{"type": "file_search", "vector_store_ids": [VS_ID]}]
     response = client.responses.create(**kwargs)
     return (getattr(response, "output_text", "") or "").strip()
 
