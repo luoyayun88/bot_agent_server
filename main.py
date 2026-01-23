@@ -845,8 +845,7 @@ async def evaluate(request: Request):
             msg = "Missing description for assistant call"
             return JSONResponse(status_code=400, content={"error": msg, "version": CODE_VERSION})
         try:
-            payload_text = json.dumps(payload, ensure_ascii=True)
-            reply = await asyncio.to_thread(run_response, model, payload_text)
+            reply = await asyncio.to_thread(run_response, model, description_text)
             reply = (reply or "").strip()
             reply_json = extract_first_json_object(reply)
             if reply_json:
