@@ -28,6 +28,12 @@ if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY is not set. The /evaluate route will fail until it is provided.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+
+
+
+
 STRICT_FAIL_ON_UNPARSABLE = os.getenv("STRICT_FAIL_ON_UNPARSABLE", "0").strip() == "1"
 
 # ===================== ASSISTANTS (pid -> assistant_id) =====================
@@ -290,6 +296,10 @@ def run_neuro_refresh(pid, source_id, table_name, limit):
         row_count = export_neuro_jsonl(db_url, table_name, source_id, limit, out_path)
 
         local_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+
+
         vs_api = vector_store_api(local_client)
         vector_store = vs_api.create(name=vs_name)
 
@@ -635,38 +645,12 @@ async def inflight_finish(key: str, result: Tuple[float, str] = None, err: Excep
             fut.set_result(result)
 
 # ===================== ASSISTANT CALLERS =====================
-def run_assistant(assistant_id: str, description_text: str) -> str:
-    run = client.beta.threads.create_and_run(
-        assistant_id=assistant_id,
-        thread={
-            "messages": [
-                {"role": "user", "content": description_text or ""}
-            ]
-        }
+def run_response(model: str, description_text: str) -> str:
+    response = client.responses.create(
+        model=model,
+        input=description_text or "",
     )
-
-    thread_id = run.thread_id
-    run_id = run.id
-    status = run.status
-    for _ in range(60):
-        if status in ("completed", "failed", "cancelled", "expired"):
-            break
-        time.sleep(0.5)
-        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
-        status = run.status
-
-    if status != "completed":
-        raise RuntimeError(f"Assistant run not completed: {status}")
-
-    messages = client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=1)
-    if not messages.data:
-        return ""
-    msg = messages.data[0]
-    parts = []
-    for part in msg.content or []:
-        if getattr(part, "type", "") == "text" and getattr(part, "text", None):
-            parts.append(part.text.value)
-    return "".join(parts).strip()
+    return (getattr(response, "output_text", "") or "").strip()
 
 def auto_heal_and_call(args):
     try:
@@ -791,15 +775,12 @@ async def evaluate(request: Request):
         compact_json = coerce_bool(payload.get("description", meta.get("description")))
         description_text = "" if description_raw is None else str(description_raw)
 
-        assistant_id = assistant_id_for_pid(pid)
-        if not assistant_id:
-            msg = f"Assistant ID not configured for pid={pid!r}"
-            return JSONResponse(status_code=500, content={"error": msg, "version": CODE_VERSION})
+        model = DEFAULT_MODEL
         if not description_text:
             msg = "Missing description for assistant call"
             return JSONResponse(status_code=400, content={"error": msg, "version": CODE_VERSION})
         try:
-            reply = await asyncio.to_thread(run_assistant, assistant_id, description_text)
+            reply = await asyncio.to_thread(run_response, model, description_text)
             reply = (reply or "").strip()
             explain = ""
             if gpt_exp:
