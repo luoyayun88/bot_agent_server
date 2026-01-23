@@ -9,7 +9,7 @@ from pathlib import Path
 
 try:
     import psycopg2
-    from psycopg2.extras import DictCursor
+    from psycopg2.extras import DictCursor, execute_values
 except Exception as _pg_exc:  # Allow app to start without psycopg2
     psycopg2 = None
     DictCursor = None
@@ -31,6 +31,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 PROMPT_S2_MA50 = os.getenv("PROMT_S2_MA50", "").strip()
 VS_ID = os.getenv("VS_ID", "").strip()
+DB_API_KEY = os.getenv("DB_API_KEY", "").strip()
 
 DEFAULT_PROMPT = ("OUTPUT REQUIREMENTS:\n"
 "- Return ONLY a valid JSON object.\n"
@@ -57,6 +58,19 @@ ASSISTANTS_MAP = {
 NEURO_DB_CONF = Path(__file__).resolve().parent / "analytics" / "db.conf"
 NEURO_TABLE_DEFAULT = "neuro.gpt_base"
 NEURO_SOURCE_DEFAULT = "s2"
+
+
+class DbReadRequest(BaseModel):
+    schema: str
+    table: str
+    where: Optional[Dict[str, Any]] = None
+    limit: Optional[int] = None
+
+
+class DbWriteRequest(BaseModel):
+    schema: str
+    table: str
+    rows: List[Dict[str, Any]]
 
 
 class NeuroRefreshRequest(BaseModel):
@@ -92,6 +106,47 @@ def split_table_name(value):
 
 def is_safe_ident(value):
     return bool(re.match(r"^[a-z_][a-z0-9_]*$", value or ""))
+
+
+def require_api_key(request: Request):
+    if not DB_API_KEY:
+        return None
+    key = request.headers.get("X-API-Key", "")
+    if key != DB_API_KEY:
+        return JSONResponse(status_code=401, content={"error": "unauthorized", "version": CODE_VERSION})
+    return None
+
+
+def infer_pg_type(value):
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "integer"
+    if isinstance(value, float):
+        return "double precision"
+    return "text"
+
+
+def ensure_table_for_rows(conn, schema, table, columns, sample_row):
+    if not is_safe_ident(schema) or not is_safe_ident(table):
+        raise ValueError("Unsafe table name")
+    col_defs = []
+    for col in columns:
+        if not is_safe_ident(col):
+            raise ValueError("Unsafe column name")
+        col_type = infer_pg_type(sample_row.get(col))
+        col_defs.append(f"{col} {col_type}")
+    create_sql = f"""
+    CREATE SCHEMA IF NOT EXISTS {schema};
+    CREATE TABLE IF NOT EXISTS {schema}.{table} (
+        {', '.join(col_defs)}
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(create_sql)
+        for col in columns:
+            col_type = infer_pg_type(sample_row.get(col))
+            cur.execute(f"ALTER TABLE {schema}.{table} ADD COLUMN IF NOT EXISTS {col} {col_type}")
 
 
 def ensure_column_exists(cur, schema, table, column):
@@ -666,8 +721,23 @@ async def inflight_finish(key: str, result: Tuple[float, str] = None, err: Excep
             fut.set_result(result)
 
 # ===================== ASSISTANT CALLERS =====================
-def run_response(model: str, description_text: str) -> str:
+def adjust_prompt_for_explain(prompt: str, gpt_exp: bool) -> str:
+    if not prompt or not gpt_exp:
+        return prompt
+    replacement = 'OUTPUT FORMAT (JSON ONLY): {"prob": 0.00, "explain": "<25 words max>"}'
+    pat1 = r'OUTPUT FORMAT \(JSON ONLY\):\s*\{[^\n]*\}'
+    if re.search(pat1, prompt):
+        return re.sub(pat1, replacement, prompt)
+    pat2 = r'OUTPUT FORMAT:\s*\{[^\n]*\}'
+    if re.search(pat2, prompt):
+        return re.sub(pat2, replacement, prompt)
+    if '{"prob": 0.00}' in prompt:
+        return prompt.replace('{"prob": 0.00}', '{"prob": 0.00, "explain": "<25 words max>"}')
+    return prompt + "\n" + replacement
+
+def run_response(model: str, description_text: str, gpt_exp: bool) -> str:
     prompt = PROMPT_S2_MA50 or DEFAULT_PROMPT
+    prompt = adjust_prompt_for_explain(prompt, gpt_exp)
     user_text = description_text or ""
     input_payload = []
     if prompt:
@@ -845,7 +915,7 @@ async def evaluate(request: Request):
             msg = "Missing description for assistant call"
             return JSONResponse(status_code=400, content={"error": msg, "version": CODE_VERSION})
         try:
-            reply = await asyncio.to_thread(run_response, model, description_text)
+            reply = await asyncio.to_thread(run_response, model, description_text, gpt_exp)
             reply = (reply or "").strip()
             reply_json = extract_first_json_object(reply)
             if reply_json:
@@ -894,6 +964,91 @@ async def evaluate(request: Request):
         print("❌ Unhandled ERROR:", str(e))
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e), "version": CODE_VERSION})
+
+@app.post("/db/read")
+async def db_read(req: DbReadRequest, request: Request):
+    auth = require_api_key(request)
+    if auth:
+        return auth
+    if psycopg2 is None:
+        return JSONResponse(status_code=500, content={"error": f"psycopg2 not available: {_PSYCOPG2_IMPORT_ERROR}", "version": CODE_VERSION})
+    schema = (req.schema or "").lower()
+    table = (req.table or "").lower()
+    if not is_safe_ident(schema) or not is_safe_ident(table):
+        return JSONResponse(status_code=400, content={"error": "Invalid schema/table", "version": CODE_VERSION})
+    where = req.where or {}
+    if where and not isinstance(where, dict):
+        return JSONResponse(status_code=400, content={"error": "where must be object", "version": CODE_VERSION})
+
+    sql = f"SELECT * FROM {schema}.{table}"
+    params = []
+    if where:
+        clauses = []
+        for k, v in where.items():
+            if not is_safe_ident(k):
+                return JSONResponse(status_code=400, content={"error": "Invalid column in where", "version": CODE_VERSION})
+            if v is None:
+                clauses.append(f"{k} IS NULL")
+            else:
+                clauses.append(f"{k} = %s")
+                params.append(v)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+    if req.limit:
+        sql += " LIMIT %s"
+        params.append(req.limit)
+
+    conn = psycopg2.connect(load_db_url(), sslmode="require")
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(sql, params)
+            rows = [dict(r) for r in cur.fetchall()]
+        return {"ok": True, "rows": rows, "count": len(rows), "version": CODE_VERSION}
+    finally:
+        conn.close()
+
+
+@app.post("/db/write")
+async def db_write(req: DbWriteRequest, request: Request):
+    auth = require_api_key(request)
+    if auth:
+        return auth
+    if psycopg2 is None:
+        return JSONResponse(status_code=500, content={"error": f"psycopg2 not available: {_PSYCOPG2_IMPORT_ERROR}", "version": CODE_VERSION})
+    schema = (req.schema or "").lower()
+    table = (req.table or "").lower()
+    if not is_safe_ident(schema) or not is_safe_ident(table):
+        return JSONResponse(status_code=400, content={"error": "Invalid schema/table", "version": CODE_VERSION})
+    rows = req.rows or []
+    if not rows:
+        return JSONResponse(status_code=400, content={"error": "rows is empty", "version": CODE_VERSION})
+    if not isinstance(rows, list) or not isinstance(rows[0], dict):
+        return JSONResponse(status_code=400, content={"error": "rows must be list of objects", "version": CODE_VERSION})
+
+    columns = list(rows[0].keys())
+    for col in columns:
+        if not is_safe_ident(col):
+            return JSONResponse(status_code=400, content={"error": "Invalid column name", "version": CODE_VERSION})
+    for r in rows:
+        if set(r.keys()) != set(columns):
+            return JSONResponse(status_code=400, content={"error": "All rows must have same columns", "version": CODE_VERSION})
+
+    conn = psycopg2.connect(load_db_url(), sslmode="require")
+    conn.autocommit = False
+    try:
+        ensure_table_for_rows(conn, schema, table, columns, rows[0])
+        sql = f"INSERT INTO {schema}.{table} ({', '.join(columns)}) VALUES %s"
+        values = [[r.get(c) for c in columns] for r in rows]
+        with conn.cursor() as cur:
+            execute_values(cur, sql, values, page_size=min(len(values), 1000))
+        conn.commit()
+        return {"ok": True, "inserted": len(values), "version": CODE_VERSION}
+    except Exception as exc:
+        conn.rollback()
+        return JSONResponse(status_code=500, content={"error": str(exc), "version": CODE_VERSION})
+    finally:
+        conn.close()
+
 
 @app.post("/neuro/refresh")
 async def neuro_refresh(req: NeuroRefreshRequest):
