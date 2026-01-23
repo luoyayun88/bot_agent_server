@@ -665,7 +665,6 @@ def run_response(model: str, description_text: str) -> str:
     kwargs = {
         "model": model,
         "input": input_text,
-        "response_format": {"type": "json_object"},
         "temperature": 0.1,
         "top_p": 0.1,
     }
