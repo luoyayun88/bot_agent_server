@@ -735,16 +735,14 @@ def adjust_prompt_for_explain(prompt: str, gpt_exp: bool) -> str:
         return prompt.replace('{"prob": 0.00}', '{"prob": 0.00, "explain": "<25 words max>"}')
     return prompt + "\n" + replacement
 
-def run_response(model: str, description_text: str, gpt_exp: bool) -> str:
+def run_response(model: str, description_text: str, gpt_exp: bool, pid: Optional[str] = None) -> dict:
     prompt = PROMPT_S2_MA50 or DEFAULT_PROMPT
     prompt = adjust_prompt_for_explain(prompt, gpt_exp)
     user_text = description_text or ""
-    input_payload = []
-    if prompt:
-        input_payload.append({"role": "system", "content": prompt})
-    input_payload.append({"role": "user", "content": user_text})
+    input_payload = [{"role": "user", "content": user_text}]
     kwargs = {
         "model": model,
+        "instructions": prompt,
         "input": input_payload,
         "text": {"format": {"type": "json_object"}},
         "temperature": 0.1,
@@ -752,9 +750,20 @@ def run_response(model: str, description_text: str, gpt_exp: bool) -> str:
         "max_output_tokens": 80,
     }
     if VS_ID:
-        kwargs["tools"] = [{"type": "file_search", "vector_store_ids": [VS_ID]}]
+        tool = {
+            "type": "file_search",
+            "vector_store_ids": [VS_ID],
+            "max_num_results": 3,
+        }
+        if pid:
+            tool["filters"] = {"type": "in", "key": "pid", "value": [pid]}
+        kwargs["tools"] = [tool]
     response = client.responses.create(**kwargs)
-    return (getattr(response, "output_text", "") or "").strip()
+    text = (getattr(response, "output_text", "") or "").strip()
+    try:
+        return json.loads(text) if text else {}
+    except Exception:
+        return {}
 
 def auto_heal_and_call(args):
     try:
@@ -915,18 +924,17 @@ async def evaluate(request: Request):
             msg = "Missing description for assistant call"
             return JSONResponse(status_code=400, content={"error": msg, "version": CODE_VERSION})
         try:
-            reply = await asyncio.to_thread(run_response, model, description_text, gpt_exp)
-            reply = (reply or "").strip()
-            reply_json = extract_first_json_object(reply)
-            if reply_json:
-                reply = reply_json
-            else:
-                reply = "{\"prob\": 0.5, \"explain\": \"format_error\"}"
+            reply_obj = await asyncio.to_thread(run_response, model, description_text, gpt_exp, pid)
             explain = ""
-            if gpt_exp:
-                prob, explain = extract_prob_and_explain(reply)
+            prob = None
+            if isinstance(reply_obj, dict):
+                prob = reply_obj.get("prob")
+                if prob is None:
+                    prob = reply_obj.get("probability")
+                if gpt_exp:
+                    explain = sanitize_explain(reply_obj.get("explain")) or ""
             else:
-                prob = extract_probability(reply)
+                reply_obj = {}
 
             if prob is None:
                 msg = "Assistant did not return a numeric probability"
@@ -938,9 +946,9 @@ async def evaluate(request: Request):
 
             prob = min(1.0, max(0.0, float(prob)))
             if gpt_exp and not explain:
-                explain = fallback_explain_from_text(reply) or ""
+                explain = ""
             if gpt_exp:
-                print(f"Assistant reply raw: {reply}")
+                print(f"Assistant reply raw: {json.dumps(reply_obj, ensure_ascii=True)}")
                 # print(f"GPT explain parsed: {explain!r}")
             stored_key = add_cache_record(payload, prob, explain or "")
             await inflight_finish(prox_key, result=(prob, explain or ""))
