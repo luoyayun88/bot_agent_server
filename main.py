@@ -32,6 +32,14 @@ DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 PROMPT_S2_MA50 = os.getenv("PROMT_S2_MA50", "").strip()
 VS_ID = os.getenv("VS_ID", "").strip()
 
+DEFAULT_PROMPT = ("OUTPUT REQUIREMENTS:\n"
+"- Return ONLY a valid JSON object.\n"
+"- \"prob\": A float between 0.0 and 1.0.\n"
+"- \"explain\": One short sentence (max 18 words).\n"
+"OUTPUT FORMAT:\n"
+"{\"prob\": <float 0.0 to 1.0>, \"explain\": \"<string>\"}\n"
+"If you cannot comply, return: {\"prob\": 0.5, \"explain\": \"format_error\"}" )
+
 
 
 
@@ -659,12 +667,16 @@ async def inflight_finish(key: str, result: Tuple[float, str] = None, err: Excep
 
 # ===================== ASSISTANT CALLERS =====================
 def run_response(model: str, description_text: str) -> str:
-    input_text = description_text or ""
-    if PROMPT_S2_MA50:
-        input_text = f"{PROMPT_S2_MA50}\n\n{input_text}".strip()
+    prompt = PROMPT_S2_MA50 or DEFAULT_PROMPT
+    user_text = description_text or ""
+    input_payload = []
+    if prompt:
+        input_payload.append({"role": "system", "content": prompt})
+    input_payload.append({"role": "user", "content": user_text})
     kwargs = {
         "model": model,
-        "input": input_text,
+        "input": input_payload,
+        "response_format": {"type": "json_object"},
         "temperature": 0.1,
         "top_p": 0.1,
         "max_output_tokens": 80,
@@ -833,11 +845,14 @@ async def evaluate(request: Request):
             msg = "Missing description for assistant call"
             return JSONResponse(status_code=400, content={"error": msg, "version": CODE_VERSION})
         try:
-            reply = await asyncio.to_thread(run_response, model, description_text)
+            payload_text = json.dumps(payload, ensure_ascii=True)
+            reply = await asyncio.to_thread(run_response, model, payload_text)
             reply = (reply or "").strip()
             reply_json = extract_first_json_object(reply)
             if reply_json:
                 reply = reply_json
+            else:
+                reply = "{\"prob\": 0.5, \"explain\": \"format_error\"}"
             explain = ""
             if gpt_exp:
                 prob, explain = extract_prob_and_explain(reply)
