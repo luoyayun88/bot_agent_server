@@ -746,6 +746,8 @@ def run_response(model: str, description_text: str, gpt_exp: bool, pid: Optional
     if prompt and ("json" not in prompt.lower()):
         prompt = prompt + "\nRespond in JSON only."
     user_text = description_text or ""
+    if "json" not in user_text.lower():
+        user_text = "JSON ONLY. " + user_text
     input_payload = [{"role": "user", "content": user_text}]
     kwargs = {
         "model": model,
