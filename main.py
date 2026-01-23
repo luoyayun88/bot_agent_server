@@ -710,7 +710,7 @@ def extract_first_json_object(text: str) -> str:
         if in_str:
             if esc:
                 esc = False
-            elif ch == "\":
+            elif ch == "\\":
                 esc = True
             elif ch == '"':
                 in_str = False
