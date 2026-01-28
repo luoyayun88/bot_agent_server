@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-CODE_VERSION = "v1.02"
+CODE_VERSION = "v1.03"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -32,6 +32,8 @@ DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 PROMPT_S2_MA50 = os.getenv("PROMT_S2_MA50", "").strip()
 VS_ID = os.getenv("VS_ID", "").strip()
 DB_API_KEY = os.getenv("DB_API_KEY", "").strip()
+USE_VECTOR_DB = os.getenv("USE_VECTOR_DB", "0").strip().lower() in ("1", "true", "yes")
+print(f"USE_VECTOR_DB={'ON' if USE_VECTOR_DB else 'OFF'}")
 
 DEFAULT_PROMPT = ("OUTPUT REQUIREMENTS:\n"
 "- Return ONLY a valid JSON object.\n"
@@ -65,6 +67,8 @@ class DbReadRequest(BaseModel):
     table: str
     where: Optional[Dict[str, Any]] = None
     limit: Optional[int] = None
+    order_by: Optional[str] = None
+    order_dir: Optional[str] = None
 
 
 class DbWriteRequest(BaseModel):
@@ -763,7 +767,7 @@ def run_response(model: str, description_text: str, gpt_exp: bool, pid: Optional
         "top_p": 0.1,
         "max_output_tokens": 80,
     }
-    if VS_ID:
+    if USE_VECTOR_DB and VS_ID:
         tool = {
             "type": "file_search",
             "vector_store_ids": [VS_ID],
@@ -1016,6 +1020,14 @@ async def db_read(req: DbReadRequest, request: Request):
                 params.append(v)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
+    if req.order_by:
+        order_by = (req.order_by or "").lower()
+        if not is_safe_ident(order_by):
+            return JSONResponse(status_code=400, content={"error": "Invalid order_by", "version": CODE_VERSION})
+        order_dir = (req.order_dir or "desc").lower()
+        if order_dir not in ("asc", "desc"):
+            return JSONResponse(status_code=400, content={"error": "Invalid order_dir", "version": CODE_VERSION})
+        sql += f" ORDER BY {order_by} {order_dir}"
     if req.limit:
         sql += " LIMIT %s"
         params.append(req.limit)
