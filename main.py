@@ -69,17 +69,20 @@ class DbReadRequest(BaseModel):
     limit: Optional[int] = None
     order_by: Optional[str] = None
     order_dir: Optional[str] = None
+    db_mode: Optional[str] = None
 
 
 class DbWriteRequest(BaseModel):
     schema: str
     table: str
     rows: List[Dict[str, Any]]
+    db_mode: Optional[str] = None
 
 class DbDeleteRequest(BaseModel):
     schema: str
     table: str
     where: Dict[str, Any]
+    db_mode: Optional[str] = None
 
 
 class NeuroRefreshRequest(BaseModel):
@@ -87,12 +90,18 @@ class NeuroRefreshRequest(BaseModel):
     source_id: Optional[str] = None
     table: str = NEURO_TABLE_DEFAULT
     limit: Optional[int] = None
+    db_mode: Optional[str] = None
 
 
-def load_db_url(path=NEURO_DB_CONF):
+def resolve_db_url(path=NEURO_DB_CONF, db_mode: Optional[str] = None):
+    mode = (db_mode or "").strip().lower()
+    if mode == "test":
+        env_url = os.getenv("TSTDATABASE_URL", "").strip()
+        if env_url:
+            return env_url, "test_env"
     env_url = os.getenv("DATABASE_URL", "").strip()
     if env_url:
-        return env_url
+        return env_url, "prod_env"
     cfg_path = Path(path)
     if not cfg_path.is_file():
         alt = Path(__file__).resolve().parent / "db.conf"
@@ -100,8 +109,13 @@ def load_db_url(path=NEURO_DB_CONF):
     with open(cfg_path, "r", encoding="utf-8") as f:
         for line in f:
             if line.startswith("DATABASE_URL="):
-                return line.strip().split("=", 1)[1]
+                return line.strip().split("=", 1)[1], "prod_file"
     raise RuntimeError("DATABASE_URL not found")
+
+
+def load_db_url(path=NEURO_DB_CONF, db_mode: Optional[str] = None):
+    url, _ = resolve_db_url(path=path, db_mode=db_mode)
+    return url
 
 
 def split_table_name(value):
@@ -363,7 +377,7 @@ def get_vector_store_file_count(client_obj, vector_store_id):
     return None
 
 
-def run_neuro_refresh(pid, source_id, table_name, limit):
+def run_neuro_refresh(pid, source_id, table_name, limit, db_mode: Optional[str] = None):
     if psycopg2 is None:
         raise RuntimeError(f"psycopg2 not available: {_PSYCOPG2_IMPORT_ERROR}")
     if not OPENAI_API_KEY:
@@ -371,7 +385,7 @@ def run_neuro_refresh(pid, source_id, table_name, limit):
     if not VS_ID:
         raise RuntimeError("VS_ID is not set")
 
-    db_url = load_db_url()
+    db_url = load_db_url(db_mode=db_mode)
     db_row_count = get_source_row_count(db_url, table_name, source_id)
     print(f"[NEURO_WS] db rows for {table_name} source_id={source_id}: {db_row_count}")
 
@@ -1032,7 +1046,9 @@ async def db_read(req: DbReadRequest, request: Request):
         sql += " LIMIT %s"
         params.append(req.limit)
 
-    conn = psycopg2.connect(load_db_url(), sslmode="require")
+    db_url, db_label = resolve_db_url(db_mode=req.db_mode)
+    print(f"[DB] read mode={req.db_mode or 'prod'} resolved={db_label}")
+    conn = psycopg2.connect(db_url, sslmode="require")
     try:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute(sql, params)
@@ -1068,7 +1084,9 @@ async def db_delete(req: DbDeleteRequest, request: Request):
             params.append(v)
     sql = f"DELETE FROM {schema}.{table} WHERE " + " AND ".join(clauses)
     try:
-        conn = psycopg2.connect(load_db_url(), sslmode="require")
+        db_url, db_label = resolve_db_url(db_mode=req.db_mode)
+        print(f"[DB] delete mode={req.db_mode or 'prod'} resolved={db_label}")
+        conn = psycopg2.connect(db_url, sslmode="require")
         with conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
@@ -1103,7 +1121,9 @@ async def db_write(req: DbWriteRequest, request: Request):
         if set(r.keys()) != set(columns):
             return JSONResponse(status_code=400, content={"error": "All rows must have same columns", "version": CODE_VERSION})
 
-    conn = psycopg2.connect(load_db_url(), sslmode="require")
+    db_url, db_label = resolve_db_url(db_mode=req.db_mode)
+    print(f"[DB] write mode={req.db_mode or 'prod'} resolved={db_label}")
+    conn = psycopg2.connect(db_url, sslmode="require")
     conn.autocommit = False
     try:
         ensure_table_for_rows(conn, schema, table, columns, rows[0])
@@ -1124,7 +1144,7 @@ async def db_write(req: DbWriteRequest, request: Request):
 async def neuro_refresh(req: NeuroRefreshRequest):
     source_id = req.source_id or req.pid or NEURO_SOURCE_DEFAULT
     try:
-        result = await asyncio.to_thread(run_neuro_refresh, req.pid, source_id, req.table, req.limit)
+        result = await asyncio.to_thread(run_neuro_refresh, req.pid, source_id, req.table, req.limit, req.db_mode)
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc), "version": CODE_VERSION})
     return result
