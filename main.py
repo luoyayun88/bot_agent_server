@@ -30,6 +30,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 PROMPT_S2_MA50 = os.getenv("PROMT_S2_MA50", "").strip()
+MAXTOKENS = int(os.getenv("MAXTOKENS", "80") or "80")
 VS_ID = os.getenv("VS_ID", "").strip()
 DB_API_KEY = os.getenv("DB_API_KEY", "").strip()
 USE_VECTOR_DB = os.getenv("USE_VECTOR_DB", "0").strip().lower() in ("1", "true", "yes")
@@ -779,7 +780,7 @@ def run_response(model: str, description_text: str, gpt_exp: bool, pid: Optional
         "text": {"format": {"type": "json_object"}},
         "temperature": 0.1,
         "top_p": 0.1,
-        "max_output_tokens": 80,
+        "max_output_tokens": MAXTOKENS,
     }
     if USE_VECTOR_DB and VS_ID:
         tool = {
