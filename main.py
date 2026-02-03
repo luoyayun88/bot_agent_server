@@ -31,6 +31,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 PROMPT_S2_MA50 = os.getenv("PROMT_S2_MA50", "").strip()
 MAXTOKENS = int(os.getenv("MAXTOKENS", "80") or "80")
+USE_DEFAULT_PROMPT_JSON = os.getenv("USE_DEFAULT_PROMPT_JSON", "1").strip().lower() not in ("0", "false", "no")
 VS_ID = os.getenv("VS_ID", "").strip()
 DB_API_KEY = os.getenv("DB_API_KEY", "").strip()
 USE_VECTOR_DB = os.getenv("USE_VECTOR_DB", "0").strip().lower() in ("1", "true", "yes")
@@ -43,6 +44,8 @@ DEFAULT_PROMPT = ("OUTPUT REQUIREMENTS:\n"
 "OUTPUT FORMAT:\n"
 "{\"prob\": <float 0.0 to 1.0>, \"explain\": \"<string>\"}\n"
 "If you cannot comply, return: {\"prob\": 0.5, \"explain\": \"format_error\"}" )
+
+MINIMAL_PROMPT = "Provide a probability estimate for the input."
 
 
 
@@ -765,7 +768,10 @@ def adjust_prompt_for_explain(prompt: str, gpt_exp: bool) -> str:
     return prompt + "\n" + replacement
 
 def run_response(model: str, description_text: str, gpt_exp: bool, pid: Optional[str] = None) -> dict:
-    prompt = PROMPT_S2_MA50 or DEFAULT_PROMPT
+    if PROMPT_S2_MA50:
+        prompt = PROMPT_S2_MA50
+    else:
+        prompt = DEFAULT_PROMPT if USE_DEFAULT_PROMPT_JSON else MINIMAL_PROMPT
     prompt = adjust_prompt_for_explain(prompt, gpt_exp)
     if prompt and ("json" not in prompt.lower()):
         prompt = prompt + "\nRespond in JSON only."
