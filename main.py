@@ -31,6 +31,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 PROMPT_S2_MA50 = os.getenv("PROMT_S2_MA50", "").strip()
 MAXTOKENS = int(os.getenv("MAXTOKENS", "80") or "80")
+MINTOKENS = int(os.getenv("MINTOKENS", "0") or "0")
 USE_DEFAULT_PROMPT_JSON = os.getenv("USE_DEFAULT_PROMPT_JSON", "1").strip().lower() not in ("0", "false", "no")
 VS_ID = os.getenv("VS_ID", "").strip()
 DB_API_KEY = os.getenv("DB_API_KEY", "").strip()
@@ -788,6 +789,8 @@ def run_response(model: str, description_text: str, gpt_exp: bool, pid: Optional
         "top_p": 0.1,
         "max_output_tokens": MAXTOKENS,
     }
+    if MINTOKENS > 0:
+        kwargs["min_output_tokens"] = MINTOKENS
     if USE_VECTOR_DB and VS_ID:
         tool = {
             "type": "file_search",
@@ -1011,6 +1014,29 @@ async def evaluate(request: Request):
         print("❌ Unhandled ERROR:", str(e))
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e), "version": CODE_VERSION})
+
+
+@app.post("/analyzer")
+async def analyzer(request: Request):
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"Invalid JSON: {e}", "version": CODE_VERSION})
+
+    description_text = payload.get("description") or ""
+    prompt = PROMPT_S2_MA50 or DEFAULT_PROMPT
+    model = DEFAULT_MODEL
+    kwargs = {
+        "model": model,
+        "instructions": prompt,
+        "input": [{"role": "user", "content": description_text}],
+        "temperature": 0.1,
+        "top_p": 0.1,
+        "max_output_tokens": MAXTOKENS,
+    }
+    response = client.responses.create(**kwargs)
+    text = (getattr(response, "output_text", "") or "").strip()
+    return {"text": text, "version": CODE_VERSION}
 
 @app.post("/db/read")
 async def db_read(req: DbReadRequest, request: Request):
