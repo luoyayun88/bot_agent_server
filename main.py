@@ -1024,7 +1024,7 @@ async def analyzer(request: Request):
         return JSONResponse(status_code=400, content={"error": f"Invalid JSON: {e}", "version": CODE_VERSION})
 
     description_text = payload.get("description") or ""
-    prompt = PROMPT_S2_MA50 or DEFAULT_PROMPT
+    prompt = payload.get("prompt") or DEFAULT_PROMPT
     model = DEFAULT_MODEL
     kwargs = {
         "model": model,
