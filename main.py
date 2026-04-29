@@ -112,6 +112,32 @@ class ConfigUiSaveRequest(BaseModel):
     changes: List[ConfigUiChange]
 
 
+class BotRuntimeBaseRequest(BaseModel):
+    env: str = "prod"
+    account_login: int
+    bot_kind: str
+    bot_id: str
+    source_id: Optional[str] = None
+    instance_id: str
+
+
+class BotRuntimeFinishRequest(BaseModel):
+    command_id: int
+    instance_id: str
+    status: str
+    result_json: Optional[Dict[str, Any]] = None
+    error_text: Optional[str] = None
+
+
+class BotRuntimeStatusRequest(BotRuntimeBaseRequest):
+    status: str = "running"
+    allow_new_entries: bool = True
+    applied_version_no: Optional[int] = None
+    applied_config_hash: Optional[str] = None
+    last_error: Optional[str] = None
+    runtime_json: Optional[Dict[str, Any]] = None
+
+
 def resolve_db_url(path=NEURO_DB_CONF, db_mode: Optional[str] = None):
     mode = (db_mode or "").strip().lower()
     if mode == "test":
@@ -332,6 +358,49 @@ def resolve_new_value_columns(cur, bot, input_param, value):
 def first_error_line(exc):
     text = str(exc).strip()
     return text.splitlines()[0] if text else exc.__class__.__name__
+
+
+def require_bot_runtime_api(request: Request):
+    auth = require_api_key(request)
+    if auth:
+        return auth
+    if psycopg2 is None:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": f"psycopg2 not available: {_PSYCOPG2_IMPORT_ERROR}", "version": CODE_VERSION},
+        )
+    return None
+
+
+def bot_runtime_json_error(status_code, error):
+    return JSONResponse(status_code=status_code, content={"ok": False, "error": error, "version": CODE_VERSION})
+
+
+def normalize_runtime_identity(req: BotRuntimeBaseRequest):
+    env = (req.env or "prod").strip().lower()
+    bot_kind = (req.bot_kind or "").strip().lower()
+    bot_id = (req.bot_id or "").strip()
+    source_id = (req.source_id or bot_id).strip()
+    instance_id = (req.instance_id or "").strip()
+    if not env or not bot_kind or not bot_id or not source_id or not instance_id:
+        raise ValueError("env, account_login, bot_kind, bot_id, source_id and instance_id are required")
+    return env, int(req.account_login), bot_kind, bot_id, source_id, instance_id
+
+
+def bot_runtime_touch(cur, env, account_login, instance_id, column_name):
+    if column_name not in ("last_config_check_at", "last_command_check_at", "last_reinit_at"):
+        return
+    cur.execute(
+        f"""
+        UPDATE bot_param.bot_runtime_status
+           SET {column_name} = now(),
+               last_seen_at = now()
+         WHERE env = %s
+           AND account_login = %s
+           AND instance_id = %s
+        """,
+        (env, account_login, instance_id),
+    )
 
 
 def config_ui_login_html(error=None):
@@ -2032,6 +2101,280 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
     except Exception as exc:
         conn.rollback()
         return config_ui_json_error(400, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/bot-runtime/config/current")
+async def bot_runtime_config_current(req: BotRuntimeBaseRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    try:
+        env, account_login, bot_kind, bot_id, source_id, instance_id = normalize_runtime_identity(req)
+    except ValueError as exc:
+        return bot_runtime_json_error(400, str(exc))
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT c.active_version_no,
+                       c.active_config_id,
+                       c.config_hash
+                  FROM bot_param.bot_config_current c
+                 WHERE c.env = %s
+                   AND c.account_login = %s
+                   AND c.bot_kind = %s
+                   AND c.bot_id = %s
+                """,
+                (env, account_login, bot_kind, bot_id),
+            )
+            current = cur.fetchone()
+            if not current:
+                conn.rollback()
+                return bot_runtime_json_error(404, "active config not found")
+
+            cur.execute(
+                """
+                SELECT pc.input_param_name AS input_param,
+                       pc.param_key,
+                       pc.param_path,
+                       pc.value_type,
+                       v.config_json #>> string_to_array(pc.param_path, '.') AS value
+                  FROM bot_param.bot_config_version v
+                  JOIN bot_param.bot_config_param_catalog pc
+                    ON pc.bot_kind = v.bot_kind
+                 WHERE v.config_version_id = %s
+                   AND pc.input_param_name IS NOT NULL
+                   AND pc.param_path IS NOT NULL
+                   AND COALESCE(pc.user_editable, true) = true
+                 ORDER BY pc.sort_order, pc.input_param_name
+                """,
+                (current["active_config_id"],),
+            )
+            params = [dict(row) for row in cur.fetchall()]
+            bot_runtime_touch(cur, env, account_login, instance_id, "last_config_check_at")
+        conn.commit()
+        return {
+            "ok": True,
+            "env": env,
+            "account_login": account_login,
+            "bot_kind": bot_kind,
+            "bot_id": bot_id,
+            "source_id": source_id,
+            "instance_id": instance_id,
+            "version_no": current["active_version_no"],
+            "config_hash": current["config_hash"],
+            "params": params,
+            "version": CODE_VERSION,
+        }
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/bot-runtime/command/next")
+async def bot_runtime_command_next(req: BotRuntimeBaseRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    try:
+        env, account_login, bot_kind, bot_id, source_id, instance_id = normalize_runtime_identity(req)
+    except ValueError as exc:
+        return bot_runtime_json_error(400, str(exc))
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(
+                """
+                WITH next_command AS (
+                    SELECT command_id
+                      FROM bot_param.bot_command
+                     WHERE env = %s
+                       AND account_login = %s
+                       AND target_bot_kind = %s
+                       AND target_bot_id = %s
+                       AND (target_instance_id IS NULL OR target_instance_id = %s)
+                       AND status = 'queued'
+                     ORDER BY priority DESC, created_at ASC, command_id ASC
+                     LIMIT 1
+                     FOR UPDATE SKIP LOCKED
+                )
+                UPDATE bot_param.bot_command c
+                   SET status = 'leased',
+                       lease_owner = %s,
+                       leased_at = now(),
+                       ack_by_instance_id = %s,
+                       ack_at = now()
+                  FROM next_command n
+                 WHERE c.command_id = n.command_id
+                 RETURNING c.command_id,
+                           c.command_type,
+                           c.command_payload,
+                           c.target_version_no,
+                           c.status,
+                           c.priority,
+                           c.created_at
+                """,
+                (env, account_login, bot_kind, bot_id, instance_id, instance_id, instance_id),
+            )
+            row = cur.fetchone()
+            bot_runtime_touch(cur, env, account_login, instance_id, "last_command_check_at")
+        conn.commit()
+        return {
+            "ok": True,
+            "env": env,
+            "account_login": account_login,
+            "bot_kind": bot_kind,
+            "bot_id": bot_id,
+            "source_id": source_id,
+            "instance_id": instance_id,
+            "command": dict(row) if row else None,
+            "version": CODE_VERSION,
+        }
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/bot-runtime/command/finish")
+async def bot_runtime_command_finish(req: BotRuntimeFinishRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    instance_id = (req.instance_id or "").strip()
+    status = (req.status or "").strip().lower()
+    if not instance_id:
+        return bot_runtime_json_error(400, "instance_id is required")
+    if status not in ("done", "error"):
+        return bot_runtime_json_error(400, "status must be done or error")
+
+    result_json = json.dumps(req.result_json or {}, separators=(",", ":"))
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE bot_param.bot_command
+                   SET status = %s,
+                       finished_at = now(),
+                       result_json = %s::jsonb,
+                       error_text = %s
+                 WHERE command_id = %s
+                   AND (lease_owner = %s OR ack_by_instance_id = %s)
+                   AND status IN ('queued', 'leased')
+                 RETURNING command_id,
+                           env,
+                           account_login,
+                           target_bot_kind,
+                           target_bot_id,
+                           command_type,
+                           target_version_no,
+                           status
+                """,
+                (status, result_json, req.error_text, req.command_id, instance_id, instance_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return bot_runtime_json_error(404, "command not found or not leased by instance")
+            if status == "done" and row["command_type"] == "SOFT_REINIT":
+                bot_runtime_touch(cur, row["env"], row["account_login"], instance_id, "last_reinit_at")
+        conn.commit()
+        return {"ok": True, "command": dict(row), "version": CODE_VERSION}
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/bot-runtime/status")
+async def bot_runtime_status(req: BotRuntimeStatusRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    try:
+        env, account_login, bot_kind, bot_id, source_id, instance_id = normalize_runtime_identity(req)
+    except ValueError as exc:
+        return bot_runtime_json_error(400, str(exc))
+
+    runtime_json = json.dumps(req.runtime_json or {}, separators=(",", ":"))
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_param.bot_runtime_status (
+                    env, account_login, instance_id,
+                    bot_kind, bot_id, source_id,
+                    status, allow_new_entries,
+                    applied_version_no, applied_config_hash,
+                    last_seen_at, last_error, runtime_json
+                )
+                VALUES (
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    now(), %s, %s::jsonb
+                )
+                ON CONFLICT (env, account_login, instance_id)
+                DO UPDATE SET
+                    bot_kind = EXCLUDED.bot_kind,
+                    bot_id = EXCLUDED.bot_id,
+                    source_id = EXCLUDED.source_id,
+                    status = EXCLUDED.status,
+                    allow_new_entries = EXCLUDED.allow_new_entries,
+                    applied_version_no = EXCLUDED.applied_version_no,
+                    applied_config_hash = EXCLUDED.applied_config_hash,
+                    last_seen_at = now(),
+                    last_error = EXCLUDED.last_error,
+                    runtime_json = EXCLUDED.runtime_json
+                RETURNING env,
+                          account_login,
+                          instance_id,
+                          bot_kind,
+                          bot_id,
+                          source_id,
+                          status,
+                          allow_new_entries,
+                          applied_version_no,
+                          applied_config_hash,
+                          last_seen_at
+                """,
+                (
+                    env,
+                    account_login,
+                    instance_id,
+                    bot_kind,
+                    bot_id,
+                    source_id,
+                    req.status,
+                    req.allow_new_entries,
+                    req.applied_version_no,
+                    req.applied_config_hash,
+                    req.last_error,
+                    runtime_json,
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return {"ok": True, "runtime_status": dict(row), "version": CODE_VERSION}
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
     finally:
         conn.close()
 
