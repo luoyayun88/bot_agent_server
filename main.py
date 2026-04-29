@@ -1,8 +1,9 @@
 from email.policy import default
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from openai import OpenAI, BadRequestError
-import os, json, traceback, re, threading, asyncio, time, tempfile
+import os, json, traceback, re, threading, asyncio, time, tempfile, base64, hashlib, hmac, secrets, html as html_lib
+from urllib.parse import parse_qs
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -98,6 +99,19 @@ class NeuroRefreshRequest(BaseModel):
     db_mode: Optional[str] = None
 
 
+class ConfigUiChange(BaseModel):
+    row_id: int
+    value: str
+    reason: Optional[str] = None
+
+
+class ConfigUiSaveRequest(BaseModel):
+    account_login: int
+    bot: str
+    copy_to_account_login: Optional[int] = None
+    changes: List[ConfigUiChange]
+
+
 def resolve_db_url(path=NEURO_DB_CONF, db_mode: Optional[str] = None):
     mode = (db_mode or "").strip().lower()
     if mode == "test":
@@ -143,6 +157,628 @@ def require_api_key(request: Request):
     if key != DB_API_KEY:
         return JSONResponse(status_code=401, content={"error": "unauthorized", "version": CODE_VERSION})
     return None
+
+
+CONFIG_UI_COOKIE_NAME = "config_ui_session"
+CONFIG_UI_COOKIE_MAX_AGE = 8 * 60 * 60
+
+
+def config_ui_enabled():
+    return os.getenv("CONFIG_UI_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_config_ui_actor():
+    return (os.getenv("CONFIG_UI_ACTOR", "finexpert") or "").strip()
+
+
+def get_config_ui_username():
+    return (os.getenv("CONFIG_UI_USERNAME", "runtime_config_admin") or "").strip()
+
+
+def get_config_ui_password_hash():
+    return (os.getenv("CONFIG_UI_PASSWORD_HASH", "") or "").strip()
+
+
+def get_config_ui_session_secret():
+    return (os.getenv("CONFIG_UI_SESSION_SECRET", "") or "").strip()
+
+
+def config_ui_cookie_secure():
+    return os.getenv("CONFIG_UI_COOKIE_SECURE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def config_ui_json_error(status_code, error):
+    return JSONResponse(status_code=status_code, content={"ok": False, "error": error, "version": CODE_VERSION})
+
+
+def make_config_ui_password_hash(password, iterations=260000):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), iterations).hex()
+    return f"pbkdf2_sha256${iterations}${salt}${digest}"
+
+
+def verify_config_ui_password(password, password_hash):
+    if not password or not password_hash:
+        return False
+    parts = password_hash.split("$")
+    if len(parts) != 4 or parts[0] != "pbkdf2_sha256":
+        return False
+    try:
+        iterations = int(parts[1])
+        salt = bytes.fromhex(parts[2])
+        expected = bytes.fromhex(parts[3])
+    except Exception:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(actual, expected)
+
+
+def _b64url_encode(raw):
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value):
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def sign_config_ui_session(username):
+    secret = get_config_ui_session_secret()
+    if not secret:
+        raise RuntimeError("CONFIG_UI_SESSION_SECRET is not set")
+    payload = {
+        "u": username,
+        "exp": int(time.time()) + CONFIG_UI_COOKIE_MAX_AGE,
+    }
+    body = _b64url_encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    sig = hmac.new(secret.encode("utf-8"), body.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+def read_config_ui_session(cookie_value):
+    if not cookie_value or "." not in cookie_value:
+        return None
+    secret = get_config_ui_session_secret()
+    if not secret:
+        return None
+    body, sig = cookie_value.rsplit(".", 1)
+    expected = hmac.new(secret.encode("utf-8"), body.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(body).decode("utf-8"))
+    except Exception:
+        return None
+    if int(payload.get("exp") or 0) < int(time.time()):
+        return None
+    username = payload.get("u")
+    return username if isinstance(username, str) and username else None
+
+
+def get_config_ui_session_user(request: Request):
+    return read_config_ui_session(request.cookies.get(CONFIG_UI_COOKIE_NAME))
+
+
+def config_ui_requirements_error():
+    if not config_ui_enabled():
+        return "CONFIG_UI_ENABLED is not 1"
+    if psycopg2 is None:
+        return f"psycopg2 not available: {_PSYCOPG2_IMPORT_ERROR}"
+    if not get_config_ui_session_secret():
+        return "CONFIG_UI_SESSION_SECRET is not set"
+    if not get_config_ui_username():
+        return "CONFIG_UI_USERNAME is not set"
+    if not get_config_ui_password_hash():
+        return "CONFIG_UI_PASSWORD_HASH is not set"
+    if not get_config_ui_actor():
+        return "CONFIG_UI_ACTOR is not set"
+    return None
+
+
+def require_config_ui_api(request: Request):
+    error = config_ui_requirements_error()
+    if error:
+        return None, None, config_ui_json_error(503, error)
+    username = get_config_ui_session_user(request)
+    if not username:
+        return None, None, config_ui_json_error(401, "login required")
+    return username, get_config_ui_actor(), None
+
+
+def config_ui_conn():
+    db_url, _ = resolve_db_url()
+    return psycopg2.connect(db_url, sslmode="require")
+
+
+def set_actor(cur, actor):
+    cur.execute("SELECT set_config('bot_param.actor', %s, true)", (actor,))
+
+
+def ensure_actor_account_access(cur, actor, account_login, can_apply=False):
+    right_column = "can_apply" if can_apply else "can_edit"
+    cur.execute(
+        f"""
+        SELECT 1
+          FROM bot_param.operator_account
+         WHERE db_user = %s
+           AND env = 'prod'
+           AND account_login = %s
+           AND enabled = true
+           AND {right_column} = true
+        """,
+        (actor, account_login),
+    )
+    return cur.fetchone() is not None
+
+
+def resolve_new_value_columns(cur, bot, input_param, value):
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM bot_param.bot_config_allowed_value
+             WHERE bot = %s
+               AND input_param = %s
+        )
+        """,
+        (bot, input_param),
+    )
+    has_dictionary = bool(cur.fetchone()[0])
+    if has_dictionary:
+        return value, None
+    return None, value
+
+
+def first_error_line(exc):
+    text = str(exc).strip()
+    return text.splitlines()[0] if text else exc.__class__.__name__
+
+
+def config_ui_login_html(error=None):
+    error_block = ""
+    if error:
+        error_block = f'<div class="error">{html_lib.escape(error)}</div>'
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runtime Config Login</title>
+  <style>
+    :root {{ color-scheme: light; font-family: Inter, Segoe UI, Arial, sans-serif; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f4f6f8; color: #17202a; }}
+    main {{ width: min(420px, calc(100vw - 32px)); background: #fff; border: 1px solid #d8dee6; border-radius: 8px; padding: 24px; box-shadow: 0 10px 30px rgba(20, 30, 45, .08); }}
+    h1 {{ font-size: 22px; margin: 0 0 18px; letter-spacing: 0; }}
+    label {{ display: block; font-size: 13px; color: #465466; margin: 14px 0 6px; }}
+    input {{ width: 100%; box-sizing: border-box; border: 1px solid #b8c2cc; border-radius: 6px; padding: 12px; font-size: 16px; }}
+    button {{ width: 100%; margin-top: 18px; border: 0; border-radius: 6px; padding: 12px 14px; font-size: 16px; font-weight: 600; background: #1769aa; color: #fff; cursor: pointer; }}
+    .error {{ border: 1px solid #e09a9a; background: #fff1f1; color: #8d1f1f; border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 14px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Runtime Config</h1>
+    {error_block}
+    <form method="post" action="/config-ui/login">
+      <label for="username">Login</label>
+      <input id="username" name="username" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>"""
+
+
+CONFIG_UI_APP_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runtime Config</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      --border: #d7dde5;
+      --text: #152033;
+      --muted: #667085;
+      --accent: #1769aa;
+      --bg: #f5f7fa;
+      --panel: #ffffff;
+      --danger: #9f1d1d;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    header { position: sticky; top: 0; z-index: 20; background: var(--panel); border-bottom: 1px solid var(--border); }
+    .header-inner { max-width: 1280px; margin: 0 auto; padding: 12px 16px; display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+    .title { font-size: 18px; font-weight: 700; letter-spacing: 0; }
+    .meta { display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 13px; flex-wrap: wrap; }
+    .logout-form { margin: 0; }
+    button, select, input { font: inherit; }
+    button { border: 0; border-radius: 6px; padding: 10px 12px; font-weight: 600; cursor: pointer; background: var(--accent); color: #fff; }
+    button.secondary { background: #eef2f6; color: #1f2a3d; border: 1px solid var(--border); }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    main { max-width: 1280px; margin: 0 auto; padding: 16px; }
+    .toolbar { display: grid; grid-template-columns: repeat(6, minmax(150px, 1fr)); gap: 10px; align-items: end; margin-bottom: 12px; }
+    .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+    label { color: var(--muted); font-size: 12px; font-weight: 600; }
+    select, input[type="text"], input[type="search"] { border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; color: var(--text); min-height: 38px; padding: 8px 10px; width: 100%; }
+    .copy-line { display: flex; gap: 8px; align-items: center; min-height: 38px; border: 1px solid var(--border); border-radius: 6px; background: #fff; padding: 8px 10px; }
+    .copy-line input { width: auto; }
+    .status { min-height: 28px; font-size: 14px; color: var(--muted); margin: 8px 0; }
+    .status.error { color: var(--danger); }
+    .table-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; min-width: 980px; }
+    th, td { border-bottom: 1px solid #e8edf3; padding: 9px 10px; text-align: left; vertical-align: top; }
+    th { position: sticky; top: 57px; background: #f8fafc; z-index: 5; color: #3a4656; font-size: 12px; }
+    td { font-size: 13px; }
+    tr.hidden { display: none; }
+    .group { color: #49566a; font-weight: 600; white-space: nowrap; }
+    .param { font-family: Consolas, Menlo, monospace; font-size: 12px; white-space: nowrap; }
+    .desc { min-width: 240px; }
+    .current { font-family: Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 260px; }
+    .new-value { min-width: 180px; }
+    .reason { min-width: 180px; }
+    .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
+    .changed-count { color: var(--muted); font-size: 14px; }
+    @media (max-width: 760px) {
+      .header-inner { align-items: flex-start; flex-direction: column; }
+      .toolbar { grid-template-columns: 1fr; }
+      main { padding: 10px; }
+      .table-wrap { border-radius: 6px; }
+      table { min-width: 860px; }
+      th { top: 0; }
+      .footer { align-items: stretch; flex-direction: column; }
+      .footer button { width: 100%; min-height: 44px; }
+      select, input[type="text"], input[type="search"] { min-height: 44px; font-size: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div>
+        <div class="title">Runtime Config</div>
+        <div class="meta">
+          <span>user: <strong id="sessionUser"></strong></span>
+          <span>actor: <strong id="actorName"></strong></span>
+          <span>version: <strong id="codeVersion"></strong></span>
+        </div>
+      </div>
+      <form class="logout-form" method="post" action="/config-ui/logout">
+        <button class="secondary" type="submit">Logout</button>
+      </form>
+    </div>
+  </header>
+  <main>
+    <section class="toolbar" aria-label="filters">
+      <div class="field">
+        <label for="accountSelect">Account</label>
+        <select id="accountSelect"></select>
+      </div>
+      <div class="field">
+        <label for="botSelect">Bot</label>
+        <select id="botSelect"></select>
+      </div>
+      <div class="field">
+        <label for="groupFilter">Group</label>
+        <select id="groupFilter"><option value="">All groups</option></select>
+      </div>
+      <div class="field">
+        <label for="searchInput">Search</label>
+        <input id="searchInput" type="search" placeholder="input_param or description">
+      </div>
+      <div class="field">
+        <label>Copy</label>
+        <label class="copy-line"><input id="copyToggle" type="checkbox"> Apply same values</label>
+      </div>
+      <div class="field">
+        <label for="targetAccountSelect">Target account</label>
+        <select id="targetAccountSelect" disabled></select>
+      </div>
+    </section>
+
+    <div id="status" class="status"></div>
+
+    <section class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>group</th>
+            <th>input_param</th>
+            <th>param_desc</th>
+            <th>current_value</th>
+            <th>new value</th>
+            <th>reason</th>
+          </tr>
+        </thead>
+        <tbody id="paramsBody"></tbody>
+      </table>
+    </section>
+
+    <section class="footer">
+      <div id="changedCount" class="changed-count">0 changed rows</div>
+      <button id="saveBtn" type="button" disabled>Save changes</button>
+    </section>
+  </main>
+  <script>
+    const SESSION_USER = __SESSION_USER__;
+    const CONFIG_ACTOR = __CONFIG_ACTOR__;
+    const CODE_VERSION = __CODE_VERSION__;
+    const choiceCache = new Map();
+
+    const els = {
+      sessionUser: document.getElementById('sessionUser'),
+      actorName: document.getElementById('actorName'),
+      codeVersion: document.getElementById('codeVersion'),
+      accountSelect: document.getElementById('accountSelect'),
+      botSelect: document.getElementById('botSelect'),
+      groupFilter: document.getElementById('groupFilter'),
+      searchInput: document.getElementById('searchInput'),
+      copyToggle: document.getElementById('copyToggle'),
+      targetAccountSelect: document.getElementById('targetAccountSelect'),
+      status: document.getElementById('status'),
+      paramsBody: document.getElementById('paramsBody'),
+      changedCount: document.getElementById('changedCount'),
+      saveBtn: document.getElementById('saveBtn')
+    };
+
+    els.sessionUser.textContent = SESSION_USER;
+    els.actorName.textContent = CONFIG_ACTOR;
+    els.codeVersion.textContent = CODE_VERSION;
+
+    function setStatus(text, isError = false) {
+      els.status.textContent = text || '';
+      els.status.className = isError ? 'status error' : 'status';
+    }
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        credentials: 'same-origin',
+        headers: Object.assign({'Accept': 'application/json'}, options.headers || {}),
+        ...options
+      });
+      if (res.status === 401) {
+        window.location.href = '/config-ui/login';
+        throw new Error('login required');
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || res.statusText || 'Request failed');
+      }
+      return data;
+    }
+
+    function fillSelect(select, rows, valueKey, labelKey, emptyLabel) {
+      select.innerHTML = '';
+      if (emptyLabel) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = emptyLabel;
+        select.appendChild(opt);
+      }
+      for (const row of rows) {
+        const opt = document.createElement('option');
+        opt.value = String(row[valueKey]);
+        opt.textContent = row[labelKey] || String(row[valueKey]);
+        select.appendChild(opt);
+      }
+    }
+
+    async function loadAccounts() {
+      setStatus('Loading accounts...');
+      const data = await api('/config-ui/api/accounts');
+      fillSelect(els.accountSelect, data.accounts || [], 'account_login', 'account_label', '');
+      if (!els.accountSelect.value) {
+        setStatus('No accounts available for actor ' + CONFIG_ACTOR, true);
+        return;
+      }
+      await loadBots();
+    }
+
+    async function loadBots() {
+      const account = els.accountSelect.value;
+      fillSelect(els.botSelect, [], 'bot', 'display_name', '');
+      if (!account) return;
+      setStatus('Loading bots...');
+      const data = await api('/config-ui/api/bots?account_login=' + encodeURIComponent(account));
+      fillSelect(els.botSelect, data.bots || [], 'bot', 'display_name', '');
+      const n9 = Array.from(els.botSelect.options).find(o => o.value === 'n9');
+      if (n9) els.botSelect.value = 'n9';
+      await loadCopyTargets();
+      await loadParams();
+    }
+
+    async function loadCopyTargets() {
+      const account = els.accountSelect.value;
+      const bot = els.botSelect.value;
+      els.targetAccountSelect.innerHTML = '';
+      els.targetAccountSelect.disabled = !els.copyToggle.checked;
+      if (!account || !bot) return;
+      const data = await api('/config-ui/api/copy-target-accounts?source_account_login=' + encodeURIComponent(account) + '&bot=' + encodeURIComponent(bot));
+      fillSelect(els.targetAccountSelect, data.accounts || [], 'account_login', 'account_label', 'No target');
+      els.targetAccountSelect.disabled = !els.copyToggle.checked || !els.targetAccountSelect.options.length;
+    }
+
+    async function getChoices(bot, inputParam) {
+      const key = bot + '|' + inputParam;
+      if (choiceCache.has(key)) return choiceCache.get(key);
+      const data = await api('/config-ui/api/choices?bot=' + encodeURIComponent(bot) + '&input_param=' + encodeURIComponent(inputParam));
+      choiceCache.set(key, data.choices || []);
+      return data.choices || [];
+    }
+
+    function textCell(className, text) {
+      const td = document.createElement('td');
+      td.className = className || '';
+      td.textContent = text == null ? '' : String(text);
+      return td;
+    }
+
+    async function buildValueControl(row) {
+      if (row.has_choices) {
+        const select = document.createElement('select');
+        select.className = 'new-value-input';
+        select.dataset.rowId = row.row_id;
+        select.dataset.inputParam = row.input_param;
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = 'No change';
+        select.appendChild(empty);
+        const choices = await getChoices(row.bot, row.input_param);
+        for (const choice of choices) {
+          const opt = document.createElement('option');
+          opt.value = choice.allowed_value;
+          opt.textContent = choice.value_desc ? choice.allowed_value + ' - ' + choice.value_desc : choice.allowed_value;
+          select.appendChild(opt);
+        }
+        if (row.new_value_ui) select.value = row.new_value_ui;
+        select.addEventListener('change', updateChangedCount);
+        return select;
+      }
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'new-value-input';
+      input.dataset.rowId = row.row_id;
+      input.dataset.inputParam = row.input_param;
+      input.placeholder = 'New value';
+      input.value = row.new_value_ui || '';
+      input.addEventListener('input', updateChangedCount);
+      return input;
+    }
+
+    async function loadParams() {
+      const account = els.accountSelect.value;
+      const bot = els.botSelect.value;
+      els.paramsBody.innerHTML = '';
+      if (!account || !bot) return;
+      setStatus('Loading parameters...');
+      const data = await api('/config-ui/api/params?account_login=' + encodeURIComponent(account) + '&bot=' + encodeURIComponent(bot));
+      const rows = data.params || [];
+      const groups = Array.from(new Set(rows.map(r => r.param_group || '').filter(Boolean))).sort();
+      const currentGroup = els.groupFilter.value;
+      els.groupFilter.innerHTML = '<option value="">All groups</option>';
+      for (const group of groups) {
+        const opt = document.createElement('option');
+        opt.value = group;
+        opt.textContent = group;
+        els.groupFilter.appendChild(opt);
+      }
+      if (groups.includes(currentGroup)) els.groupFilter.value = currentGroup;
+
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        tr.dataset.group = row.param_group || '';
+        tr.dataset.search = ((row.input_param || '') + ' ' + (row.param_desc || '')).toLowerCase();
+        tr.dataset.rowId = row.row_id;
+        tr.appendChild(textCell('group', row.param_group));
+        tr.appendChild(textCell('param', row.input_param));
+        tr.appendChild(textCell('desc', row.param_desc));
+        tr.appendChild(textCell('current', row.current_value));
+
+        const newTd = document.createElement('td');
+        newTd.className = 'new-value';
+        newTd.appendChild(await buildValueControl(row));
+        tr.appendChild(newTd);
+
+        const reasonTd = document.createElement('td');
+        reasonTd.className = 'reason';
+        const reason = document.createElement('input');
+        reason.type = 'text';
+        reason.className = 'reason-input';
+        reason.dataset.rowId = row.row_id;
+        reason.placeholder = 'Optional';
+        reason.value = row.reason || '';
+        reason.addEventListener('input', updateChangedCount);
+        reasonTd.appendChild(reason);
+        tr.appendChild(reasonTd);
+        els.paramsBody.appendChild(tr);
+      }
+      applyFilters();
+      updateChangedCount();
+      setStatus(rows.length + ' parameters loaded');
+    }
+
+    function applyFilters() {
+      const group = els.groupFilter.value;
+      const query = els.searchInput.value.trim().toLowerCase();
+      for (const tr of els.paramsBody.querySelectorAll('tr')) {
+        const groupOk = !group || tr.dataset.group === group;
+        const queryOk = !query || tr.dataset.search.includes(query);
+        tr.classList.toggle('hidden', !(groupOk && queryOk));
+      }
+    }
+
+    function getChangedRows() {
+      const changes = [];
+      for (const control of els.paramsBody.querySelectorAll('.new-value-input')) {
+        const value = (control.value || '').trim();
+        if (!value) continue;
+        const rowId = Number(control.dataset.rowId);
+        const reason = els.paramsBody.querySelector('.reason-input[data-row-id="' + rowId + '"]');
+        changes.push({row_id: rowId, value, reason: reason ? reason.value.trim() || null : null});
+      }
+      return changes;
+    }
+
+    function updateChangedCount() {
+      const count = getChangedRows().length;
+      els.changedCount.textContent = count + (count === 1 ? ' changed row' : ' changed rows');
+      els.saveBtn.disabled = count === 0;
+    }
+
+    async function saveChanges() {
+      const changes = getChangedRows();
+      if (!changes.length) return;
+      if (els.copyToggle.checked && !els.targetAccountSelect.value) {
+        setStatus('Choose target account or turn off Apply same values', true);
+        return;
+      }
+      els.saveBtn.disabled = true;
+      setStatus('Saving...');
+      const payload = {
+        account_login: Number(els.accountSelect.value),
+        bot: els.botSelect.value,
+        copy_to_account_login: els.copyToggle.checked ? Number(els.targetAccountSelect.value) : null,
+        changes
+      };
+      try {
+        const data = await api('/config-ui/api/save', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        setStatus('Saved ' + (data.applied_count || 0) + ' row updates');
+        await loadParams();
+      } catch (exc) {
+        setStatus(exc.message, true);
+      } finally {
+        updateChangedCount();
+      }
+    }
+
+    els.accountSelect.addEventListener('change', loadBots);
+    els.botSelect.addEventListener('change', async () => { await loadCopyTargets(); await loadParams(); });
+    els.groupFilter.addEventListener('change', applyFilters);
+    els.searchInput.addEventListener('input', applyFilters);
+    els.copyToggle.addEventListener('change', loadCopyTargets);
+    els.saveBtn.addEventListener('click', saveChanges);
+
+    loadAccounts().catch(exc => setStatus(exc.message, true));
+  </script>
+</body>
+</html>"""
+
+
+def config_ui_app_html(username, actor):
+    return (
+        CONFIG_UI_APP_HTML
+        .replace("__SESSION_USER__", json.dumps(username))
+        .replace("__CONFIG_ACTOR__", json.dumps(actor))
+        .replace("__CODE_VERSION__", json.dumps(CODE_VERSION))
+    )
 
 
 def infer_pg_type(value):
@@ -1037,6 +1673,367 @@ async def analyzer(request: Request):
     response = client.responses.create(**kwargs)
     text = (getattr(response, "output_text", "") or "").strip()
     return {"text": text, "version": CODE_VERSION}
+
+
+@app.get("/config-ui/login", response_class=HTMLResponse)
+async def config_ui_login_page(request: Request):
+    if not config_ui_enabled():
+        return HTMLResponse("Config UI is disabled", status_code=404)
+    if get_config_ui_session_user(request):
+        return RedirectResponse(url="/config-ui", status_code=303)
+    error = config_ui_requirements_error()
+    if error:
+        return HTMLResponse(config_ui_login_html(error), status_code=503)
+    return HTMLResponse(config_ui_login_html())
+
+
+@app.post("/config-ui/login")
+async def config_ui_login_submit(request: Request):
+    if not config_ui_enabled():
+        return HTMLResponse("Config UI is disabled", status_code=404)
+    body = (await request.body()).decode("utf-8", errors="replace")
+    form = parse_qs(body, keep_blank_values=True)
+    username = (form.get("username", [""])[0] or "").strip()
+    password = form.get("password", [""])[0] or ""
+
+    error = config_ui_requirements_error()
+    if error:
+        return HTMLResponse(config_ui_login_html(error), status_code=503)
+    if username != get_config_ui_username() or not verify_config_ui_password(password, get_config_ui_password_hash()):
+        return HTMLResponse(config_ui_login_html("Invalid login or password"), status_code=401)
+
+    response = RedirectResponse(url="/config-ui", status_code=303)
+    response.set_cookie(
+        CONFIG_UI_COOKIE_NAME,
+        sign_config_ui_session(username),
+        max_age=CONFIG_UI_COOKIE_MAX_AGE,
+        httponly=True,
+        secure=config_ui_cookie_secure(),
+        samesite="lax",
+    )
+    return response
+
+
+@app.post("/config-ui/logout")
+async def config_ui_logout():
+    response = RedirectResponse(url="/config-ui/login", status_code=303)
+    response.delete_cookie(CONFIG_UI_COOKIE_NAME)
+    return response
+
+
+@app.get("/config-ui", response_class=HTMLResponse)
+async def config_ui_page(request: Request):
+    if not config_ui_enabled():
+        return HTMLResponse("Config UI is disabled", status_code=404)
+    error = config_ui_requirements_error()
+    if error:
+        return HTMLResponse(config_ui_login_html(error), status_code=503)
+    username = get_config_ui_session_user(request)
+    if not username:
+        return RedirectResponse(url="/config-ui/login", status_code=303)
+    return HTMLResponse(config_ui_app_html(username, get_config_ui_actor()))
+
+
+@app.get("/config-ui/api/accounts")
+async def config_ui_accounts(request: Request):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT account_login, account_label
+                  FROM bot_param.operator_account
+                 WHERE db_user = %s
+                   AND env = 'prod'
+                   AND enabled = true
+                   AND can_edit = true
+                 ORDER BY account_label, account_login
+                """,
+                (actor,),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "actor": actor, "accounts": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.get("/config-ui/api/bots")
+async def config_ui_bots(request: Request, account_login: int):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            if not ensure_actor_account_access(cur, actor, account_login, can_apply=False):
+                return config_ui_json_error(403, "account is not available for actor")
+            cur.execute(
+                """
+                SELECT DISTINCT
+                       e.bot,
+                       COALESCE(c.display_name, e.bot) AS display_name,
+                       COALESCE(c.sort_order, 9999) AS sort_order
+                  FROM bot_param.bot_config_user_editor e
+                  LEFT JOIN bot_param.bot_catalog c
+                    ON c.bot_kind = e.bot
+                  JOIN bot_param.operator_account oa
+                    ON oa.env = 'prod'
+                   AND oa.account_login = e.account_login
+                   AND oa.db_user = %s
+                   AND oa.enabled = true
+                   AND oa.can_edit = true
+                 WHERE e.account_login = %s
+                 ORDER BY sort_order, e.bot
+                """,
+                (actor, account_login),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "bots": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.get("/config-ui/api/params")
+async def config_ui_params(request: Request, account_login: int, bot: str):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    bot = (bot or "").strip().lower()
+    if not bot:
+        return config_ui_json_error(400, "bot is required")
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            if not ensure_actor_account_access(cur, actor, account_login, can_apply=False):
+                return config_ui_json_error(403, "account is not available for actor")
+            cur.execute(
+                """
+                SELECT
+                    e.row_id,
+                    e.account_login,
+                    e.bot,
+                    e.param_group,
+                    e.input_param,
+                    e.param_desc,
+                    e.current_value,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                              FROM bot_param.bot_config_allowed_value av
+                             WHERE av.bot = e.bot
+                               AND av.input_param = e.input_param
+                        )
+                        THEN e.new_choice
+                        ELSE e.new_value
+                    END AS new_value_ui,
+                    e.reason,
+                    EXISTS (
+                        SELECT 1
+                          FROM bot_param.bot_config_allowed_value av
+                         WHERE av.bot = e.bot
+                           AND av.input_param = e.input_param
+                    ) AS has_choices
+                  FROM bot_param.bot_config_user_editor e
+                  JOIN bot_param.operator_account oa
+                    ON oa.env = 'prod'
+                   AND oa.account_login = e.account_login
+                   AND oa.db_user = %s
+                   AND oa.enabled = true
+                   AND oa.can_edit = true
+                 WHERE e.account_login = %s
+                   AND e.bot = %s
+                 ORDER BY e.param_group, e.input_param
+                """,
+                (actor, account_login, bot),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "params": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.get("/config-ui/api/choices")
+async def config_ui_choices(request: Request, bot: str, input_param: str):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    bot = (bot or "").strip().lower()
+    input_param = (input_param or "").strip()
+    if not bot or not input_param:
+        return config_ui_json_error(400, "bot and input_param are required")
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT allowed_value, value_desc
+                  FROM bot_param.bot_config_allowed_value
+                 WHERE bot = %s
+                   AND input_param = %s
+                 ORDER BY sort_order, allowed_value
+                """,
+                (bot, input_param),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "actor": actor, "choices": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.get("/config-ui/api/copy-target-accounts")
+async def config_ui_copy_target_accounts(request: Request, source_account_login: int, bot: str):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    bot = (bot or "").strip().lower()
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            if not ensure_actor_account_access(cur, actor, source_account_login, can_apply=True):
+                return config_ui_json_error(403, "source account is not available for apply")
+            cur.execute(
+                """
+                SELECT DISTINCT e.account_login, oa.account_label
+                  FROM bot_param.bot_config_user_editor e
+                  JOIN bot_param.operator_account oa
+                    ON oa.env = 'prod'
+                   AND oa.account_login = e.account_login
+                   AND oa.db_user = %s
+                   AND oa.enabled = true
+                   AND oa.can_apply = true
+                 WHERE e.bot = %s
+                   AND e.account_login <> %s
+                 ORDER BY oa.account_label, e.account_login
+                """,
+                (actor, bot, source_account_login),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "accounts": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/config-ui/api/save")
+async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    bot = (req.bot or "").strip().lower()
+    if not bot:
+        return config_ui_json_error(400, "bot is required")
+    if not req.changes:
+        return config_ui_json_error(400, "changes is empty")
+    if len(req.changes) > 100:
+        return config_ui_json_error(400, "too many changes")
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        applied = []
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            set_actor(cur, actor)
+            if not ensure_actor_account_access(cur, actor, req.account_login, can_apply=True):
+                return config_ui_json_error(403, "source account is not available for apply")
+            if req.copy_to_account_login is not None:
+                if req.copy_to_account_login == req.account_login:
+                    return config_ui_json_error(400, "target account must differ from source account")
+                if not ensure_actor_account_access(cur, actor, req.copy_to_account_login, can_apply=True):
+                    return config_ui_json_error(403, "target account is not available for apply")
+
+            for change in req.changes:
+                value = (change.value or "").strip()
+                if not value:
+                    raise ValueError(f"row {change.row_id}: value is empty")
+                reason = (change.reason or "").strip() or None
+
+                cur.execute(
+                    """
+                    SELECT row_id, account_login, bot, input_param
+                      FROM bot_param.bot_config_user_editor
+                     WHERE row_id = %s
+                       AND account_login = %s
+                       AND bot = %s
+                     FOR UPDATE
+                    """,
+                    (change.row_id, req.account_login, bot),
+                )
+                source = cur.fetchone()
+                if not source:
+                    raise ValueError(f"row {change.row_id}: source row not found")
+
+                new_choice, new_value = resolve_new_value_columns(cur, source["bot"], source["input_param"], value)
+                cur.execute(
+                    """
+                    UPDATE bot_param.bot_config_user_editor
+                       SET new_choice = %s,
+                           new_value = %s,
+                           reason = %s
+                     WHERE row_id = %s
+                     RETURNING row_id, account_login, bot, input_param, current_value
+                    """,
+                    (new_choice, new_value, reason, source["row_id"]),
+                )
+                applied.append({"source": dict(cur.fetchone())})
+
+                if req.copy_to_account_login is not None:
+                    cur.execute(
+                        """
+                        SELECT row_id, account_login, bot, input_param
+                          FROM bot_param.bot_config_user_editor
+                         WHERE account_login = %s
+                           AND bot = %s
+                           AND input_param = %s
+                         FOR UPDATE
+                        """,
+                        (req.copy_to_account_login, source["bot"], source["input_param"]),
+                    )
+                    target = cur.fetchone()
+                    if not target:
+                        raise ValueError(
+                            f"row {change.row_id}: target row not found for account {req.copy_to_account_login}"
+                        )
+                    cur.execute(
+                        """
+                        UPDATE bot_param.bot_config_user_editor
+                           SET new_choice = %s,
+                               new_value = %s,
+                               reason = %s
+                         WHERE row_id = %s
+                         RETURNING row_id, account_login, bot, input_param, current_value
+                        """,
+                        (new_choice, new_value, reason, target["row_id"]),
+                    )
+                    applied[-1]["target"] = dict(cur.fetchone())
+
+        conn.commit()
+        return {
+            "ok": True,
+            "actor": actor,
+            "applied": applied,
+            "applied_count": sum(1 + (1 if "target" in row else 0) for row in applied),
+            "version": CODE_VERSION,
+        }
+    except ValueError as exc:
+        conn.rollback()
+        return config_ui_json_error(400, str(exc))
+    except Exception as exc:
+        conn.rollback()
+        return config_ui_json_error(400, first_error_line(exc))
+    finally:
+        conn.close()
 
 @app.post("/db/read")
 async def db_read(req: DbReadRequest, request: Request):
