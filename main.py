@@ -109,6 +109,7 @@ class ConfigUiSaveRequest(BaseModel):
     account_login: int
     bot: str
     copy_to_account_login: Optional[int] = None
+    copy_to_account_logins: Optional[List[int]] = None
     changes: List[ConfigUiChange]
 
 
@@ -474,6 +475,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
     label { color: var(--muted); font-size: 12px; font-weight: 600; }
     select, input[type="text"], input[type="search"] { border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; color: var(--text); min-height: 38px; padding: 8px 10px; width: 100%; }
+    select[multiple] { min-height: 86px; }
     .copy-line { display: flex; gap: 8px; align-items: center; min-height: 38px; border: 1px solid var(--border); border-radius: 6px; background: #fff; padding: 8px 10px; }
     .copy-line input { width: auto; }
     .status { min-height: 28px; font-size: 14px; color: var(--muted); margin: 8px 0; }
@@ -543,8 +545,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         <label class="copy-line"><input id="copyToggle" type="checkbox"> Apply same values</label>
       </div>
       <div class="field">
-        <label for="targetAccountSelect">Target account</label>
-        <select id="targetAccountSelect" disabled></select>
+        <label for="targetAccountSelect">Target accounts</label>
+        <select id="targetAccountSelect" multiple disabled></select>
       </div>
     </section>
 
@@ -635,6 +637,17 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       }
     }
 
+    function fillTargetAccountSelect(rows) {
+      els.targetAccountSelect.innerHTML = '';
+      for (const row of rows) {
+        const opt = document.createElement('option');
+        opt.value = String(row.account_login);
+        opt.textContent = row.has_bot_config ? row.account_label : row.account_label + ' (no config for this bot)';
+        opt.disabled = !row.has_bot_config;
+        els.targetAccountSelect.appendChild(opt);
+      }
+    }
+
     async function loadAccounts() {
       setStatus('Loading accounts...');
       const data = await api('/config-ui/api/accounts');
@@ -666,8 +679,9 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       els.targetAccountSelect.disabled = !els.copyToggle.checked;
       if (!account || !bot) return;
       const data = await api('/config-ui/api/copy-target-accounts?source_account_login=' + encodeURIComponent(account) + '&bot=' + encodeURIComponent(bot));
-      fillSelect(els.targetAccountSelect, data.accounts || [], 'account_login', 'account_label', 'No target');
-      els.targetAccountSelect.disabled = !els.copyToggle.checked || !els.targetAccountSelect.options.length;
+      fillTargetAccountSelect(data.accounts || []);
+      const enabledTargets = Array.from(els.targetAccountSelect.options).some(opt => !opt.disabled);
+      els.targetAccountSelect.disabled = !els.copyToggle.checked || !enabledTargets;
     }
 
     async function getChoices(bot, inputParam) {
@@ -791,6 +805,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return changes;
     }
 
+    function getSelectedTargetAccounts() {
+      if (!els.copyToggle.checked) return [];
+      return Array.from(els.targetAccountSelect.selectedOptions)
+        .filter(opt => !opt.disabled && opt.value)
+        .map(opt => Number(opt.value));
+    }
+
     function updateChangedCount() {
       const count = getChangedRows().length;
       els.changedCount.textContent = count + (count === 1 ? ' changed row' : ' changed rows');
@@ -800,8 +821,9 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     async function saveChanges() {
       const changes = getChangedRows();
       if (!changes.length) return;
-      if (els.copyToggle.checked && !els.targetAccountSelect.value) {
-        setStatus('Choose target account or turn off Apply same values', true);
+      const targetAccounts = getSelectedTargetAccounts();
+      if (els.copyToggle.checked && !targetAccounts.length) {
+        setStatus('Choose at least one available target account or turn off Apply same values', true);
         return;
       }
       els.saveBtn.disabled = true;
@@ -809,7 +831,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       const payload = {
         account_login: Number(els.accountSelect.value),
         bot: els.botSelect.value,
-        copy_to_account_login: els.copyToggle.checked ? Number(els.targetAccountSelect.value) : null,
+        copy_to_account_logins: targetAccounts,
         changes
       };
       try {
@@ -1972,19 +1994,23 @@ async def config_ui_copy_target_accounts(request: Request, source_account_login:
                 return config_ui_json_error(403, "source account is not available for apply")
             cur.execute(
                 """
-                SELECT DISTINCT e.account_login, oa.account_label
-                  FROM bot_param.bot_config_user_editor e
-                  JOIN bot_param.operator_account oa
-                    ON oa.env = 'prod'
-                   AND oa.account_login = e.account_login
+                SELECT oa.account_login,
+                       oa.account_label,
+                       EXISTS (
+                           SELECT 1
+                             FROM bot_param.bot_config_user_editor e
+                            WHERE e.account_login = oa.account_login
+                              AND e.bot = %s
+                       ) AS has_bot_config
+                  FROM bot_param.operator_account oa
+                 WHERE oa.env = 'prod'
                    AND oa.db_user = %s
                    AND oa.enabled = true
                    AND oa.can_apply = true
-                 WHERE e.bot = %s
-                   AND e.account_login <> %s
-                 ORDER BY oa.account_label, e.account_login
+                   AND oa.account_login <> %s
+                 ORDER BY oa.account_label, oa.account_login
                 """,
-                (actor, bot, source_account_login),
+                (bot, actor, source_account_login),
             )
             rows = [dict(row) for row in cur.fetchall()]
         return {"ok": True, "accounts": rows, "version": CODE_VERSION}
@@ -2011,15 +2037,23 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
     conn.autocommit = False
     try:
         applied = []
+        target_accounts = []
+        if req.copy_to_account_login is not None:
+            target_accounts.append(int(req.copy_to_account_login))
+        for account in (req.copy_to_account_logins or []):
+            account = int(account)
+            if account not in target_accounts:
+                target_accounts.append(account)
+
         with conn.cursor(cursor_factory=DictCursor) as cur:
             set_actor(cur, actor)
             if not ensure_actor_account_access(cur, actor, req.account_login, can_apply=True):
                 return config_ui_json_error(403, "source account is not available for apply")
-            if req.copy_to_account_login is not None:
-                if req.copy_to_account_login == req.account_login:
+            for target_account in target_accounts:
+                if target_account == req.account_login:
                     return config_ui_json_error(400, "target account must differ from source account")
-                if not ensure_actor_account_access(cur, actor, req.copy_to_account_login, can_apply=True):
-                    return config_ui_json_error(403, "target account is not available for apply")
+                if not ensure_actor_account_access(cur, actor, target_account, can_apply=True):
+                    return config_ui_json_error(403, f"target account {target_account} is not available for apply")
 
             for change in req.changes:
                 value = (change.value or "").strip()
@@ -2056,7 +2090,7 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
                 )
                 applied.append({"source": dict(cur.fetchone())})
 
-                if req.copy_to_account_login is not None:
+                for target_account in target_accounts:
                     cur.execute(
                         """
                         SELECT row_id, account_login, bot, input_param
@@ -2066,12 +2100,12 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
                            AND input_param = %s
                          FOR UPDATE
                         """,
-                        (req.copy_to_account_login, source["bot"], source["input_param"]),
+                        (target_account, source["bot"], source["input_param"]),
                     )
                     target = cur.fetchone()
                     if not target:
                         raise ValueError(
-                            f"row {change.row_id}: target row not found for account {req.copy_to_account_login}"
+                            f"row {change.row_id}: target row not found for account {target_account}"
                         )
                     cur.execute(
                         """
@@ -2084,14 +2118,16 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
                         """,
                         (new_choice, new_value, reason, target["row_id"]),
                     )
-                    applied[-1]["target"] = dict(cur.fetchone())
+                    if "targets" not in applied[-1]:
+                        applied[-1]["targets"] = []
+                    applied[-1]["targets"].append(dict(cur.fetchone()))
 
         conn.commit()
         return {
             "ok": True,
             "actor": actor,
             "applied": applied,
-            "applied_count": sum(1 + (1 if "target" in row else 0) for row in applied),
+            "applied_count": sum(1 + len(row.get("targets", [])) for row in applied),
             "version": CODE_VERSION,
         }
     except ValueError as exc:
