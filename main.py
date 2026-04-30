@@ -120,6 +120,8 @@ class BotRuntimeBaseRequest(BaseModel):
     bot_id: str
     source_id: Optional[str] = None
     instance_id: str
+    applied_version_no: Optional[int] = None
+    command_id: Optional[int] = None
 
 
 class BotRuntimeFinishRequest(BaseModel):
@@ -404,6 +406,66 @@ def bot_runtime_touch(cur, env, account_login, instance_id, column_name):
     )
 
 
+def bot_runtime_load_changed_params(cur, env, account_login, bot_kind, bot_id, old_version_no, new_version_no, active_config_id):
+    if not old_version_no or int(old_version_no) <= 0 or int(old_version_no) == int(new_version_no or 0):
+        return []
+
+    cur.execute(
+        """
+        SELECT pc.input_param_name AS input_param,
+               a.old_value #>> '{}' AS old_value,
+               a.new_value #>> '{}' AS new_value,
+               a.changed_by,
+               a.changed_reason AS reason
+          FROM bot_param.bot_param_audit a
+          JOIN bot_param.bot_config_param_catalog pc
+            ON pc.bot_kind = a.bot_kind
+           AND pc.param_path = a.param_path
+         WHERE a.env = %s
+           AND a.account_login = %s
+           AND a.bot_kind = %s
+           AND a.bot_id = %s
+           AND a.old_version_no = %s
+           AND a.new_version_no = %s
+           AND pc.input_param_name IS NOT NULL
+         ORDER BY pc.sort_order, pc.input_param_name, a.audit_id
+        """,
+        (env, account_login, bot_kind, bot_id, old_version_no, new_version_no),
+    )
+    rows = [dict(row) for row in cur.fetchall()]
+    if rows:
+        return rows
+
+    cur.execute(
+        """
+        SELECT pc.input_param_name AS input_param,
+               old_v.config_json #>> string_to_array(pc.param_path, '.') AS old_value,
+               new_v.config_json #>> string_to_array(pc.param_path, '.') AS new_value,
+               NULL::text AS changed_by,
+               NULL::text AS reason
+          FROM bot_param.bot_config_version new_v
+          JOIN bot_param.bot_config_version old_v
+            ON old_v.env = new_v.env
+           AND old_v.account_login = new_v.account_login
+           AND old_v.bot_kind = new_v.bot_kind
+           AND old_v.bot_id = new_v.bot_id
+           AND old_v.version_no = %s
+          JOIN bot_param.bot_config_param_catalog pc
+            ON pc.bot_kind = new_v.bot_kind
+         WHERE new_v.config_version_id = %s
+           AND pc.input_param_name IS NOT NULL
+           AND pc.param_path IS NOT NULL
+           AND COALESCE(pc.user_editable, true) = true
+           AND (old_v.config_json #>> string_to_array(pc.param_path, '.'))
+               IS DISTINCT FROM
+               (new_v.config_json #>> string_to_array(pc.param_path, '.'))
+         ORDER BY pc.sort_order, pc.input_param_name
+        """,
+        (old_version_no, active_config_id),
+    )
+    return [dict(row) for row in cur.fetchall()]
+
+
 def config_ui_login_html(error=None):
     error_block = ""
     if error:
@@ -471,29 +533,53 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     button.secondary { background: #eef2f6; color: #1f2a3d; border: 1px solid var(--border); }
     button:disabled { opacity: .55; cursor: not-allowed; }
     main { max-width: 1280px; margin: 0 auto; padding: 16px; }
-    .toolbar { display: grid; grid-template-columns: repeat(6, minmax(150px, 1fr)); gap: 10px; align-items: end; margin-bottom: 12px; }
+    .toolbar { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; margin-bottom: 12px; }
     .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
     label { color: var(--muted); font-size: 12px; font-weight: 600; }
     select, input[type="text"], input[type="search"] { border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; color: var(--text); min-height: 38px; padding: 8px 10px; width: 100%; }
-    select[multiple] { min-height: 86px; }
     .copy-line { display: flex; gap: 8px; align-items: center; min-height: 38px; border: 1px solid var(--border); border-radius: 6px; background: #fff; padding: 8px 10px; }
     .copy-line input { width: auto; }
+    .target-list { min-height: 86px; max-height: 112px; overflow-y: auto; border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; padding: 4px; }
+    .target-list.is-disabled { opacity: .65; background: #f8fafc; }
+    .target-option { display: flex; align-items: center; gap: 8px; min-height: 26px; padding: 3px 5px; border-radius: 4px; color: var(--text); font-size: 13px; font-weight: 500; }
+    .target-option:hover { background: #eef4fb; }
+    .target-option.is-unavailable { color: var(--muted); }
+    .target-option input { width: auto; flex: 0 0 auto; }
+    .target-option span { min-width: 0; overflow-wrap: anywhere; }
     .status { min-height: 28px; font-size: 14px; color: var(--muted); margin: 8px 0; }
     .status.error { color: var(--danger); }
-    .table-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; min-width: 980px; }
+    .table-wrap { overflow-x: hidden; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
     th, td { border-bottom: 1px solid #e8edf3; padding: 9px 10px; text-align: left; vertical-align: top; }
     th { background: #f8fafc; color: #3a4656; font-size: 12px; }
     td { font-size: 13px; }
     tr.hidden { display: none; }
-    .group { color: #49566a; font-weight: 600; white-space: nowrap; }
-    .param { font-family: Consolas, Menlo, monospace; font-size: 12px; white-space: nowrap; }
-    .desc { min-width: 240px; }
-    .current { font-family: Consolas, Menlo, monospace; color: #147a3d; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 260px; }
-    .new-value { min-width: 180px; }
-    .reason { min-width: 180px; }
+    tr.group-break td { border-top: 10px solid var(--bg); }
+    tr.group-break td:first-child { box-shadow: inset 4px 0 0 #3d7cae; }
+    tr.group-break .group { background: #eef4fb; color: #1f5f8c; }
+    th:nth-child(1), td.group { width: 10%; }
+    th:nth-child(2), td.param { width: 18%; }
+    th:nth-child(3), td.desc { width: 24%; }
+    th:nth-child(4), td.current { width: 18%; }
+    th:nth-child(5), td.new-value { width: 17%; }
+    th:nth-child(6), td.reason { width: 13%; }
+    .group { color: #49566a; font-weight: 600; white-space: normal; overflow-wrap: anywhere; }
+    .param { font-family: Consolas, Menlo, monospace; font-size: 12px; white-space: normal; overflow-wrap: anywhere; }
+    .desc { overflow-wrap: anywhere; }
+    .current { font-family: Consolas, Menlo, monospace; color: #147a3d; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .new-value, .reason { min-width: 0; }
+    .new-value input, .new-value select, .reason input { width: 100%; min-width: 0; }
     .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
     .changed-count { color: var(--muted); font-size: 14px; }
+    @media (max-width: 1100px) {
+      th:first-child, td.group { display: none; }
+      tr.group-break td:nth-child(2) { box-shadow: inset 4px 0 0 #3d7cae; }
+      th:nth-child(2), td.param { width: 22%; }
+      th:nth-child(3), td.desc { width: 28%; }
+      th:nth-child(4), td.current { width: 20%; }
+      th:nth-child(5), td.new-value { width: 18%; }
+      th:nth-child(6), td.reason { width: 12%; }
+    }
     @media (max-width: 760px) {
       .header-inner { align-items: flex-start; display: grid; grid-template-columns: minmax(0, 1fr) auto; }
       .logout-form { grid-column: 2; grid-row: 1; }
@@ -507,6 +593,9 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       thead { display: none; }
       tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px 14px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
       tr.hidden { display: none; }
+      tr.group-break { margin-top: 18px; border-top: 3px solid #3d7cae; }
+      tr.group-break td { border-top: 0; }
+      tr.group-break td:nth-child(2) { box-shadow: none; }
       td { border-bottom: 0; padding: 0; min-width: 0; }
       td.group, td.reason { display: none; }
       .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
@@ -520,6 +609,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .footer { align-items: stretch; flex-direction: column; }
       .footer button { width: 100%; min-height: 44px; }
       select, input[type="text"], input[type="search"] { min-height: 44px; font-size: 16px; }
+      .target-list { max-height: 144px; }
+      .target-option { min-height: 34px; font-size: 14px; }
     }
   </style>
 </head>
@@ -562,8 +653,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         <label class="copy-line"><input id="copyToggle" type="checkbox"> Apply same values</label>
       </div>
       <div class="field">
-        <label for="targetAccountSelect">Target accounts</label>
-        <select id="targetAccountSelect" multiple disabled></select>
+        <label id="targetAccountLabel">Target accounts</label>
+        <div id="targetAccountList" class="target-list is-disabled" role="group" aria-labelledby="targetAccountLabel"></div>
       </div>
     </section>
 
@@ -605,7 +696,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       groupFilter: document.getElementById('groupFilter'),
       searchInput: document.getElementById('searchInput'),
       copyToggle: document.getElementById('copyToggle'),
-      targetAccountSelect: document.getElementById('targetAccountSelect'),
+      targetAccountList: document.getElementById('targetAccountList'),
       status: document.getElementById('status'),
       paramsBody: document.getElementById('paramsBody'),
       changedCount: document.getElementById('changedCount'),
@@ -654,14 +745,32 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       }
     }
 
-    function fillTargetAccountSelect(rows) {
-      els.targetAccountSelect.innerHTML = '';
+    function setTargetAccountListEnabled(enabled) {
+      els.targetAccountList.classList.toggle('is-disabled', !enabled);
+      for (const input of els.targetAccountList.querySelectorAll('input[type="checkbox"]')) {
+        input.disabled = !enabled || input.dataset.hasConfig !== '1';
+      }
+    }
+
+    function fillTargetAccountList(rows) {
+      els.targetAccountList.innerHTML = '';
       for (const row of rows) {
-        const opt = document.createElement('option');
-        opt.value = String(row.account_login);
-        opt.textContent = row.has_bot_config ? row.account_label : row.account_label + ' (no config for this bot)';
-        opt.disabled = !row.has_bot_config;
-        els.targetAccountSelect.appendChild(opt);
+        const option = document.createElement('label');
+        option.className = 'target-option' + (row.has_bot_config ? '' : ' is-unavailable');
+
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.className = 'target-account-input';
+        input.value = String(row.account_login);
+        input.dataset.hasConfig = row.has_bot_config ? '1' : '0';
+        input.disabled = !row.has_bot_config;
+
+        const text = document.createElement('span');
+        text.textContent = row.has_bot_config ? row.account_label : row.account_label + ' (no config for this bot)';
+
+        option.appendChild(input);
+        option.appendChild(text);
+        els.targetAccountList.appendChild(option);
       }
     }
 
@@ -692,13 +801,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     async function loadCopyTargets() {
       const account = els.accountSelect.value;
       const bot = els.botSelect.value;
-      els.targetAccountSelect.innerHTML = '';
-      els.targetAccountSelect.disabled = !els.copyToggle.checked;
+      els.targetAccountList.innerHTML = '';
+      setTargetAccountListEnabled(false);
       if (!account || !bot) return;
       const data = await api('/config-ui/api/copy-target-accounts?source_account_login=' + encodeURIComponent(account) + '&bot=' + encodeURIComponent(bot));
-      fillTargetAccountSelect(data.accounts || []);
-      const enabledTargets = Array.from(els.targetAccountSelect.options).some(opt => !opt.disabled);
-      els.targetAccountSelect.disabled = !els.copyToggle.checked || !enabledTargets;
+      fillTargetAccountList(data.accounts || []);
+      const enabledTargets = Array.from(els.targetAccountList.querySelectorAll('input[type="checkbox"]')).some(input => input.dataset.hasConfig === '1');
+      setTargetAccountListEnabled(els.copyToggle.checked && enabledTargets);
     }
 
     async function getChoices(bot, inputParam) {
@@ -774,9 +883,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       }
       if (groups.includes(currentGroup)) els.groupFilter.value = currentGroup;
 
+      let previousGroup = null;
       for (const row of rows) {
+        const rowGroup = row.param_group || '';
         const tr = document.createElement('tr');
-        tr.dataset.group = row.param_group || '';
+        if (previousGroup !== null && rowGroup !== previousGroup) tr.classList.add('group-break');
+        previousGroup = rowGroup;
+        tr.dataset.group = rowGroup;
         tr.dataset.search = ((row.input_param || '') + ' ' + (row.param_desc || '')).toLowerCase();
         tr.dataset.rowId = row.row_id;
         tr.appendChild(textCell('group', row.param_group));
@@ -831,9 +944,9 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
 
     function getSelectedTargetAccounts() {
       if (!els.copyToggle.checked) return [];
-      return Array.from(els.targetAccountSelect.selectedOptions)
-        .filter(opt => !opt.disabled && opt.value)
-        .map(opt => Number(opt.value));
+      return Array.from(els.targetAccountList.querySelectorAll('input[type="checkbox"]:checked'))
+        .filter(input => !input.disabled && input.value)
+        .map(input => Number(input.value));
     }
 
     function updateChangedCount() {
@@ -2215,6 +2328,17 @@ async def bot_runtime_config_current(req: BotRuntimeBaseRequest, request: Reques
                 (current["active_config_id"],),
             )
             params = [dict(row) for row in cur.fetchall()]
+            old_version_no = req.applied_version_no
+            changed_params = bot_runtime_load_changed_params(
+                cur,
+                env,
+                account_login,
+                bot_kind,
+                bot_id,
+                old_version_no,
+                current["active_version_no"],
+                current["active_config_id"],
+            )
             bot_runtime_touch(cur, env, account_login, instance_id, "last_config_check_at")
         conn.commit()
         return {
@@ -2225,9 +2349,11 @@ async def bot_runtime_config_current(req: BotRuntimeBaseRequest, request: Reques
             "bot_id": bot_id,
             "source_id": source_id,
             "instance_id": instance_id,
+            "old_version_no": old_version_no,
             "version_no": current["active_version_no"],
             "config_hash": current["config_hash"],
             "params": params,
+            "changed_params": changed_params,
             "version": CODE_VERSION,
         }
     except Exception as exc:
