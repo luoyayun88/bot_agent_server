@@ -481,7 +481,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .table-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
     table { width: 100%; border-collapse: collapse; min-width: 980px; }
     th, td { border-bottom: 1px solid #e8edf3; padding: 9px 10px; text-align: left; vertical-align: top; }
-    th { position: sticky; top: 57px; background: #f8fafc; z-index: 5; color: #3a4656; font-size: 12px; }
+    th { background: #f8fafc; color: #3a4656; font-size: 12px; }
     td { font-size: 13px; }
     tr.hidden { display: none; }
     .group { color: #49566a; font-weight: 600; white-space: nowrap; }
@@ -498,7 +498,6 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       main { padding: 10px; }
       .table-wrap { border-radius: 6px; }
       table { min-width: 860px; }
-      th { top: 0; }
       .footer { align-items: stretch; flex-direction: column; }
       .footer button { width: 100%; min-height: 44px; }
       select, input[type="text"], input[type="search"] { min-height: 44px; font-size: 16px; }
