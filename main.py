@@ -498,8 +498,18 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .header-inner { align-items: flex-start; flex-direction: column; }
       .toolbar { grid-template-columns: 1fr; }
       main { padding: 10px; }
-      .table-wrap { border-radius: 6px; }
-      table { min-width: 860px; }
+      .table-wrap { border-radius: 6px; overflow-x: visible; }
+      table { min-width: 0; width: 100%; table-layout: fixed; }
+      th, td { padding: 8px 6px; }
+      th:nth-child(1), td.group, th:nth-child(6), td.reason { display: none; }
+      th:nth-child(2) { width: 30%; }
+      th:nth-child(3) { width: 24%; }
+      th:nth-child(4) { width: 20%; }
+      th:nth-child(5) { width: 26%; }
+      .param { white-space: normal; overflow-wrap: anywhere; font-size: 11px; }
+      .desc { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+      .current { max-width: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .new-value { min-width: 0; }
       .footer { align-items: stretch; flex-direction: column; }
       .footer button { width: 100%; min-height: 44px; }
       select, input[type="text"], input[type="search"] { min-height: 44px; font-size: 16px; }
