@@ -489,7 +489,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .group { color: #49566a; font-weight: 600; white-space: nowrap; }
     .param { font-family: Consolas, Menlo, monospace; font-size: 12px; white-space: nowrap; }
     .desc { min-width: 240px; }
-    .current { font-family: Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 260px; }
+    .current { font-family: Consolas, Menlo, monospace; color: #147a3d; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 260px; }
     .new-value { min-width: 180px; }
     .reason { min-width: 180px; }
     .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
@@ -510,13 +510,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       td { border-bottom: 0; padding: 0; min-width: 0; }
       td.group, td.reason { display: none; }
       .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
-      .param::after { content: " (" attr(data-desc) ")"; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
+      .param::after { content: attr(data-desc); display: block; margin-top: 4px; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
       .desc { display: none; }
       .current, .new-value { min-width: 0; max-width: none; }
       .current::before, .new-value::before { display: block; margin-bottom: 5px; font-family: Inter, Segoe UI, Arial, sans-serif; font-size: 12px; font-weight: 700; color: var(--muted); }
-      .current::before { content: "current value"; }
+      .current::before { content: "current value"; color: #147a3d; }
       .new-value::before { content: "new"; }
-      .current { font-family: Consolas, Menlo, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .current { font-family: Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
       .footer { align-items: stretch; flex-direction: column; }
       .footer button { width: 100%; min-height: 44px; }
       select, input[type="text"], input[type="search"] { min-height: 44px; font-size: 16px; }
