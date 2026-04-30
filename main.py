@@ -102,6 +102,7 @@ class NeuroRefreshRequest(BaseModel):
 class ConfigUiChange(BaseModel):
     row_id: int
     value: str
+    input_param: Optional[str] = None
     reason: Optional[str] = None
 
 
@@ -119,8 +120,6 @@ class RmControlCommandRequest(BaseModel):
     bot_ids: Optional[List[str]] = None
     duration: Optional[str] = None
     until: Optional[str] = None
-    set_key: Optional[str] = None
-    set_value: Optional[str] = None
     reason: Optional[str] = None
 
 
@@ -478,28 +477,72 @@ def bot_runtime_load_changed_params(cur, env, account_login, bot_kind, bot_id, o
 
 
 RM_CONTROL_SUPPORTED_BOT_IDS = ("n4", "n5", "n6", "n7", "n8", "n9", "bot123")
+RM_CONTROLLER_BOT = "rm_controller"
+RM_CONTROLLER_BOT_LABEL = "RM* Controller"
 RM_CONTROL_ACTION_COMMANDS = {
     "status": "status",
-    "status_bots": "status bots",
     "config": "config",
-    "halt": "halt",
-    "day_stop": "day_stop",
-    "week_stop": "week_stop",
     "resume": "resume",
     "rm_daystart": "rm_daystart",
     "rm_reset": "rm_reset",
-    "whoami": "whoami",
 }
-RM_CONTROL_SET_KEYS = {
-    "profit_abs": "profit_abs",
-    "profit_pct": "profit_pct",
-    "loss_abs": "loss_abs",
-    "loss_pct": "loss_pct",
-    "metric": "metric",
-    "use_profit_abs": "use_profit_abs",
-    "use_profit_pct": "use_profit_pct",
-    "use_loss_abs": "use_loss_abs",
-    "use_loss_pct": "use_loss_pct",
+RM_CONTROL_COMMAND_DESCRIPTIONS = {
+    "status": "Show account RM state, active account stop, per-bot stops and runtime heartbeat.",
+    "config": "Show current RM limits and owner configuration.",
+    "stop_account": "Stop trading on the selected account until the selected period expires or resume is sent.",
+    "resume": "Clear current account stop and keep today's baseline.",
+    "rm_daystart": "Clear current account stop and restore today's day-start baseline.",
+    "rm_reset": "Rearm RM from current balance/equity.",
+    "stop_bots": "Stop only selected bot families on the account.",
+    "resume_bots": "Clear stops for selected bot families.",
+}
+RM_CONTROL_INPUT_PARAMS = {
+    "RM_UseProfitTargetPct": "bool",
+    "RM_ProfitTargetPct": "double",
+    "RM_UseProfitTargetAbs": "bool",
+    "RM_ProfitTargetAbs": "double",
+    "RM_UseLossLimitPct": "bool",
+    "RM_LossLimitPct": "double",
+    "RM_UseLossLimitAbs": "bool",
+    "RM_LossLimitAbs": "double",
+    "RM_MetricMode": "metric",
+    "RM_ActionOnProfit": "action",
+    "RM_ActionOnLoss": "action",
+    "RM_ResetMode": "reset",
+    "RM_OwnerHeartbeatSec": "int",
+    "RM_ManualResetNow": "bool",
+}
+RM_CONTROLLER_PARAM_DEFS = [
+    ("Account RM Owner", "RM_UseProfitTargetPct", "Use account profit target as percent from baseline.", "bool"),
+    ("Account RM Owner", "RM_ProfitTargetPct", "Account profit target percentage from baseline.", "double"),
+    ("Account RM Owner", "RM_UseProfitTargetAbs", "Use account profit target as absolute account currency amount.", "bool"),
+    ("Account RM Owner", "RM_ProfitTargetAbs", "Account profit target absolute amount.", "double"),
+    ("Account RM Owner", "RM_UseLossLimitPct", "Use account loss limit as percent from baseline.", "bool"),
+    ("Account RM Owner", "RM_LossLimitPct", "Account loss limit percentage from baseline.", "double"),
+    ("Account RM Owner", "RM_UseLossLimitAbs", "Use account loss limit as absolute account currency amount.", "bool"),
+    ("Account RM Owner", "RM_LossLimitAbs", "Account loss limit absolute amount.", "double"),
+    ("Account RM Owner", "RM_MetricMode", "Account metric used for RM thresholds.", "metric"),
+    ("Account RM Owner", "RM_ActionOnProfit", "Action taken when a profit target is reached.", "action"),
+    ("Account RM Owner", "RM_ActionOnLoss", "Action taken when a loss limit is reached.", "action"),
+    ("Account RM Owner", "RM_ResetMode", "Automatic reset mode for normal RM stops.", "reset"),
+    ("Account RM Owner", "RM_OwnerHeartbeatSec", "Maximum owner heartbeat age in seconds.", "int"),
+    ("Account RM Owner", "RM_ManualResetNow", "One-shot manual reset request for triggered RM state.", "bool"),
+]
+RM_CONTROLLER_DEFAULT_VALUES = {
+    "RM_UseProfitTargetPct": "false",
+    "RM_ProfitTargetPct": "2.0",
+    "RM_UseProfitTargetAbs": "true",
+    "RM_ProfitTargetAbs": "60.0",
+    "RM_UseLossLimitPct": "true",
+    "RM_LossLimitPct": "2.0",
+    "RM_UseLossLimitAbs": "false",
+    "RM_LossLimitAbs": "30.0",
+    "RM_MetricMode": "RM_METRIC_BALANCE",
+    "RM_ActionOnProfit": "RM_ACTION_FLATTEN_AND_HALT",
+    "RM_ActionOnLoss": "RM_ACTION_FLATTEN_AND_HALT",
+    "RM_ResetMode": "RM_RESET_NEXT_DAY",
+    "RM_OwnerHeartbeatSec": "30",
+    "RM_ManualResetNow": "false",
 }
 
 
@@ -516,6 +559,10 @@ def normalize_rm_bot_ids(bot_ids):
     return normalized
 
 
+def is_rm_controller_bot(bot):
+    return (bot or "").strip().lower() in (RM_CONTROLLER_BOT, "rm*", "rm")
+
+
 def normalize_rm_until(value):
     text = (value or "").strip()
     if not re.match(r"^\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}$", text):
@@ -527,54 +574,240 @@ def normalize_rm_until(value):
     return text
 
 
+def normalize_rm_bool_value(value, param_name):
+    text = (value or "").strip().lower()
+    if text in ("true", "1", "on", "enable", "enabled", "yes"):
+        return "true"
+    if text in ("false", "0", "off", "disable", "disabled", "no"):
+        return "false"
+    raise ValueError(f"{param_name} expects true/false")
+
+
+def normalize_rm_enum_value(value, param_name, options):
+    raw = (value or "").strip()
+    key = re.sub(r"[^a-z0-9]", "", raw.lower())
+    for exact, aliases in options.items():
+        if key == re.sub(r"[^a-z0-9]", "", exact.lower()):
+            return exact
+        for alias in aliases:
+            if key == re.sub(r"[^a-z0-9]", "", alias.lower()):
+                return exact
+    raise ValueError(f"{param_name} expects one of: {', '.join(options.keys())}")
+
+
+def normalize_rm_input_value(param_name, value):
+    value_type = RM_CONTROL_INPUT_PARAMS.get(param_name)
+    if not value_type:
+        raise ValueError("unsupported input_param")
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("set value is required")
+
+    if value_type == "bool":
+        return normalize_rm_bool_value(text, param_name)
+    if value_type == "double":
+        try:
+            number = float(text)
+        except ValueError:
+            raise ValueError(f"{param_name} expects a number")
+        if number < 0:
+            raise ValueError(f"{param_name} expects a non-negative number")
+        return text
+    if value_type == "int":
+        if not re.match(r"^\d+$", text):
+            raise ValueError(f"{param_name} expects a non-negative integer")
+        return text
+    if value_type == "metric":
+        return normalize_rm_enum_value(
+            text,
+            param_name,
+            {
+                "RM_METRIC_BALANCE": ("balance",),
+                "RM_METRIC_EQUITY": ("equity",),
+            },
+        )
+    if value_type == "action":
+        return normalize_rm_enum_value(
+            text,
+            param_name,
+            {
+                "RM_ACTION_HALT_ONLY": ("halt_only", "halt only"),
+                "RM_ACTION_FLATTEN_AND_HALT": ("flatten_and_halt", "flatten and halt"),
+            },
+        )
+    if value_type == "reset":
+        return normalize_rm_enum_value(
+            text,
+            param_name,
+            {
+                "RM_RESET_NEXT_DAY": ("next_day", "next day"),
+                "RM_RESET_MANUAL": ("manual",),
+            },
+        )
+    raise ValueError("unsupported input_param type")
+
+
 def build_rm_control_command(account_login, req: RmControlCommandRequest):
     action = (req.action or "").strip().lower()
     if action in RM_CONTROL_ACTION_COMMANDS:
         return f"/{int(account_login)} {RM_CONTROL_ACTION_COMMANDS[action]}"
 
-    if action == "stop_until":
-        return f"/{int(account_login)} stop {normalize_rm_until(req.until)}"
+    if action == "stop_account":
+        duration = (req.duration or "").strip().lower()
+        if duration == "manual":
+            return f"/{int(account_login)} halt"
+        if duration == "day":
+            return f"/{int(account_login)} day_stop"
+        if duration == "week":
+            return f"/{int(account_login)} week_stop"
+        if duration == "until":
+            return f"/{int(account_login)} stop {normalize_rm_until(req.until)}"
+        raise ValueError("duration must be manual, day, week, or until")
 
     if action == "stop_bots":
         bots = ",".join(normalize_rm_bot_ids(req.bot_ids))
         duration = (req.duration or "").strip().lower()
-        if duration in ("day", "week"):
+        if duration in ("manual", "day", "week"):
             stop_until = duration
         elif duration == "until":
             stop_until = normalize_rm_until(req.until)
         else:
-            raise ValueError("duration must be day, week, or until")
+            raise ValueError("duration must be manual, day, week, or until")
         return f"/{int(account_login)} stop bots {bots} {stop_until}"
 
     if action == "resume_bots":
         bots = ",".join(normalize_rm_bot_ids(req.bot_ids))
         return f"/{int(account_login)} resume bots {bots}"
 
-    if action == "set":
-        key = (req.set_key or "").strip().lower()
-        if key not in RM_CONTROL_SET_KEYS:
-            raise ValueError("unsupported set key")
-        value = (req.set_value or "").strip()
-        if not value:
-            raise ValueError("set value is required")
-        if key in ("profit_abs", "profit_pct", "loss_abs", "loss_pct"):
-            try:
-                number = float(value)
-            except ValueError:
-                raise ValueError(f"{key} expects a number")
-            if number < 0:
-                raise ValueError(f"{key} expects a non-negative number")
-        elif key == "metric":
-            if value.lower() not in ("balance", "equity"):
-                raise ValueError("metric expects balance or equity")
-            value = value.lower()
-        else:
-            if value.lower() not in ("on", "off", "true", "false", "1", "0", "enable", "disable", "enabled", "disabled"):
-                raise ValueError(f"{key} expects on/off")
-            value = value.lower()
-        return f"/{int(account_login)} set {RM_CONTROL_SET_KEYS[key]} {value}"
-
     raise ValueError("unsupported RM action")
+
+
+def rm_controller_choices(input_param):
+    value_type = RM_CONTROL_INPUT_PARAMS.get(input_param)
+    if value_type == "bool":
+        return [
+            {"allowed_value": "true", "value_desc": "enabled"},
+            {"allowed_value": "false", "value_desc": "disabled"},
+        ]
+    if value_type == "metric":
+        return [
+            {"allowed_value": "RM_METRIC_BALANCE", "value_desc": "balance"},
+            {"allowed_value": "RM_METRIC_EQUITY", "value_desc": "equity"},
+        ]
+    if value_type == "action":
+        return [
+            {"allowed_value": "RM_ACTION_HALT_ONLY", "value_desc": "halt only"},
+            {"allowed_value": "RM_ACTION_FLATTEN_AND_HALT", "value_desc": "flatten and halt"},
+        ]
+    if value_type == "reset":
+        return [
+            {"allowed_value": "RM_RESET_NEXT_DAY", "value_desc": "next day"},
+            {"allowed_value": "RM_RESET_MANUAL", "value_desc": "manual"},
+        ]
+    return []
+
+
+def load_rm_controller_current_values(cur, account_login):
+    values = dict(RM_CONTROLLER_DEFAULT_VALUES)
+    cur.execute(
+        """
+        SELECT runtime_json
+          FROM bot_param.bot_runtime_status
+         WHERE env = 'prod'
+           AND account_login = %s
+           AND bot_kind = 'rm_controller'
+         ORDER BY last_seen_at DESC
+         LIMIT 1
+        """,
+        (account_login,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return values
+    runtime_json = row["runtime_json"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
+    if isinstance(runtime_json, str):
+        try:
+            runtime_json = json.loads(runtime_json)
+        except Exception:
+            runtime_json = {}
+    owner_rm = (runtime_json or {}).get("owner_rm") or {}
+    for key in RM_CONTROLLER_DEFAULT_VALUES:
+        if key in owner_rm and owner_rm[key] is not None:
+            values[key] = str(owner_rm[key]).lower() if isinstance(owner_rm[key], bool) else str(owner_rm[key])
+    return values
+
+
+def build_rm_controller_param_rows(cur, account_login):
+    values = load_rm_controller_current_values(cur, account_login)
+    rows = []
+    for idx, (group, input_param, desc, value_type) in enumerate(RM_CONTROLLER_PARAM_DEFS, start=1):
+        rows.append(
+            {
+                "row_id": -idx,
+                "account_login": account_login,
+                "bot": RM_CONTROLLER_BOT,
+                "param_group": group,
+                "input_param": input_param,
+                "param_desc": desc,
+                "current_value": values.get(input_param, ""),
+                "new_value_ui": "",
+                "reason": None,
+                "has_choices": bool(rm_controller_choices(input_param)),
+            }
+        )
+    return rows
+
+
+def insert_rm_control_command(cur, account, actor, command_text, reason, action):
+    payload = {
+        "command": command_text,
+        "actor": actor,
+        "source": "config-ui",
+        "action": action,
+    }
+    cur.execute(
+        """
+        INSERT INTO bot_param.bot_command (
+            env,
+            account_login,
+            target_bot_kind,
+            target_bot_id,
+            command_type,
+            command_payload,
+            priority,
+            created_by,
+            created_source,
+            created_reason
+        )
+        VALUES (
+            'prod',
+            %s,
+            'rm_controller',
+            'rm_controller',
+            'RM_CONTROL',
+            %s::jsonb,
+            250,
+            %s,
+            'config-ui',
+            %s
+        )
+        RETURNING command_id,
+                  account_login,
+                  target_bot_kind,
+                  target_bot_id,
+                  command_type,
+                  command_payload,
+                  status,
+                  created_at
+        """,
+        (
+            account,
+            json.dumps(payload, separators=(",", ":")),
+            actor,
+            reason,
+        ),
+    )
+    return dict(cur.fetchone())
 
 
 def config_ui_login_html(error=None):
@@ -631,6 +864,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       --bg: #f5f7fa;
       --panel: #ffffff;
       --danger: #9f1d1d;
+      --rm-bg: #edf8f4;
+      --rm-border: #8bc9ba;
+      --rm-accent: #0f766e;
+      --rm-soft: #d9f0e9;
     }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--text); }
@@ -657,15 +894,23 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .target-option.is-unavailable { color: var(--muted); }
     .target-option input { width: auto; flex: 0 0 auto; }
     .target-option span { min-width: 0; overflow-wrap: anywhere; }
-    .rm-control { margin-bottom: 12px; padding: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+    .tabs { display: flex; gap: 6px; align-items: center; margin: 10px 0 12px; border-bottom: 1px solid var(--border); overflow-x: auto; }
+    .tab-btn { flex: 0 0 auto; border: 1px solid transparent; border-bottom: 0; border-radius: 8px 8px 0 0; padding: 10px 14px; background: transparent; color: #314052; font-weight: 700; }
+    .tab-btn:hover { background: #eef4fb; }
+    .tab-btn.is-active { background: var(--panel); border-color: var(--border); color: var(--accent); }
+    #rmTab:hover { background: var(--rm-soft); }
+    #rmTab.is-active { background: var(--rm-bg); border-color: var(--rm-border); color: var(--rm-accent); }
+    .tab-panel[hidden] { display: none; }
+    .rm-control { margin-bottom: 12px; padding: 12px; background: var(--rm-bg); border: 1px solid var(--rm-border); border-radius: 8px; box-shadow: inset 4px 0 0 var(--rm-accent); }
     .rm-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-    .rm-title { font-size: 15px; font-weight: 700; }
+    .rm-title { font-size: 15px; font-weight: 700; color: #0b534d; }
     .rm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; align-items: start; }
-    .rm-check-list { min-height: 38px; max-height: 132px; overflow-y: auto; border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; padding: 4px; }
+    .rm-check-list { min-height: 38px; max-height: 132px; overflow-y: auto; border: 1px solid var(--rm-border); border-radius: 6px; background: #fff; padding: 4px; }
     .rm-option { display: flex; align-items: center; gap: 8px; min-height: 28px; padding: 3px 5px; border-radius: 4px; color: var(--text); font-size: 13px; font-weight: 500; }
-    .rm-option:hover { background: #eef4fb; }
+    .rm-option:hover { background: var(--rm-soft); }
     .rm-option input { width: auto; flex: 0 0 auto; }
-    .rm-preview { min-height: 38px; max-height: 96px; overflow: auto; margin: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: #f8fafc; color: #314052; font: 12px Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .rm-desc { min-height: 34px; padding: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .rm-preview { min-height: 38px; max-height: 96px; overflow: auto; margin: 0; padding: 8px 10px; border: 1px solid var(--rm-border); border-radius: 6px; background: #f7fcfa; color: #26413d; font: 12px Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
     .rm-footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: start; margin-top: 10px; }
     .runtime-list { margin-top: 10px; overflow-x: hidden; }
     .runtime-list table { min-width: 0; table-layout: fixed; }
@@ -716,6 +961,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .meta { grid-column: 1 / -1; }
       .toolbar { grid-template-columns: 1fr; }
       main { padding: 10px; }
+      .tabs { margin-top: 8px; }
+      .tab-btn { flex: 1 0 auto; min-height: 42px; }
       .table-wrap { border: 0; border-radius: 0; overflow-x: visible; background: transparent; }
       .params-table, .params-table thead, .params-table tbody, .params-table tr, .params-table td { display: block; width: 100%; }
       .params-table { min-width: 0; border-collapse: separate; }
@@ -768,125 +1015,112 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     </div>
   </header>
   <main>
-    <section class="toolbar" aria-label="filters">
-      <div class="field">
-        <label for="accountSelect">Account</label>
-        <select id="accountSelect"></select>
-      </div>
-      <div class="field">
-        <label for="botSelect">Bot</label>
-        <select id="botSelect"></select>
-      </div>
-      <div class="field">
-        <label for="groupFilter">Group</label>
-        <select id="groupFilter"><option value="">All groups</option></select>
-      </div>
-      <div class="field">
-        <label for="searchInput">Search</label>
-        <input id="searchInput" type="search" placeholder="input_param or description">
-      </div>
-      <div class="field">
-        <label>Copy</label>
-        <label class="copy-line"><input id="copyToggle" type="checkbox"> Apply same values</label>
-      </div>
-      <div class="field">
-        <label id="targetAccountLabel">Target accounts</label>
-        <div id="targetAccountList" class="target-list is-disabled" role="group" aria-labelledby="targetAccountLabel"></div>
-      </div>
-    </section>
-
     <div id="status" class="status"></div>
 
-    <section class="rm-control" aria-label="rm-control">
-      <div class="rm-head">
-        <div class="rm-title">RM control</div>
-        <button id="rmRefreshStatusBtn" class="secondary" type="button">Refresh status</button>
-      </div>
-      <div class="rm-grid">
+    <nav class="tabs" role="tablist" aria-label="form tabs">
+      <button id="paramsTab" class="tab-btn is-active" type="button" role="tab" aria-selected="true" aria-controls="paramsPanel">Params</button>
+      <button id="rmTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="rmPanel">RM command</button>
+    </nav>
+
+    <section id="paramsPanel" class="tab-panel" role="tabpanel" aria-labelledby="paramsTab">
+      <section class="toolbar" aria-label="filters">
         <div class="field">
-          <label>Accounts</label>
-          <div id="rmAccountList" class="rm-check-list"></div>
+          <label for="accountSelect">Account</label>
+          <select id="accountSelect"></select>
         </div>
         <div class="field">
-          <label for="rmActionSelect">Command</label>
-          <select id="rmActionSelect">
-            <option value="status">Status</option>
-            <option value="status_bots">Bots status</option>
-            <option value="config">Config</option>
-            <option value="halt">Halt account</option>
-            <option value="day_stop">Day stop account</option>
-            <option value="week_stop">Week stop account</option>
-            <option value="stop_until">Stop account until</option>
-            <option value="resume">Resume account</option>
-            <option value="rm_daystart">RM daystart</option>
-            <option value="rm_reset">RM reset</option>
-            <option value="stop_bots">Stop selected bots</option>
-            <option value="resume_bots">Resume selected bots</option>
-            <option value="set">Set RM value</option>
-            <option value="whoami">Whoami</option>
-          </select>
+          <label for="botSelect">Bot</label>
+          <select id="botSelect"></select>
         </div>
-        <div class="field" id="rmBotField">
-          <label>Bots</label>
-          <div id="rmBotList" class="rm-check-list"></div>
+        <div class="field">
+          <label for="groupFilter">Group</label>
+          <select id="groupFilter"><option value="">All groups</option></select>
         </div>
-        <div class="field" id="rmDurationField">
-          <label for="rmDurationSelect">Duration</label>
-          <select id="rmDurationSelect">
-            <option value="day">Day</option>
-            <option value="week">Week</option>
-            <option value="until">Until</option>
-          </select>
+        <div class="field">
+          <label for="searchInput">Search</label>
+          <input id="searchInput" type="search" placeholder="input_param or description">
         </div>
-        <div class="field" id="rmUntilField">
-          <label for="rmUntilInput">Until</label>
-          <input id="rmUntilInput" type="text" placeholder="YYYY.MM.DD HH:MM">
+        <div class="field">
+          <label>Copy</label>
+          <label class="copy-line"><input id="copyToggle" type="checkbox"> Apply same values</label>
         </div>
-        <div class="field" id="rmSetKeyField">
-          <label for="rmSetKeySelect">Set key</label>
-          <select id="rmSetKeySelect">
-            <option value="profit_abs">profit_abs</option>
-            <option value="profit_pct">profit_pct</option>
-            <option value="loss_abs">loss_abs</option>
-            <option value="loss_pct">loss_pct</option>
-            <option value="metric">metric</option>
-            <option value="use_profit_abs">use_profit_abs</option>
-            <option value="use_profit_pct">use_profit_pct</option>
-            <option value="use_loss_abs">use_loss_abs</option>
-            <option value="use_loss_pct">use_loss_pct</option>
-          </select>
+        <div class="field">
+          <label id="targetAccountLabel">Target accounts</label>
+          <div id="targetAccountList" class="target-list is-disabled" role="group" aria-labelledby="targetAccountLabel"></div>
         </div>
-        <div class="field" id="rmSetValueField">
-          <label for="rmSetValueInput">Set value</label>
-          <input id="rmSetValueInput" type="text" placeholder="value">
-        </div>
-      </div>
-      <div class="rm-footer">
-        <pre id="rmCommandPreview" class="rm-preview"></pre>
-        <button id="rmSendBtn" type="button">Send RM command</button>
-      </div>
-      <div id="rmRuntimeList" class="runtime-list"></div>
+      </section>
+
+      <section class="table-wrap">
+        <table class="params-table">
+          <thead>
+            <tr>
+              <th>group</th>
+              <th>input_param</th>
+              <th>param_desc</th>
+              <th>current_value</th>
+              <th>new value</th>
+              <th>reason</th>
+            </tr>
+          </thead>
+          <tbody id="paramsBody"></tbody>
+        </table>
+      </section>
+
+      <section class="footer">
+        <div id="changedCount" class="changed-count">0 changed rows</div>
+        <button id="saveBtn" type="button" disabled>Save changes</button>
+      </section>
     </section>
 
-    <section class="table-wrap">
-      <table class="params-table">
-        <thead>
-          <tr>
-            <th>group</th>
-            <th>input_param</th>
-            <th>param_desc</th>
-            <th>current_value</th>
-            <th>new value</th>
-            <th>reason</th>
-          </tr>
-        </thead>
-        <tbody id="paramsBody"></tbody>
-      </table>
-    </section>
-
-    <section class="footer">
-      <div id="changedCount" class="changed-count">0 changed rows</div>
-      <button id="saveBtn" type="button" disabled>Save changes</button>
+    <section id="rmPanel" class="tab-panel" role="tabpanel" aria-labelledby="rmTab" hidden>
+      <section class="rm-control" aria-label="rm-control">
+        <div class="rm-head">
+          <div class="rm-title">RM control</div>
+          <button id="rmRefreshStatusBtn" class="secondary" type="button">Refresh status</button>
+        </div>
+        <div class="rm-grid">
+          <div class="field">
+            <label>Accounts</label>
+            <div id="rmAccountList" class="rm-check-list"></div>
+          </div>
+          <div class="field">
+            <label for="rmActionSelect">Command</label>
+            <select id="rmActionSelect">
+              <option value="status">Status</option>
+              <option value="config">Config</option>
+              <option value="stop_account">Stop account</option>
+              <option value="resume">Resume account</option>
+              <option value="rm_daystart">RM daystart</option>
+              <option value="rm_reset">RM reset</option>
+              <option value="stop_bots">Stop selected bots</option>
+              <option value="resume_bots">Resume selected bots</option>
+            </select>
+            <div id="rmCommandDescription" class="rm-desc"></div>
+          </div>
+          <div class="field" id="rmBotField">
+            <label>Bots</label>
+            <div id="rmBotList" class="rm-check-list"></div>
+          </div>
+          <div class="field" id="rmPeriodField">
+            <label>Period</label>
+            <div id="rmPeriodList" class="rm-check-list">
+              <label class="rm-option"><input type="checkbox" value="manual" checked> Manual</label>
+              <label class="rm-option"><input type="checkbox" value="day"> Day</label>
+              <label class="rm-option"><input type="checkbox" value="week"> Week</label>
+              <label class="rm-option"><input type="checkbox" value="until"> Until</label>
+            </div>
+          </div>
+          <div class="field" id="rmUntilField">
+            <label for="rmUntilInput">Until</label>
+            <input id="rmUntilInput" type="text" placeholder="YYYY.MM.DD HH:MM">
+          </div>
+        </div>
+        <div class="rm-footer">
+          <pre id="rmCommandPreview" class="rm-preview"></pre>
+          <button id="rmSendBtn" type="button">Send RM command</button>
+        </div>
+        <div id="rmRuntimeList" class="runtime-list"></div>
+      </section>
     </section>
   </main>
   <script>
@@ -895,6 +1129,16 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     const CODE_VERSION = __CODE_VERSION__;
     const choiceCache = new Map();
     const RM_BOT_IDS = ['n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'bot123'];
+    const RM_COMMAND_DESCRIPTIONS = {
+      status: 'Show account RM state, active account stop, selected bot stops and runtime heartbeat.',
+      config: 'Show current RM limits and owner configuration.',
+      stop_account: 'Stop trading on the selected account for the selected period.',
+      resume: "Clear current account stop and keep today's baseline.",
+      rm_daystart: "Clear current account stop and restore today's day-start baseline.",
+      rm_reset: 'Rearm RM from current balance/equity.',
+      stop_bots: 'Stop only selected bot families for the selected period.',
+      resume_bots: 'Clear stops for selected bot families.'
+    };
 
     const els = {
       sessionUser: document.getElementById('sessionUser'),
@@ -908,20 +1152,21 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       targetAccountList: document.getElementById('targetAccountList'),
       rmAccountList: document.getElementById('rmAccountList'),
       rmActionSelect: document.getElementById('rmActionSelect'),
+      rmCommandDescription: document.getElementById('rmCommandDescription'),
       rmBotField: document.getElementById('rmBotField'),
       rmBotList: document.getElementById('rmBotList'),
-      rmDurationField: document.getElementById('rmDurationField'),
-      rmDurationSelect: document.getElementById('rmDurationSelect'),
+      rmPeriodField: document.getElementById('rmPeriodField'),
+      rmPeriodList: document.getElementById('rmPeriodList'),
       rmUntilField: document.getElementById('rmUntilField'),
       rmUntilInput: document.getElementById('rmUntilInput'),
-      rmSetKeyField: document.getElementById('rmSetKeyField'),
-      rmSetKeySelect: document.getElementById('rmSetKeySelect'),
-      rmSetValueField: document.getElementById('rmSetValueField'),
-      rmSetValueInput: document.getElementById('rmSetValueInput'),
       rmCommandPreview: document.getElementById('rmCommandPreview'),
       rmSendBtn: document.getElementById('rmSendBtn'),
       rmRefreshStatusBtn: document.getElementById('rmRefreshStatusBtn'),
       rmRuntimeList: document.getElementById('rmRuntimeList'),
+      paramsTab: document.getElementById('paramsTab'),
+      rmTab: document.getElementById('rmTab'),
+      paramsPanel: document.getElementById('paramsPanel'),
+      rmPanel: document.getElementById('rmPanel'),
       status: document.getElementById('status'),
       paramsBody: document.getElementById('paramsBody'),
       changedCount: document.getElementById('changedCount'),
@@ -935,6 +1180,17 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     function setStatus(text, isError = false) {
       els.status.textContent = text || '';
       els.status.className = isError ? 'status error' : 'status';
+    }
+
+    function switchFormTab(tab) {
+      const showRm = tab === 'rm';
+      els.paramsPanel.hidden = showRm;
+      els.rmPanel.hidden = !showRm;
+      els.paramsTab.classList.toggle('is-active', !showRm);
+      els.rmTab.classList.toggle('is-active', showRm);
+      els.paramsTab.setAttribute('aria-selected', showRm ? 'false' : 'true');
+      els.rmTab.setAttribute('aria-selected', showRm ? 'true' : 'false');
+      if (showRm) loadRuntimeStatus().catch(exc => setStatus(exc.message, true));
     }
 
     async function api(path, options = {}) {
@@ -1003,6 +1259,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return Array.from(container.querySelectorAll('input[type="checkbox"]:checked')).map(input => input.value);
     }
 
+    function singleCheckedValue(container, fallback) {
+      const checked = container.querySelector('input[type="checkbox"]:checked');
+      return checked ? checked.value : fallback;
+    }
+
     function fillRmAccountList(rows) {
       els.rmAccountList.innerHTML = '';
       const currentAccount = els.accountSelect.value;
@@ -1064,47 +1325,47 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return els.rmUntilInput.value.trim();
     }
 
+    function selectedRmPeriod() {
+      return singleCheckedValue(els.rmPeriodList, 'manual');
+    }
+
     function buildRmCommandCore() {
       const action = els.rmActionSelect.value;
-      if (action === 'stop_until') return 'stop ' + (rmUntilValue() || 'YYYY.MM.DD HH:MM');
+      const period = selectedRmPeriod();
+      if (action === 'stop_account') {
+        if (period === 'manual') return 'halt';
+        if (period === 'day') return 'day_stop';
+        if (period === 'week') return 'week_stop';
+        return 'stop ' + (rmUntilValue() || 'YYYY.MM.DD HH:MM');
+      }
       if (action === 'stop_bots') {
         const bots = checkedValues(els.rmBotList).join(',') || 'n4,n5,n6,n7,n8,n9,bot123';
-        const duration = els.rmDurationSelect.value === 'until' ? (rmUntilValue() || 'YYYY.MM.DD HH:MM') : els.rmDurationSelect.value;
+        const duration = period === 'until' ? (rmUntilValue() || 'YYYY.MM.DD HH:MM') : period;
         return 'stop bots ' + bots + ' ' + duration;
       }
       if (action === 'resume_bots') {
         const bots = checkedValues(els.rmBotList).join(',') || 'n4,n5,n6,n7,n8,n9,bot123';
         return 'resume bots ' + bots;
       }
-      if (action === 'set') {
-        return 'set ' + els.rmSetKeySelect.value + ' ' + (els.rmSetValueInput.value.trim() || 'value');
-      }
       return {
         status: 'status',
-        status_bots: 'status bots',
         config: 'config',
-        halt: 'halt',
-        day_stop: 'day_stop',
-        week_stop: 'week_stop',
         resume: 'resume',
         rm_daystart: 'rm_daystart',
-        rm_reset: 'rm_reset',
-        whoami: 'whoami'
+        rm_reset: 'rm_reset'
       }[action] || action;
     }
 
     function updateRmCommandUi() {
       const action = els.rmActionSelect.value;
       const needsBots = action === 'stop_bots' || action === 'resume_bots';
-      const needsDuration = action === 'stop_bots';
-      const needsUntil = action === 'stop_until' || (action === 'stop_bots' && els.rmDurationSelect.value === 'until');
-      const needsSet = action === 'set';
+      const needsPeriod = action === 'stop_account' || action === 'stop_bots';
+      const needsUntil = needsPeriod && selectedRmPeriod() === 'until';
 
       els.rmBotField.style.display = needsBots ? '' : 'none';
-      els.rmDurationField.style.display = needsDuration ? '' : 'none';
+      els.rmPeriodField.style.display = needsPeriod ? '' : 'none';
       els.rmUntilField.style.display = needsUntil ? '' : 'none';
-      els.rmSetKeyField.style.display = needsSet ? '' : 'none';
-      els.rmSetValueField.style.display = needsSet ? '' : 'none';
+      els.rmCommandDescription.textContent = RM_COMMAND_DESCRIPTIONS[action] || '';
 
       const accounts = checkedValues(els.rmAccountList);
       if (!accounts.length) {
@@ -1120,10 +1381,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         account_logins: checkedValues(els.rmAccountList).map(value => Number(value)),
         action: els.rmActionSelect.value,
         bot_ids: checkedValues(els.rmBotList),
-        duration: els.rmDurationSelect.value,
+        duration: selectedRmPeriod(),
         until: rmUntilValue(),
-        set_key: els.rmSetKeySelect.value,
-        set_value: els.rmSetValueInput.value.trim(),
         reason: 'config-ui ' + CONFIG_ACTOR
       };
     }
@@ -1346,7 +1605,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         if (!value) continue;
         const rowId = Number(control.dataset.rowId);
         const reason = els.paramsBody.querySelector('.reason-input[data-row-id="' + rowId + '"]');
-        changes.push({row_id: rowId, value, reason: reason ? reason.value.trim() || null : null});
+        changes.push({row_id: rowId, input_param: control.dataset.inputParam || null, value, reason: reason ? reason.value.trim() || null : null});
       }
       return changes;
     }
@@ -1401,11 +1660,22 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.searchInput.addEventListener('input', applyFilters);
     els.copyToggle.addEventListener('change', loadCopyTargets);
     els.saveBtn.addEventListener('click', saveChanges);
+    els.paramsTab.addEventListener('click', () => switchFormTab('params'));
+    els.rmTab.addEventListener('click', () => switchFormTab('rm'));
     els.rmActionSelect.addEventListener('change', updateRmCommandUi);
-    els.rmDurationSelect.addEventListener('change', updateRmCommandUi);
+    for (const input of els.rmPeriodList.querySelectorAll('input[type="checkbox"]')) {
+      input.addEventListener('change', () => {
+        if (input.checked) {
+          for (const other of els.rmPeriodList.querySelectorAll('input[type="checkbox"]')) {
+            if (other !== input) other.checked = false;
+          }
+        } else if (!checkedValues(els.rmPeriodList).length) {
+          input.checked = true;
+        }
+        updateRmCommandUi();
+      });
+    }
     els.rmUntilInput.addEventListener('input', updateRmCommandUi);
-    els.rmSetKeySelect.addEventListener('change', updateRmCommandUi);
-    els.rmSetValueInput.addEventListener('input', updateRmCommandUi);
     els.rmSendBtn.addEventListener('click', sendRmCommand);
     els.rmRefreshStatusBtn.addEventListener('click', () => loadRuntimeStatus().catch(exc => setStatus(exc.message, true)));
 
@@ -2424,6 +2694,10 @@ async def config_ui_bots(request: Request, account_login: int):
                        COALESCE(c.display_name, e.bot) AS display_name,
                        COALESCE(c.sort_order, 9999) AS sort_order
                   FROM bot_param.bot_config_user_editor e
+                  JOIN bot_param.bot_config_param_catalog pc
+                    ON pc.bot_kind = e.bot
+                   AND COALESCE(pc.input_param_name, pc.param_key) = e.input_param
+                   AND COALESCE(pc.user_editable, true) = true
                   LEFT JOIN bot_param.bot_catalog c
                     ON c.bot_kind = e.bot
                   JOIN bot_param.operator_account oa
@@ -2438,6 +2712,9 @@ async def config_ui_bots(request: Request, account_login: int):
                 (actor, account_login),
             )
             rows = [dict(row) for row in cur.fetchall()]
+            if not any((row.get("bot") or "").lower() == RM_CONTROLLER_BOT for row in rows):
+                rows.append({"bot": RM_CONTROLLER_BOT, "display_name": RM_CONTROLLER_BOT_LABEL, "sort_order": 50})
+            rows.sort(key=lambda row: (int(row.get("sort_order") or 9999), row.get("display_name") or row.get("bot") or ""))
         return {"ok": True, "bots": rows, "version": CODE_VERSION}
     except Exception as exc:
         return config_ui_json_error(500, first_error_line(exc))
@@ -2458,6 +2735,9 @@ async def config_ui_params(request: Request, account_login: int, bot: str):
         with conn.cursor(cursor_factory=DictCursor) as cur:
             if not ensure_actor_account_access(cur, actor, account_login, can_apply=False):
                 return config_ui_json_error(403, "account is not available for actor")
+            if is_rm_controller_bot(bot):
+                rows = build_rm_controller_param_rows(cur, account_login)
+                return {"ok": True, "params": rows, "version": CODE_VERSION}
             cur.execute(
                 """
                 SELECT
@@ -2482,10 +2762,14 @@ async def config_ui_params(request: Request, account_login: int, bot: str):
                     EXISTS (
                         SELECT 1
                           FROM bot_param.bot_config_allowed_value av
-                         WHERE av.bot = e.bot
+                        WHERE av.bot = e.bot
                            AND av.input_param = e.input_param
                     ) AS has_choices
                   FROM bot_param.bot_config_user_editor e
+                  JOIN bot_param.bot_config_param_catalog pc
+                    ON pc.bot_kind = e.bot
+                   AND COALESCE(pc.input_param_name, pc.param_key) = e.input_param
+                   AND COALESCE(pc.user_editable, true) = true
                   JOIN bot_param.operator_account oa
                     ON oa.env = 'prod'
                    AND oa.account_login = e.account_login
@@ -2515,6 +2799,8 @@ async def config_ui_choices(request: Request, bot: str, input_param: str):
     input_param = (input_param or "").strip()
     if not bot or not input_param:
         return config_ui_json_error(400, "bot and input_param are required")
+    if is_rm_controller_bot(bot):
+        return {"ok": True, "actor": actor, "choices": rm_controller_choices(input_param), "version": CODE_VERSION}
     conn = config_ui_conn()
     try:
         with conn.cursor(cursor_factory=DictCursor) as cur:
@@ -2547,6 +2833,24 @@ async def config_ui_copy_target_accounts(request: Request, source_account_login:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             if not ensure_actor_account_access(cur, actor, source_account_login, can_apply=True):
                 return config_ui_json_error(403, "source account is not available for apply")
+            if is_rm_controller_bot(bot):
+                cur.execute(
+                    """
+                    SELECT oa.account_login,
+                           oa.account_label,
+                           true AS has_bot_config
+                      FROM bot_param.operator_account oa
+                     WHERE oa.env = 'prod'
+                       AND oa.db_user = %s
+                       AND oa.enabled = true
+                       AND oa.can_apply = true
+                       AND oa.account_login <> %s
+                     ORDER BY oa.account_label, oa.account_login
+                    """,
+                    (actor, source_account_login),
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+                return {"ok": True, "accounts": rows, "version": CODE_VERSION}
             cur.execute(
                 """
                 SELECT oa.account_login,
@@ -2554,6 +2858,10 @@ async def config_ui_copy_target_accounts(request: Request, source_account_login:
                        EXISTS (
                            SELECT 1
                              FROM bot_param.bot_config_user_editor e
+                             JOIN bot_param.bot_config_param_catalog pc
+                               ON pc.bot_kind = e.bot
+                              AND COALESCE(pc.input_param_name, pc.param_key) = e.input_param
+                              AND COALESCE(pc.user_editable, true) = true
                             WHERE e.account_login = oa.account_login
                               AND e.bot = %s
                        ) AS has_bot_config
@@ -2657,55 +2965,16 @@ async def config_ui_rm_command(req: RmControlCommandRequest, request: Request):
                 if not ensure_actor_account_access(cur, actor, account, can_apply=True):
                     raise ValueError(f"account {account} is not available for RM control")
                 command_text = build_rm_control_command(account, req)
-                payload = {
-                    "command": command_text,
-                    "actor": actor,
-                    "source": "config-ui",
-                    "action": (req.action or "").strip().lower(),
-                }
-                cur.execute(
-                    """
-                    INSERT INTO bot_param.bot_command (
-                        env,
-                        account_login,
-                        target_bot_kind,
-                        target_bot_id,
-                        command_type,
-                        command_payload,
-                        priority,
-                        created_by,
-                        created_source,
-                        created_reason
-                    )
-                    VALUES (
-                        'prod',
-                        %s,
-                        'rm_controller',
-                        'rm_controller',
-                        'RM_CONTROL',
-                        %s::jsonb,
-                        250,
-                        %s,
-                        'config-ui',
-                        %s
-                    )
-                    RETURNING command_id,
-                              account_login,
-                              target_bot_kind,
-                              target_bot_id,
-                              command_type,
-                              command_payload,
-                              status,
-                              created_at
-                    """,
-                    (
+                commands.append(
+                    insert_rm_control_command(
+                        cur,
                         account,
-                        json.dumps(payload, separators=(",", ":")),
                         actor,
+                        command_text,
                         (req.reason or f"RM control {(req.action or '').strip().lower()}").strip(),
-                    ),
+                        (req.action or "").strip().lower(),
+                    )
                 )
-                commands.append(dict(cur.fetchone()))
         conn.commit()
         return {"ok": True, "commands": commands, "version": CODE_VERSION}
     except ValueError as exc:
@@ -2753,6 +3022,35 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
                 if not ensure_actor_account_access(cur, actor, target_account, can_apply=True):
                     return config_ui_json_error(403, f"target account {target_account} is not available for apply")
 
+            if is_rm_controller_bot(bot):
+                apply_accounts = [req.account_login] + target_accounts
+                for change in req.changes:
+                    input_param = (change.input_param or "").strip()
+                    value = normalize_rm_input_value(input_param, change.value)
+                    reason = (change.reason or "").strip() or f"RM input_param {input_param}"
+                    for account in apply_accounts:
+                        command_text = f"/{int(account)} set_input {input_param} {value}"
+                        applied.append(
+                            {
+                                "source": insert_rm_control_command(
+                                    cur,
+                                    account,
+                                    actor,
+                                    command_text,
+                                    reason,
+                                    "set_input",
+                                )
+                            }
+                        )
+                conn.commit()
+                return {
+                    "ok": True,
+                    "actor": actor,
+                    "applied": applied,
+                    "applied_count": len(applied),
+                    "version": CODE_VERSION,
+                }
+
             for change in req.changes:
                 value = (change.value or "").strip()
                 if not value:
@@ -2761,12 +3059,16 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
 
                 cur.execute(
                     """
-                    SELECT row_id, account_login, bot, input_param
-                      FROM bot_param.bot_config_user_editor
-                     WHERE row_id = %s
-                       AND account_login = %s
-                       AND bot = %s
-                     FOR UPDATE
+                    SELECT e.row_id, e.account_login, e.bot, e.input_param
+                      FROM bot_param.bot_config_user_editor e
+                      JOIN bot_param.bot_config_param_catalog pc
+                        ON pc.bot_kind = e.bot
+                       AND COALESCE(pc.input_param_name, pc.param_key) = e.input_param
+                       AND COALESCE(pc.user_editable, true) = true
+                     WHERE e.row_id = %s
+                       AND e.account_login = %s
+                       AND e.bot = %s
+                     FOR UPDATE OF e
                     """,
                     (change.row_id, req.account_login, bot),
                 )
@@ -2791,12 +3093,16 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
                 for target_account in target_accounts:
                     cur.execute(
                         """
-                        SELECT row_id, account_login, bot, input_param
-                          FROM bot_param.bot_config_user_editor
-                         WHERE account_login = %s
-                           AND bot = %s
-                           AND input_param = %s
-                         FOR UPDATE
+                        SELECT e.row_id, e.account_login, e.bot, e.input_param
+                          FROM bot_param.bot_config_user_editor e
+                          JOIN bot_param.bot_config_param_catalog pc
+                            ON pc.bot_kind = e.bot
+                           AND COALESCE(pc.input_param_name, pc.param_key) = e.input_param
+                           AND COALESCE(pc.user_editable, true) = true
+                         WHERE e.account_login = %s
+                           AND e.bot = %s
+                           AND e.input_param = %s
+                         FOR UPDATE OF e
                         """,
                         (target_account, source["bot"], source["input_param"]),
                     )
