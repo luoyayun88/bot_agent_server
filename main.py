@@ -476,9 +476,10 @@ def bot_runtime_load_changed_params(cur, env, account_login, bot_kind, bot_id, o
     return [dict(row) for row in cur.fetchall()]
 
 
-RM_CONTROL_SUPPORTED_BOT_IDS = ("n4", "n5", "n6", "n7", "n8", "n9", "bot123")
 RM_CONTROLLER_BOT = "rm_controller"
 RM_CONTROLLER_BOT_LABEL = "RM* Controller"
+RM_CONTROLLER_BOT_ID = "rm_controller"
+RM_CONTROLLER_SOURCE_ID = "rm"
 RM_CONTROL_ACTION_COMMANDS = {
     "status": "status",
     "config": "config",
@@ -546,11 +547,230 @@ RM_CONTROLLER_DEFAULT_VALUES = {
 }
 
 
+def rm_controller_config_json(account_login):
+    config = {
+        "schema_version": 1,
+        "env": "prod",
+        "account_login": int(account_login),
+        "bot_kind": RM_CONTROLLER_BOT,
+        "bot_id": RM_CONTROLLER_BOT_ID,
+        "source_id": RM_CONTROLLER_SOURCE_ID,
+        "version_no": 1,
+        "enabled": True,
+        "allow_new_entries": True,
+    }
+    for key, value in RM_CONTROLLER_DEFAULT_VALUES.items():
+        value_type = RM_CONTROL_INPUT_PARAMS.get(key)
+        if value_type == "bool":
+            config[key] = normalize_rm_bool_value(value, key) == "true"
+        elif value_type == "double":
+            config[key] = float(value)
+        elif value_type == "int":
+            config[key] = int(value)
+        else:
+            config[key] = value
+    return config
+
+
+def rm_controller_config_hash(config):
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def rm_controller_catalog_value_type(value_type):
+    if value_type == "double":
+        return "numeric"
+    if value_type in ("metric", "action", "reset"):
+        return "text"
+    return value_type
+
+
+def ensure_rm_controller_catalog(cur):
+    cur.execute("SELECT 1 FROM bot_param.bot_catalog WHERE bot_kind = %s", (RM_CONTROLLER_BOT,))
+    if cur.fetchone():
+        cur.execute(
+            """
+            UPDATE bot_param.bot_catalog
+               SET bot_id = %s,
+                   source_id = %s,
+                   display_name = %s,
+                   ea_file = %s,
+                   sort_order = %s,
+                   enabled = true
+             WHERE bot_kind = %s
+            """,
+            (RM_CONTROLLER_BOT_ID, RM_CONTROLLER_SOURCE_ID, RM_CONTROLLER_BOT_LABEL, "RM_Controller.mq5", 50, RM_CONTROLLER_BOT),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO bot_param.bot_catalog (
+                bot_kind, bot_id, source_id, display_name, ea_file, sort_order, enabled
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, true)
+            """,
+            (RM_CONTROLLER_BOT, RM_CONTROLLER_BOT_ID, RM_CONTROLLER_SOURCE_ID, RM_CONTROLLER_BOT_LABEL, "RM_Controller.mq5", 50),
+        )
+
+    for sort_order, (section_name, input_param, desc, value_type) in enumerate(RM_CONTROLLER_PARAM_DEFS, start=1):
+        allowed_values = [choice["allowed_value"] for choice in rm_controller_choices(input_param)] or None
+        cur.execute(
+            """
+            SELECT 1
+              FROM bot_param.bot_config_param_catalog
+             WHERE bot_kind = %s
+               AND param_key = %s
+            """,
+            (RM_CONTROLLER_BOT, input_param),
+        )
+        catalog_value_type = rm_controller_catalog_value_type(value_type)
+        if cur.fetchone():
+            cur.execute(
+                """
+                UPDATE bot_param.bot_config_param_catalog
+                   SET section_name = %s,
+                       input_param_name = %s,
+                       display_name = %s,
+                       param_desc = %s,
+                       param_path = %s,
+                       value_type = %s,
+                       allowed_values = %s,
+                       sort_order = %s,
+                       user_editable = COALESCE(user_editable, true)
+                 WHERE bot_kind = %s
+                   AND param_key = %s
+                """,
+                (
+                    section_name,
+                    input_param,
+                    input_param,
+                    desc,
+                    input_param,
+                    catalog_value_type,
+                    allowed_values,
+                    sort_order,
+                    RM_CONTROLLER_BOT,
+                    input_param,
+                ),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO bot_param.bot_config_param_catalog (
+                    bot_kind, section_name, param_key, input_param_name, display_name,
+                    param_desc, param_path, value_type, allowed_values, sort_order, user_editable
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true)
+                """,
+                (RM_CONTROLLER_BOT, section_name, input_param, input_param, input_param, desc, input_param, catalog_value_type, allowed_values, sort_order),
+            )
+
+    for input_param, value_type in RM_CONTROL_INPUT_PARAMS.items():
+        for sort_order, choice in enumerate(rm_controller_choices(input_param), start=1):
+            cur.execute(
+                """
+                INSERT INTO bot_param.bot_config_allowed_value (
+                    bot, input_param, allowed_value, value_desc, sort_order
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (bot, input_param, allowed_value)
+                DO UPDATE SET
+                    value_desc = EXCLUDED.value_desc,
+                    sort_order = EXCLUDED.sort_order
+                """,
+                (
+                    RM_CONTROLLER_BOT,
+                    input_param,
+                    choice["allowed_value"],
+                    choice.get("value_desc"),
+                    sort_order,
+                ),
+            )
+
+
+def refresh_rm_controller_editor(cur, account_login):
+    for fn_name in ("refresh_bot_config_editor", "refresh_bot_config_user_editor"):
+        savepoint = f"rm_{fn_name}"
+        cur.execute(f"SAVEPOINT {savepoint}")
+        try:
+            cur.execute(f"SELECT bot_param.{fn_name}(%s, %s, %s)", ("prod", int(account_login), RM_CONTROLLER_BOT))
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+
+
+def ensure_rm_controller_db_config(cur, account_login):
+    ensure_rm_controller_catalog(cur)
+    cur.execute(
+        """
+        SELECT 1
+          FROM bot_param.bot_config_current
+         WHERE env = 'prod'
+           AND account_login = %s
+           AND bot_kind = %s
+           AND bot_id = %s
+        """,
+        (int(account_login), RM_CONTROLLER_BOT, RM_CONTROLLER_BOT_ID),
+    )
+    if not cur.fetchone():
+        config = rm_controller_config_json(account_login)
+        config_hash = rm_controller_config_hash(config)
+        cur.execute(
+            """
+            SELECT config_version_id, config_hash
+              FROM bot_param.bot_config_version
+             WHERE env = 'prod'
+               AND account_login = %s
+               AND bot_kind = %s
+               AND bot_id = %s
+               AND version_no = 1
+            """,
+            (int(account_login), RM_CONTROLLER_BOT, RM_CONTROLLER_BOT_ID),
+        )
+        version_row = cur.fetchone()
+        if version_row:
+            config_id = version_row["config_version_id"] if hasattr(version_row, "keys") else version_row[0]
+            config_hash = version_row["config_hash"] if hasattr(version_row, "keys") else version_row[1]
+        else:
+            cur.execute(
+                """
+                INSERT INTO bot_param.bot_config_version (
+                    env, account_login, bot_kind, bot_id, config_scope, version_no,
+                    status, config_json, config_hash, validation_status, validation_errors,
+                    created_by, created_source, created_reason,
+                    approved_by, approved_at, activated_by, activated_at
+                )
+                VALUES (
+                    'prod', %s, %s, %s, 'bot', 1,
+                    'active', %s::jsonb, %s, 'ok', '[]'::jsonb,
+                    current_user::text, 'config-ui-bootstrap', 'RM controller initial config',
+                    current_user::text, now(), current_user::text, now()
+                )
+                RETURNING config_version_id
+                """,
+                (int(account_login), RM_CONTROLLER_BOT, RM_CONTROLLER_BOT_ID, json.dumps(config, separators=(",", ":")), config_hash),
+            )
+            config_id = cur.fetchone()[0]
+        cur.execute(
+            """
+            INSERT INTO bot_param.bot_config_current (
+                env, account_login, bot_kind, bot_id, active_version_no,
+                active_config_id, config_hash, updated_by, updated_source
+            )
+            VALUES ('prod', %s, %s, %s, 1, %s, %s, current_user::text, 'config-ui-bootstrap')
+            """,
+            (int(account_login), RM_CONTROLLER_BOT, RM_CONTROLLER_BOT_ID, config_id, config_hash),
+        )
+    refresh_rm_controller_editor(cur, account_login)
+
+
 def normalize_rm_bot_ids(bot_ids):
     normalized = []
     for bot_id in bot_ids or []:
         value = (bot_id or "").strip().lower()
-        if value not in RM_CONTROL_SUPPORTED_BOT_IDS:
+        if not re.match(r"^n\d+$", value):
             raise ValueError(f"unsupported bot id: {bot_id}")
         if value not in normalized:
             normalized.append(value)
@@ -581,70 +801,6 @@ def normalize_rm_bool_value(value, param_name):
     if text in ("false", "0", "off", "disable", "disabled", "no"):
         return "false"
     raise ValueError(f"{param_name} expects true/false")
-
-
-def normalize_rm_enum_value(value, param_name, options):
-    raw = (value or "").strip()
-    key = re.sub(r"[^a-z0-9]", "", raw.lower())
-    for exact, aliases in options.items():
-        if key == re.sub(r"[^a-z0-9]", "", exact.lower()):
-            return exact
-        for alias in aliases:
-            if key == re.sub(r"[^a-z0-9]", "", alias.lower()):
-                return exact
-    raise ValueError(f"{param_name} expects one of: {', '.join(options.keys())}")
-
-
-def normalize_rm_input_value(param_name, value):
-    value_type = RM_CONTROL_INPUT_PARAMS.get(param_name)
-    if not value_type:
-        raise ValueError("unsupported input_param")
-    text = (value or "").strip()
-    if not text:
-        raise ValueError("set value is required")
-
-    if value_type == "bool":
-        return normalize_rm_bool_value(text, param_name)
-    if value_type == "double":
-        try:
-            number = float(text)
-        except ValueError:
-            raise ValueError(f"{param_name} expects a number")
-        if number < 0:
-            raise ValueError(f"{param_name} expects a non-negative number")
-        return text
-    if value_type == "int":
-        if not re.match(r"^\d+$", text):
-            raise ValueError(f"{param_name} expects a non-negative integer")
-        return text
-    if value_type == "metric":
-        return normalize_rm_enum_value(
-            text,
-            param_name,
-            {
-                "RM_METRIC_BALANCE": ("balance",),
-                "RM_METRIC_EQUITY": ("equity",),
-            },
-        )
-    if value_type == "action":
-        return normalize_rm_enum_value(
-            text,
-            param_name,
-            {
-                "RM_ACTION_HALT_ONLY": ("halt_only", "halt only"),
-                "RM_ACTION_FLATTEN_AND_HALT": ("flatten_and_halt", "flatten and halt"),
-            },
-        )
-    if value_type == "reset":
-        return normalize_rm_enum_value(
-            text,
-            param_name,
-            {
-                "RM_RESET_NEXT_DAY": ("next_day", "next day"),
-                "RM_RESET_MANUAL": ("manual",),
-            },
-        )
-    raise ValueError("unsupported input_param type")
 
 
 def build_rm_control_command(account_login, req: RmControlCommandRequest):
@@ -705,57 +861,6 @@ def rm_controller_choices(input_param):
             {"allowed_value": "RM_RESET_MANUAL", "value_desc": "manual"},
         ]
     return []
-
-
-def load_rm_controller_current_values(cur, account_login):
-    values = dict(RM_CONTROLLER_DEFAULT_VALUES)
-    cur.execute(
-        """
-        SELECT runtime_json
-          FROM bot_param.bot_runtime_status
-         WHERE env = 'prod'
-           AND account_login = %s
-           AND bot_kind = 'rm_controller'
-         ORDER BY last_seen_at DESC
-         LIMIT 1
-        """,
-        (account_login,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return values
-    runtime_json = row["runtime_json"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
-    if isinstance(runtime_json, str):
-        try:
-            runtime_json = json.loads(runtime_json)
-        except Exception:
-            runtime_json = {}
-    owner_rm = (runtime_json or {}).get("owner_rm") or {}
-    for key in RM_CONTROLLER_DEFAULT_VALUES:
-        if key in owner_rm and owner_rm[key] is not None:
-            values[key] = str(owner_rm[key]).lower() if isinstance(owner_rm[key], bool) else str(owner_rm[key])
-    return values
-
-
-def build_rm_controller_param_rows(cur, account_login):
-    values = load_rm_controller_current_values(cur, account_login)
-    rows = []
-    for idx, (group, input_param, desc, value_type) in enumerate(RM_CONTROLLER_PARAM_DEFS, start=1):
-        rows.append(
-            {
-                "row_id": -idx,
-                "account_login": account_login,
-                "bot": RM_CONTROLLER_BOT,
-                "param_group": group,
-                "input_param": input_param,
-                "param_desc": desc,
-                "current_value": values.get(input_param, ""),
-                "new_value_ui": "",
-                "reason": None,
-                "has_choices": bool(rm_controller_choices(input_param)),
-            }
-        )
-    return rows
 
 
 def insert_rm_control_command(cur, account, actor, command_text, reason, action):
@@ -1128,7 +1233,6 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     const CONFIG_ACTOR = __CONFIG_ACTOR__;
     const CODE_VERSION = __CODE_VERSION__;
     const choiceCache = new Map();
-    const RM_BOT_IDS = ['n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'bot123'];
     const RM_COMMAND_DESCRIPTIONS = {
       status: 'Show account RM state, active account stop, selected bot stops and runtime heartbeat.',
       config: 'Show current RM limits and owner configuration.',
@@ -1139,6 +1243,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       stop_bots: 'Stop only selected bot families for the selected period.',
       resume_bots: 'Clear stops for selected bot families.'
     };
+    let currentBotRows = [];
 
     const els = {
       sessionUser: document.getElementById('sessionUser'),
@@ -1300,9 +1405,28 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       updateRmCommandUi();
     }
 
-    function fillRmBotList() {
+    function isRmStopBot(bot) {
+      return /^n\d+$/i.test(String(bot || '').trim());
+    }
+
+    function fillRmBotList(rows = currentBotRows) {
       els.rmBotList.innerHTML = '';
-      for (const botId of RM_BOT_IDS) {
+      const rmBots = (rows || [])
+        .filter(row => isRmStopBot(row.bot))
+        .sort((a, b) => String(a.bot).localeCompare(String(b.bot), undefined, {numeric: true, sensitivity: 'base'}));
+
+      if (!rmBots.length) {
+        const empty = document.createElement('div');
+        empty.className = 'rm-option';
+        empty.textContent = 'No n* bots for selected account';
+        els.rmBotList.appendChild(empty);
+        updateRmCommandUi();
+        return;
+      }
+
+      for (const row of rmBots) {
+        const botId = String(row.bot).toLowerCase();
+        const displayName = row.display_name || row.bot;
         const option = document.createElement('label');
         option.className = 'rm-option';
 
@@ -1313,7 +1437,9 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         input.addEventListener('change', updateRmCommandUi);
 
         const text = document.createElement('span');
-        text.textContent = botId;
+        text.textContent = displayName && String(displayName).toLowerCase() !== botId
+          ? botId + ' - ' + displayName
+          : botId;
 
         option.appendChild(input);
         option.appendChild(text);
@@ -1339,13 +1465,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         return 'stop ' + (rmUntilValue() || 'YYYY.MM.DD HH:MM');
       }
       if (action === 'stop_bots') {
-        const bots = checkedValues(els.rmBotList).join(',') || 'n4,n5,n6,n7,n8,n9,bot123';
+        const bots = checkedValues(els.rmBotList).join(',');
         const duration = period === 'until' ? (rmUntilValue() || 'YYYY.MM.DD HH:MM') : period;
-        return 'stop bots ' + bots + ' ' + duration;
+        return bots ? 'stop bots ' + bots + ' ' + duration : 'choose n* bots';
       }
       if (action === 'resume_bots') {
-        const bots = checkedValues(els.rmBotList).join(',') || 'n4,n5,n6,n7,n8,n9,bot123';
-        return 'resume bots ' + bots;
+        const bots = checkedValues(els.rmBotList).join(',');
+        return bots ? 'resume bots ' + bots : 'choose n* bots';
       }
       return {
         status: 'status',
@@ -1459,7 +1585,9 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       if (!account) return;
       setStatus('Loading bots...');
       const data = await api('/config-ui/api/bots?account_login=' + encodeURIComponent(account));
-      fillSelect(els.botSelect, data.bots || [], 'bot', 'display_name', '');
+      currentBotRows = data.bots || [];
+      fillSelect(els.botSelect, currentBotRows, 'bot', 'display_name', '');
+      fillRmBotList(currentBotRows);
       const n9 = Array.from(els.botSelect.options).find(o => o.value === 'n9');
       if (n9) els.botSelect.value = 'n9';
       await loadCopyTargets();
@@ -1679,7 +1807,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.rmSendBtn.addEventListener('click', sendRmCommand);
     els.rmRefreshStatusBtn.addEventListener('click', () => loadRuntimeStatus().catch(exc => setStatus(exc.message, true)));
 
-    fillRmBotList();
+    fillRmBotList([]);
     updateRmCommandUi();
     loadAccounts().catch(exc => setStatus(exc.message, true));
   </script>
@@ -2687,6 +2815,8 @@ async def config_ui_bots(request: Request, account_login: int):
         with conn.cursor(cursor_factory=DictCursor) as cur:
             if not ensure_actor_account_access(cur, actor, account_login, can_apply=False):
                 return config_ui_json_error(403, "account is not available for actor")
+            set_actor(cur, actor)
+            ensure_rm_controller_db_config(cur, account_login)
             cur.execute(
                 """
                 SELECT DISTINCT
@@ -2712,9 +2842,8 @@ async def config_ui_bots(request: Request, account_login: int):
                 (actor, account_login),
             )
             rows = [dict(row) for row in cur.fetchall()]
-            if not any((row.get("bot") or "").lower() == RM_CONTROLLER_BOT for row in rows):
-                rows.append({"bot": RM_CONTROLLER_BOT, "display_name": RM_CONTROLLER_BOT_LABEL, "sort_order": 50})
             rows.sort(key=lambda row: (int(row.get("sort_order") or 9999), row.get("display_name") or row.get("bot") or ""))
+        conn.commit()
         return {"ok": True, "bots": rows, "version": CODE_VERSION}
     except Exception as exc:
         return config_ui_json_error(500, first_error_line(exc))
@@ -2735,9 +2864,6 @@ async def config_ui_params(request: Request, account_login: int, bot: str):
         with conn.cursor(cursor_factory=DictCursor) as cur:
             if not ensure_actor_account_access(cur, actor, account_login, can_apply=False):
                 return config_ui_json_error(403, "account is not available for actor")
-            if is_rm_controller_bot(bot):
-                rows = build_rm_controller_param_rows(cur, account_login)
-                return {"ok": True, "params": rows, "version": CODE_VERSION}
             cur.execute(
                 """
                 SELECT
@@ -2799,8 +2925,6 @@ async def config_ui_choices(request: Request, bot: str, input_param: str):
     input_param = (input_param or "").strip()
     if not bot or not input_param:
         return config_ui_json_error(400, "bot and input_param are required")
-    if is_rm_controller_bot(bot):
-        return {"ok": True, "actor": actor, "choices": rm_controller_choices(input_param), "version": CODE_VERSION}
     conn = config_ui_conn()
     try:
         with conn.cursor(cursor_factory=DictCursor) as cur:
@@ -2833,24 +2957,21 @@ async def config_ui_copy_target_accounts(request: Request, source_account_login:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             if not ensure_actor_account_access(cur, actor, source_account_login, can_apply=True):
                 return config_ui_json_error(403, "source account is not available for apply")
+            set_actor(cur, actor)
             if is_rm_controller_bot(bot):
                 cur.execute(
                     """
-                    SELECT oa.account_login,
-                           oa.account_label,
-                           true AS has_bot_config
+                    SELECT oa.account_login
                       FROM bot_param.operator_account oa
                      WHERE oa.env = 'prod'
                        AND oa.db_user = %s
                        AND oa.enabled = true
                        AND oa.can_apply = true
-                       AND oa.account_login <> %s
-                     ORDER BY oa.account_label, oa.account_login
                     """,
-                    (actor, source_account_login),
+                    (actor,),
                 )
-                rows = [dict(row) for row in cur.fetchall()]
-                return {"ok": True, "accounts": rows, "version": CODE_VERSION}
+                for row in cur.fetchall():
+                    ensure_rm_controller_db_config(cur, row["account_login"])
             cur.execute(
                 """
                 SELECT oa.account_login,
@@ -2876,6 +2997,7 @@ async def config_ui_copy_target_accounts(request: Request, source_account_login:
                 (bot, actor, source_account_login),
             )
             rows = [dict(row) for row in cur.fetchall()]
+        conn.commit()
         return {"ok": True, "accounts": rows, "version": CODE_VERSION}
     except Exception as exc:
         return config_ui_json_error(500, first_error_line(exc))
@@ -3021,35 +3143,6 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
                     return config_ui_json_error(400, "target account must differ from source account")
                 if not ensure_actor_account_access(cur, actor, target_account, can_apply=True):
                     return config_ui_json_error(403, f"target account {target_account} is not available for apply")
-
-            if is_rm_controller_bot(bot):
-                apply_accounts = [req.account_login] + target_accounts
-                for change in req.changes:
-                    input_param = (change.input_param or "").strip()
-                    value = normalize_rm_input_value(input_param, change.value)
-                    reason = (change.reason or "").strip() or f"RM input_param {input_param}"
-                    for account in apply_accounts:
-                        command_text = f"/{int(account)} set_input {input_param} {value}"
-                        applied.append(
-                            {
-                                "source": insert_rm_control_command(
-                                    cur,
-                                    account,
-                                    actor,
-                                    command_text,
-                                    reason,
-                                    "set_input",
-                                )
-                            }
-                        )
-                conn.commit()
-                return {
-                    "ok": True,
-                    "actor": actor,
-                    "applied": applied,
-                    "applied_count": len(applied),
-                    "version": CODE_VERSION,
-                }
 
             for change in req.changes:
                 value = (change.value or "").strip()
