@@ -1,5 +1,5 @@
 from email.policy import default
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from openai import OpenAI, BadRequestError
 import os, json, traceback, re, threading, asyncio, time, tempfile, base64, hashlib, hmac, secrets, html as html_lib
@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-CODE_VERSION = "v1.03"
+CODE_VERSION = "v1.04"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -111,6 +111,17 @@ class ConfigUiSaveRequest(BaseModel):
     copy_to_account_login: Optional[int] = None
     copy_to_account_logins: Optional[List[int]] = None
     changes: List[ConfigUiChange]
+
+
+class RmControlCommandRequest(BaseModel):
+    account_logins: List[int]
+    action: str
+    bot_ids: Optional[List[str]] = None
+    duration: Optional[str] = None
+    until: Optional[str] = None
+    set_key: Optional[str] = None
+    set_value: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class BotRuntimeBaseRequest(BaseModel):
@@ -466,6 +477,106 @@ def bot_runtime_load_changed_params(cur, env, account_login, bot_kind, bot_id, o
     return [dict(row) for row in cur.fetchall()]
 
 
+RM_CONTROL_SUPPORTED_BOT_IDS = ("n4", "n5", "n6", "n7", "n8", "n9", "bot123")
+RM_CONTROL_ACTION_COMMANDS = {
+    "status": "status",
+    "status_bots": "status bots",
+    "config": "config",
+    "halt": "halt",
+    "day_stop": "day_stop",
+    "week_stop": "week_stop",
+    "resume": "resume",
+    "rm_daystart": "rm_daystart",
+    "rm_reset": "rm_reset",
+    "whoami": "whoami",
+}
+RM_CONTROL_SET_KEYS = {
+    "profit_abs": "profit_abs",
+    "profit_pct": "profit_pct",
+    "loss_abs": "loss_abs",
+    "loss_pct": "loss_pct",
+    "metric": "metric",
+    "use_profit_abs": "use_profit_abs",
+    "use_profit_pct": "use_profit_pct",
+    "use_loss_abs": "use_loss_abs",
+    "use_loss_pct": "use_loss_pct",
+}
+
+
+def normalize_rm_bot_ids(bot_ids):
+    normalized = []
+    for bot_id in bot_ids or []:
+        value = (bot_id or "").strip().lower()
+        if value not in RM_CONTROL_SUPPORTED_BOT_IDS:
+            raise ValueError(f"unsupported bot id: {bot_id}")
+        if value not in normalized:
+            normalized.append(value)
+    if not normalized:
+        raise ValueError("choose at least one bot")
+    return normalized
+
+
+def normalize_rm_until(value):
+    text = (value or "").strip()
+    if not re.match(r"^\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}$", text):
+        raise ValueError("until must use YYYY.MM.DD HH:MM")
+    try:
+        datetime.strptime(text, "%Y.%m.%d %H:%M")
+    except ValueError:
+        raise ValueError("until must be a valid YYYY.MM.DD HH:MM datetime")
+    return text
+
+
+def build_rm_control_command(account_login, req: RmControlCommandRequest):
+    action = (req.action or "").strip().lower()
+    if action in RM_CONTROL_ACTION_COMMANDS:
+        return f"/{int(account_login)} {RM_CONTROL_ACTION_COMMANDS[action]}"
+
+    if action == "stop_until":
+        return f"/{int(account_login)} stop {normalize_rm_until(req.until)}"
+
+    if action == "stop_bots":
+        bots = ",".join(normalize_rm_bot_ids(req.bot_ids))
+        duration = (req.duration or "").strip().lower()
+        if duration in ("day", "week"):
+            stop_until = duration
+        elif duration == "until":
+            stop_until = normalize_rm_until(req.until)
+        else:
+            raise ValueError("duration must be day, week, or until")
+        return f"/{int(account_login)} stop bots {bots} {stop_until}"
+
+    if action == "resume_bots":
+        bots = ",".join(normalize_rm_bot_ids(req.bot_ids))
+        return f"/{int(account_login)} resume bots {bots}"
+
+    if action == "set":
+        key = (req.set_key or "").strip().lower()
+        if key not in RM_CONTROL_SET_KEYS:
+            raise ValueError("unsupported set key")
+        value = (req.set_value or "").strip()
+        if not value:
+            raise ValueError("set value is required")
+        if key in ("profit_abs", "profit_pct", "loss_abs", "loss_pct"):
+            try:
+                number = float(value)
+            except ValueError:
+                raise ValueError(f"{key} expects a number")
+            if number < 0:
+                raise ValueError(f"{key} expects a non-negative number")
+        elif key == "metric":
+            if value.lower() not in ("balance", "equity"):
+                raise ValueError("metric expects balance or equity")
+            value = value.lower()
+        else:
+            if value.lower() not in ("on", "off", "true", "false", "1", "0", "enable", "disable", "enabled", "disabled"):
+                raise ValueError(f"{key} expects on/off")
+            value = value.lower()
+        return f"/{int(account_login)} set {RM_CONTROL_SET_KEYS[key]} {value}"
+
+    raise ValueError("unsupported RM action")
+
+
 def config_ui_login_html(error=None):
     error_block = ""
     if error:
@@ -546,6 +657,24 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .target-option.is-unavailable { color: var(--muted); }
     .target-option input { width: auto; flex: 0 0 auto; }
     .target-option span { min-width: 0; overflow-wrap: anywhere; }
+    .rm-control { margin-bottom: 12px; padding: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+    .rm-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    .rm-title { font-size: 15px; font-weight: 700; }
+    .rm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; align-items: start; }
+    .rm-check-list { min-height: 38px; max-height: 132px; overflow-y: auto; border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; padding: 4px; }
+    .rm-option { display: flex; align-items: center; gap: 8px; min-height: 28px; padding: 3px 5px; border-radius: 4px; color: var(--text); font-size: 13px; font-weight: 500; }
+    .rm-option:hover { background: #eef4fb; }
+    .rm-option input { width: auto; flex: 0 0 auto; }
+    .rm-preview { min-height: 38px; max-height: 96px; overflow: auto; margin: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: #f8fafc; color: #314052; font: 12px Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .rm-footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: start; margin-top: 10px; }
+    .runtime-list { margin-top: 10px; overflow-x: hidden; }
+    .runtime-list table { min-width: 0; table-layout: fixed; }
+    .runtime-list th:nth-child(1), .runtime-list td:nth-child(1) { width: 18%; }
+    .runtime-list th:nth-child(2), .runtime-list td:nth-child(2) { width: 18%; }
+    .runtime-list th:nth-child(3), .runtime-list td:nth-child(3) { width: 18%; }
+    .runtime-list th:nth-child(4), .runtime-list td:nth-child(4) { width: 18%; }
+    .runtime-list th:nth-child(5), .runtime-list td:nth-child(5) { width: 28%; }
+    .runtime-list td { overflow-wrap: anywhere; }
     .status { min-height: 28px; font-size: 14px; color: var(--muted); margin: 8px 0; }
     .status.error { color: var(--danger); }
     .table-wrap { overflow-x: hidden; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
@@ -557,12 +686,12 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     tr.group-break td { border-top: 10px solid var(--bg); }
     tr.group-break td:first-child { box-shadow: inset 4px 0 0 #3d7cae; }
     tr.group-break .group { background: #eef4fb; color: #1f5f8c; }
-    th:nth-child(1), td.group { width: 10%; }
-    th:nth-child(2), td.param { width: 18%; }
-    th:nth-child(3), td.desc { width: 24%; }
-    th:nth-child(4), td.current { width: 18%; }
-    th:nth-child(5), td.new-value { width: 17%; }
-    th:nth-child(6), td.reason { width: 13%; }
+    .params-table th:nth-child(1), .params-table td.group { width: 10%; }
+    .params-table th:nth-child(2), .params-table td.param { width: 18%; }
+    .params-table th:nth-child(3), .params-table td.desc { width: 24%; }
+    .params-table th:nth-child(4), .params-table td.current { width: 18%; }
+    .params-table th:nth-child(5), .params-table td.new-value { width: 17%; }
+    .params-table th:nth-child(6), .params-table td.reason { width: 13%; }
     .group { color: #49566a; font-weight: 600; white-space: normal; overflow-wrap: anywhere; }
     .param { font-family: Consolas, Menlo, monospace; font-size: 12px; white-space: normal; overflow-wrap: anywhere; }
     .desc { overflow-wrap: anywhere; }
@@ -572,13 +701,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
     .changed-count { color: var(--muted); font-size: 14px; }
     @media (max-width: 1100px) {
-      th:first-child, td.group { display: none; }
-      tr.group-break td:nth-child(2) { box-shadow: inset 4px 0 0 #3d7cae; }
-      th:nth-child(2), td.param { width: 22%; }
-      th:nth-child(3), td.desc { width: 28%; }
-      th:nth-child(4), td.current { width: 20%; }
-      th:nth-child(5), td.new-value { width: 18%; }
-      th:nth-child(6), td.reason { width: 12%; }
+      .params-table th:first-child, .params-table td.group { display: none; }
+      .params-table tr.group-break td:nth-child(2) { box-shadow: inset 4px 0 0 #3d7cae; }
+      .params-table th:nth-child(2), .params-table td.param { width: 22%; }
+      .params-table th:nth-child(3), .params-table td.desc { width: 28%; }
+      .params-table th:nth-child(4), .params-table td.current { width: 20%; }
+      .params-table th:nth-child(5), .params-table td.new-value { width: 18%; }
+      .params-table th:nth-child(6), .params-table td.reason { width: 12%; }
     }
     @media (max-width: 760px) {
       .header-inner { align-items: flex-start; display: grid; grid-template-columns: minmax(0, 1fr) auto; }
@@ -588,16 +717,16 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .toolbar { grid-template-columns: 1fr; }
       main { padding: 10px; }
       .table-wrap { border: 0; border-radius: 0; overflow-x: visible; background: transparent; }
-      table, thead, tbody, tr, td { display: block; width: 100%; }
-      table { min-width: 0; border-collapse: separate; }
-      thead { display: none; }
-      tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
-      tr.hidden { display: none; }
-      tr.group-break { margin-top: 18px; border-top: 3px solid #3d7cae; }
-      tr.group-break td { border-top: 0; }
-      tr.group-break td:nth-child(2) { box-shadow: none; }
-      td { border-bottom: 0; padding: 0; min-width: 0; width: 100% !important; }
-      td.group, td.reason { display: none; }
+      .params-table, .params-table thead, .params-table tbody, .params-table tr, .params-table td { display: block; width: 100%; }
+      .params-table { min-width: 0; border-collapse: separate; }
+      .params-table thead { display: none; }
+      .params-table tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
+      .params-table tr.hidden { display: none; }
+      .params-table tr.group-break { margin-top: 18px; border-top: 3px solid #3d7cae; }
+      .params-table tr.group-break td { border-top: 0; }
+      .params-table tr.group-break td:nth-child(2) { box-shadow: none; }
+      .params-table td { border-bottom: 0; padding: 0; min-width: 0; width: 100% !important; }
+      .params-table td.group, .params-table td.reason { display: none; }
       .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
       .param::after { content: attr(data-desc); display: block; margin-top: 4px; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
       .desc { display: none; }
@@ -611,6 +740,14 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       select, input[type="text"], input[type="search"] { min-height: 44px; font-size: 16px; }
       .target-list { max-height: 144px; }
       .target-option { min-height: 34px; font-size: 14px; }
+      .rm-control { padding: 10px; }
+      .rm-head, .rm-footer { display: grid; grid-template-columns: 1fr; }
+      .rm-grid { grid-template-columns: 1fr; }
+      .rm-option { min-height: 34px; font-size: 14px; }
+      .runtime-list table, .runtime-list tbody, .runtime-list tr, .runtime-list td { display: block; width: 100%; }
+      .runtime-list thead { display: none; }
+      .runtime-list tr { display: grid; grid-template-columns: 1fr; gap: 6px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; }
+      .runtime-list td { display: block; width: 100% !important; }
     }
   </style>
 </head>
@@ -660,8 +797,79 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
 
     <div id="status" class="status"></div>
 
+    <section class="rm-control" aria-label="rm-control">
+      <div class="rm-head">
+        <div class="rm-title">RM control</div>
+        <button id="rmRefreshStatusBtn" class="secondary" type="button">Refresh status</button>
+      </div>
+      <div class="rm-grid">
+        <div class="field">
+          <label>Accounts</label>
+          <div id="rmAccountList" class="rm-check-list"></div>
+        </div>
+        <div class="field">
+          <label for="rmActionSelect">Command</label>
+          <select id="rmActionSelect">
+            <option value="status">Status</option>
+            <option value="status_bots">Bots status</option>
+            <option value="config">Config</option>
+            <option value="halt">Halt account</option>
+            <option value="day_stop">Day stop account</option>
+            <option value="week_stop">Week stop account</option>
+            <option value="stop_until">Stop account until</option>
+            <option value="resume">Resume account</option>
+            <option value="rm_daystart">RM daystart</option>
+            <option value="rm_reset">RM reset</option>
+            <option value="stop_bots">Stop selected bots</option>
+            <option value="resume_bots">Resume selected bots</option>
+            <option value="set">Set RM value</option>
+            <option value="whoami">Whoami</option>
+          </select>
+        </div>
+        <div class="field" id="rmBotField">
+          <label>Bots</label>
+          <div id="rmBotList" class="rm-check-list"></div>
+        </div>
+        <div class="field" id="rmDurationField">
+          <label for="rmDurationSelect">Duration</label>
+          <select id="rmDurationSelect">
+            <option value="day">Day</option>
+            <option value="week">Week</option>
+            <option value="until">Until</option>
+          </select>
+        </div>
+        <div class="field" id="rmUntilField">
+          <label for="rmUntilInput">Until</label>
+          <input id="rmUntilInput" type="text" placeholder="YYYY.MM.DD HH:MM">
+        </div>
+        <div class="field" id="rmSetKeyField">
+          <label for="rmSetKeySelect">Set key</label>
+          <select id="rmSetKeySelect">
+            <option value="profit_abs">profit_abs</option>
+            <option value="profit_pct">profit_pct</option>
+            <option value="loss_abs">loss_abs</option>
+            <option value="loss_pct">loss_pct</option>
+            <option value="metric">metric</option>
+            <option value="use_profit_abs">use_profit_abs</option>
+            <option value="use_profit_pct">use_profit_pct</option>
+            <option value="use_loss_abs">use_loss_abs</option>
+            <option value="use_loss_pct">use_loss_pct</option>
+          </select>
+        </div>
+        <div class="field" id="rmSetValueField">
+          <label for="rmSetValueInput">Set value</label>
+          <input id="rmSetValueInput" type="text" placeholder="value">
+        </div>
+      </div>
+      <div class="rm-footer">
+        <pre id="rmCommandPreview" class="rm-preview"></pre>
+        <button id="rmSendBtn" type="button">Send RM command</button>
+      </div>
+      <div id="rmRuntimeList" class="runtime-list"></div>
+    </section>
+
     <section class="table-wrap">
-      <table>
+      <table class="params-table">
         <thead>
           <tr>
             <th>group</th>
@@ -686,6 +894,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     const CONFIG_ACTOR = __CONFIG_ACTOR__;
     const CODE_VERSION = __CODE_VERSION__;
     const choiceCache = new Map();
+    const RM_BOT_IDS = ['n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'bot123'];
 
     const els = {
       sessionUser: document.getElementById('sessionUser'),
@@ -697,6 +906,22 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       searchInput: document.getElementById('searchInput'),
       copyToggle: document.getElementById('copyToggle'),
       targetAccountList: document.getElementById('targetAccountList'),
+      rmAccountList: document.getElementById('rmAccountList'),
+      rmActionSelect: document.getElementById('rmActionSelect'),
+      rmBotField: document.getElementById('rmBotField'),
+      rmBotList: document.getElementById('rmBotList'),
+      rmDurationField: document.getElementById('rmDurationField'),
+      rmDurationSelect: document.getElementById('rmDurationSelect'),
+      rmUntilField: document.getElementById('rmUntilField'),
+      rmUntilInput: document.getElementById('rmUntilInput'),
+      rmSetKeyField: document.getElementById('rmSetKeyField'),
+      rmSetKeySelect: document.getElementById('rmSetKeySelect'),
+      rmSetValueField: document.getElementById('rmSetValueField'),
+      rmSetValueInput: document.getElementById('rmSetValueInput'),
+      rmCommandPreview: document.getElementById('rmCommandPreview'),
+      rmSendBtn: document.getElementById('rmSendBtn'),
+      rmRefreshStatusBtn: document.getElementById('rmRefreshStatusBtn'),
+      rmRuntimeList: document.getElementById('rmRuntimeList'),
       status: document.getElementById('status'),
       paramsBody: document.getElementById('paramsBody'),
       changedCount: document.getElementById('changedCount'),
@@ -774,15 +999,199 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       }
     }
 
+    function checkedValues(container) {
+      return Array.from(container.querySelectorAll('input[type="checkbox"]:checked')).map(input => input.value);
+    }
+
+    function fillRmAccountList(rows) {
+      els.rmAccountList.innerHTML = '';
+      const currentAccount = els.accountSelect.value;
+      for (const row of rows) {
+        const option = document.createElement('label');
+        option.className = 'rm-option';
+
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.value = String(row.account_login);
+        input.checked = String(row.account_login) === currentAccount;
+        input.addEventListener('change', updateRmCommandUi);
+
+        const text = document.createElement('span');
+        text.textContent = row.account_label || String(row.account_login);
+
+        option.appendChild(input);
+        option.appendChild(text);
+        els.rmAccountList.appendChild(option);
+      }
+      if (!checkedValues(els.rmAccountList).length) {
+        const first = els.rmAccountList.querySelector('input[type="checkbox"]');
+        if (first) first.checked = true;
+      }
+      updateRmCommandUi();
+    }
+
+    function syncRmCurrentAccount() {
+      const currentAccount = els.accountSelect.value;
+      if (!currentAccount) return;
+      for (const input of els.rmAccountList.querySelectorAll('input[type="checkbox"]')) {
+        input.checked = input.value === currentAccount;
+      }
+      updateRmCommandUi();
+    }
+
+    function fillRmBotList() {
+      els.rmBotList.innerHTML = '';
+      for (const botId of RM_BOT_IDS) {
+        const option = document.createElement('label');
+        option.className = 'rm-option';
+
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.value = botId;
+        input.checked = true;
+        input.addEventListener('change', updateRmCommandUi);
+
+        const text = document.createElement('span');
+        text.textContent = botId;
+
+        option.appendChild(input);
+        option.appendChild(text);
+        els.rmBotList.appendChild(option);
+      }
+    }
+
+    function rmUntilValue() {
+      return els.rmUntilInput.value.trim();
+    }
+
+    function buildRmCommandCore() {
+      const action = els.rmActionSelect.value;
+      if (action === 'stop_until') return 'stop ' + (rmUntilValue() || 'YYYY.MM.DD HH:MM');
+      if (action === 'stop_bots') {
+        const bots = checkedValues(els.rmBotList).join(',') || 'n4,n5,n6,n7,n8,n9,bot123';
+        const duration = els.rmDurationSelect.value === 'until' ? (rmUntilValue() || 'YYYY.MM.DD HH:MM') : els.rmDurationSelect.value;
+        return 'stop bots ' + bots + ' ' + duration;
+      }
+      if (action === 'resume_bots') {
+        const bots = checkedValues(els.rmBotList).join(',') || 'n4,n5,n6,n7,n8,n9,bot123';
+        return 'resume bots ' + bots;
+      }
+      if (action === 'set') {
+        return 'set ' + els.rmSetKeySelect.value + ' ' + (els.rmSetValueInput.value.trim() || 'value');
+      }
+      return {
+        status: 'status',
+        status_bots: 'status bots',
+        config: 'config',
+        halt: 'halt',
+        day_stop: 'day_stop',
+        week_stop: 'week_stop',
+        resume: 'resume',
+        rm_daystart: 'rm_daystart',
+        rm_reset: 'rm_reset',
+        whoami: 'whoami'
+      }[action] || action;
+    }
+
+    function updateRmCommandUi() {
+      const action = els.rmActionSelect.value;
+      const needsBots = action === 'stop_bots' || action === 'resume_bots';
+      const needsDuration = action === 'stop_bots';
+      const needsUntil = action === 'stop_until' || (action === 'stop_bots' && els.rmDurationSelect.value === 'until');
+      const needsSet = action === 'set';
+
+      els.rmBotField.style.display = needsBots ? '' : 'none';
+      els.rmDurationField.style.display = needsDuration ? '' : 'none';
+      els.rmUntilField.style.display = needsUntil ? '' : 'none';
+      els.rmSetKeyField.style.display = needsSet ? '' : 'none';
+      els.rmSetValueField.style.display = needsSet ? '' : 'none';
+
+      const accounts = checkedValues(els.rmAccountList);
+      if (!accounts.length) {
+        els.rmCommandPreview.textContent = 'No account selected';
+        return;
+      }
+      const core = buildRmCommandCore();
+      els.rmCommandPreview.textContent = accounts.map(account => '/' + account + ' ' + core).join('\n');
+    }
+
+    function rmCommandPayload() {
+      return {
+        account_logins: checkedValues(els.rmAccountList).map(value => Number(value)),
+        action: els.rmActionSelect.value,
+        bot_ids: checkedValues(els.rmBotList),
+        duration: els.rmDurationSelect.value,
+        until: rmUntilValue(),
+        set_key: els.rmSetKeySelect.value,
+        set_value: els.rmSetValueInput.value.trim(),
+        reason: 'config-ui ' + CONFIG_ACTOR
+      };
+    }
+
+    function renderRuntimeStatus(rows) {
+      if (!rows.length) {
+        els.rmRuntimeList.innerHTML = '';
+        return;
+      }
+      const table = document.createElement('table');
+      table.innerHTML = '<thead><tr><th>account</th><th>bot</th><th>status</th><th>version</th><th>last_seen</th></tr></thead>';
+      const body = document.createElement('tbody');
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        tr.appendChild(textCell('', row.account_login));
+        tr.appendChild(textCell('', (row.bot_kind || '') + '/' + (row.bot_id || '')));
+        tr.appendChild(textCell('', row.status || ''));
+        tr.appendChild(textCell('', row.applied_version_no == null ? '' : row.applied_version_no));
+        tr.appendChild(textCell('', row.last_seen_at || ''));
+        body.appendChild(tr);
+      }
+      table.appendChild(body);
+      els.rmRuntimeList.innerHTML = '';
+      els.rmRuntimeList.appendChild(table);
+    }
+
+    async function loadRuntimeStatus() {
+      const accounts = checkedValues(els.rmAccountList);
+      const query = accounts.map(account => 'account_login=' + encodeURIComponent(account)).join('&');
+      const data = await api('/config-ui/api/runtime-status' + (query ? '?' + query : ''));
+      renderRuntimeStatus(data.statuses || []);
+    }
+
+    async function sendRmCommand() {
+      const payload = rmCommandPayload();
+      if (!payload.account_logins.length) {
+        setStatus('Choose at least one RM account', true);
+        return;
+      }
+      els.rmSendBtn.disabled = true;
+      setStatus('Queueing RM command...');
+      try {
+        const data = await api('/config-ui/api/rm-command', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        setStatus('Queued ' + (data.commands || []).length + ' RM command(s)');
+        await loadRuntimeStatus();
+      } catch (exc) {
+        setStatus(exc.message, true);
+      } finally {
+        els.rmSendBtn.disabled = false;
+      }
+    }
+
     async function loadAccounts() {
       setStatus('Loading accounts...');
       const data = await api('/config-ui/api/accounts');
-      fillSelect(els.accountSelect, data.accounts || [], 'account_login', 'account_label', '');
+      const accounts = data.accounts || [];
+      fillSelect(els.accountSelect, accounts, 'account_login', 'account_label', '');
+      fillRmAccountList(accounts);
       if (!els.accountSelect.value) {
         setStatus('No accounts available for actor ' + CONFIG_ACTOR, true);
         return;
       }
       await loadBots();
+      loadRuntimeStatus().catch(exc => setStatus(exc.message, true));
     }
 
     async function loadBots() {
@@ -986,13 +1395,22 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       }
     }
 
-    els.accountSelect.addEventListener('change', loadBots);
+    els.accountSelect.addEventListener('change', async () => { syncRmCurrentAccount(); await loadBots(); });
     els.botSelect.addEventListener('change', async () => { await loadCopyTargets(); await loadParams(); });
     els.groupFilter.addEventListener('change', applyFilters);
     els.searchInput.addEventListener('input', applyFilters);
     els.copyToggle.addEventListener('change', loadCopyTargets);
     els.saveBtn.addEventListener('click', saveChanges);
+    els.rmActionSelect.addEventListener('change', updateRmCommandUi);
+    els.rmDurationSelect.addEventListener('change', updateRmCommandUi);
+    els.rmUntilInput.addEventListener('input', updateRmCommandUi);
+    els.rmSetKeySelect.addEventListener('change', updateRmCommandUi);
+    els.rmSetValueInput.addEventListener('input', updateRmCommandUi);
+    els.rmSendBtn.addEventListener('click', sendRmCommand);
+    els.rmRefreshStatusBtn.addEventListener('click', () => loadRuntimeStatus().catch(exc => setStatus(exc.message, true)));
 
+    fillRmBotList();
+    updateRmCommandUi();
     loadAccounts().catch(exc => setStatus(exc.message, true));
   </script>
 </body>
@@ -2152,6 +2570,149 @@ async def config_ui_copy_target_accounts(request: Request, source_account_login:
             rows = [dict(row) for row in cur.fetchall()]
         return {"ok": True, "accounts": rows, "version": CODE_VERSION}
     except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.get("/config-ui/api/runtime-status")
+async def config_ui_runtime_status(request: Request, account_login: Optional[List[int]] = Query(None)):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    account_logins = []
+    for account in account_login or []:
+        account = int(account)
+        if account not in account_logins:
+            account_logins.append(account)
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            for account in account_logins:
+                if not ensure_actor_account_access(cur, actor, account, can_apply=False):
+                    return config_ui_json_error(403, f"account {account} is not available")
+            params = [actor]
+            account_filter = ""
+            if account_logins:
+                account_filter = "AND r.account_login = ANY(%s)"
+                params.append(account_logins)
+            cur.execute(
+                f"""
+                SELECT r.account_login,
+                       oa.account_label,
+                       r.instance_id,
+                       r.bot_kind,
+                       r.bot_id,
+                       r.source_id,
+                       r.status,
+                       r.allow_new_entries,
+                       r.applied_version_no,
+                       r.applied_config_hash,
+                       r.last_seen_at,
+                       r.last_error
+                  FROM bot_param.bot_runtime_status r
+                  JOIN bot_param.operator_account oa
+                    ON oa.env = r.env
+                   AND oa.account_login = r.account_login
+                   AND oa.db_user = %s
+                   AND oa.enabled = true
+                 WHERE r.env = 'prod'
+                   {account_filter}
+                 ORDER BY r.account_login, r.bot_kind, r.bot_id, r.last_seen_at DESC
+                 LIMIT 100
+                """,
+                tuple(params),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "statuses": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/config-ui/api/rm-command")
+async def config_ui_rm_command(req: RmControlCommandRequest, request: Request):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+
+    account_logins = []
+    for account in req.account_logins or []:
+        account = int(account)
+        if account not in account_logins:
+            account_logins.append(account)
+    if not account_logins:
+        return config_ui_json_error(400, "choose at least one account")
+    if len(account_logins) > 20:
+        return config_ui_json_error(400, "too many accounts")
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        commands = []
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            set_actor(cur, actor)
+            for account in account_logins:
+                if not ensure_actor_account_access(cur, actor, account, can_apply=True):
+                    raise ValueError(f"account {account} is not available for RM control")
+                command_text = build_rm_control_command(account, req)
+                payload = {
+                    "command": command_text,
+                    "actor": actor,
+                    "source": "config-ui",
+                    "action": (req.action or "").strip().lower(),
+                }
+                cur.execute(
+                    """
+                    INSERT INTO bot_param.bot_command (
+                        env,
+                        account_login,
+                        target_bot_kind,
+                        target_bot_id,
+                        command_type,
+                        command_payload,
+                        priority,
+                        created_by,
+                        created_source,
+                        created_reason
+                    )
+                    VALUES (
+                        'prod',
+                        %s,
+                        'rm_controller',
+                        'rm_controller',
+                        'RM_CONTROL',
+                        %s::jsonb,
+                        250,
+                        %s,
+                        'config-ui',
+                        %s
+                    )
+                    RETURNING command_id,
+                              account_login,
+                              target_bot_kind,
+                              target_bot_id,
+                              command_type,
+                              command_payload,
+                              status,
+                              created_at
+                    """,
+                    (
+                        account,
+                        json.dumps(payload, separators=(",", ":")),
+                        actor,
+                        (req.reason or f"RM control {(req.action or '').strip().lower()}").strip(),
+                    ),
+                )
+                commands.append(dict(cur.fetchone()))
+        conn.commit()
+        return {"ok": True, "commands": commands, "version": CODE_VERSION}
+    except ValueError as exc:
+        conn.rollback()
+        return config_ui_json_error(400, str(exc))
+    except Exception as exc:
+        conn.rollback()
         return config_ui_json_error(500, first_error_line(exc))
     finally:
         conn.close()
