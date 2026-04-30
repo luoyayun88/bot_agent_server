@@ -591,18 +591,18 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       table, thead, tbody, tr, td { display: block; width: 100%; }
       table { min-width: 0; border-collapse: separate; }
       thead { display: none; }
-      tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px 14px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
+      tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
       tr.hidden { display: none; }
       tr.group-break { margin-top: 18px; border-top: 3px solid #3d7cae; }
       tr.group-break td { border-top: 0; }
       tr.group-break td:nth-child(2) { box-shadow: none; }
-      td { border-bottom: 0; padding: 0; min-width: 0; }
+      td { border-bottom: 0; padding: 0; min-width: 0; width: 100% !important; }
       td.group, td.reason { display: none; }
       .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
       .param::after { content: attr(data-desc); display: block; margin-top: 4px; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
       .desc { display: none; }
-      .current, .new-value { min-width: 0; max-width: none; }
-      .current::before, .new-value::before { display: block; margin-bottom: 5px; font-family: Inter, Segoe UI, Arial, sans-serif; font-size: 12px; font-weight: 700; color: var(--muted); }
+      .current, .new-value { grid-column: 1 / -1; min-width: 0; max-width: none; }
+      .current::before, .new-value::before { display: block; margin-bottom: 5px; font-family: Inter, Segoe UI, Arial, sans-serif; font-size: 12px; font-weight: 700; color: var(--muted); white-space: nowrap; }
       .current::before { content: "current value"; color: #147a3d; }
       .new-value::before { content: "new"; }
       .current { font-family: Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
