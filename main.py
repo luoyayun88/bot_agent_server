@@ -413,7 +413,7 @@ def config_ui_login_html(error=None):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Runtime Config Login</title>
+  <title>BOT parameters Login</title>
   <style>
     :root {{ color-scheme: light; font-family: Inter, Segoe UI, Arial, sans-serif; }}
     body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f4f6f8; color: #17202a; }}
@@ -427,7 +427,7 @@ def config_ui_login_html(error=None):
 </head>
 <body>
   <main>
-    <h1>Runtime Config</h1>
+    <h1>BOT parameters</h1>
     {error_block}
     <form method="post" action="/config-ui/login">
       <label for="username">Login</label>
@@ -446,7 +446,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Runtime Config</title>
+  <title>BOT parameters</title>
   <style>
     :root {
       color-scheme: light;
@@ -498,18 +498,22 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .header-inner { align-items: flex-start; flex-direction: column; }
       .toolbar { grid-template-columns: 1fr; }
       main { padding: 10px; }
-      .table-wrap { border-radius: 6px; overflow-x: visible; }
-      table { min-width: 0; width: 100%; table-layout: fixed; }
-      th, td { padding: 8px 6px; }
-      th:nth-child(1), td.group, th:nth-child(6), td.reason { display: none; }
-      th:nth-child(2) { width: 30%; }
-      th:nth-child(3) { width: 24%; }
-      th:nth-child(4) { width: 20%; }
-      th:nth-child(5) { width: 26%; }
-      .param { white-space: normal; overflow-wrap: anywhere; font-size: 11px; }
-      .desc { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-      .current { max-width: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .new-value { min-width: 0; }
+      .table-wrap { border: 0; border-radius: 0; overflow-x: visible; background: transparent; }
+      table, thead, tbody, tr, td { display: block; width: 100%; }
+      table { min-width: 0; border-collapse: separate; }
+      thead { display: none; }
+      tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px 12px; padding: 12px 0; border-bottom: 1px solid var(--border); background: var(--panel); }
+      tr.hidden { display: none; }
+      td { border-bottom: 0; padding: 0; min-width: 0; }
+      td.group, td.reason { display: none; }
+      .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .param::after { content: " (" attr(data-desc) ")"; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
+      .desc { display: none; }
+      .current, .new-value { min-width: 0; max-width: none; }
+      .current::before, .new-value::before { display: block; margin-bottom: 5px; font-family: Inter, Segoe UI, Arial, sans-serif; font-size: 12px; font-weight: 700; color: var(--muted); }
+      .current::before { content: "current value"; }
+      .new-value::before { content: "new"; }
+      .current { font-family: Consolas, Menlo, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .footer { align-items: stretch; flex-direction: column; }
       .footer button { width: 100%; min-height: 44px; }
       select, input[type="text"], input[type="search"] { min-height: 44px; font-size: 16px; }
@@ -520,7 +524,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
   <header>
     <div class="header-inner">
       <div>
-        <div class="title">Runtime Config</div>
+        <div class="title">BOT parameters</div>
         <div class="meta">
           <span>user: <strong id="sessionUser"></strong></span>
           <span>actor: <strong id="actorName"></strong></span>
@@ -709,6 +713,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return td;
     }
 
+    function paramCell(row) {
+      const td = textCell('param', row.input_param);
+      td.dataset.desc = row.param_desc || '';
+      td.title = row.param_desc || '';
+      return td;
+    }
+
     async function buildValueControl(row) {
       if (row.has_choices) {
         const select = document.createElement('select');
@@ -766,7 +777,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         tr.dataset.search = ((row.input_param || '') + ' ' + (row.param_desc || '')).toLowerCase();
         tr.dataset.rowId = row.row_id;
         tr.appendChild(textCell('group', row.param_group));
-        tr.appendChild(textCell('param', row.input_param));
+        tr.appendChild(paramCell(row));
         tr.appendChild(textCell('desc', row.param_desc));
         tr.appendChild(textCell('current', row.current_value));
 
