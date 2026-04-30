@@ -495,18 +495,21 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
     .changed-count { color: var(--muted); font-size: 14px; }
     @media (max-width: 760px) {
-      .header-inner { align-items: flex-start; flex-direction: column; }
+      .header-inner { align-items: flex-start; display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+      .logout-form { grid-column: 2; grid-row: 1; }
+      .logout-form button { margin-top: 0; min-height: 36px; padding: 8px 10px; }
+      .meta { grid-column: 1 / -1; }
       .toolbar { grid-template-columns: 1fr; }
       main { padding: 10px; }
       .table-wrap { border: 0; border-radius: 0; overflow-x: visible; background: transparent; }
       table, thead, tbody, tr, td { display: block; width: 100%; }
       table { min-width: 0; border-collapse: separate; }
       thead { display: none; }
-      tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px 12px; padding: 12px 0; border-bottom: 1px solid var(--border); background: var(--panel); }
+      tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px 14px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
       tr.hidden { display: none; }
       td { border-bottom: 0; padding: 0; min-width: 0; }
       td.group, td.reason { display: none; }
-      .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
       .param::after { content: " (" attr(data-desc) ")"; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
       .desc { display: none; }
       .current, .new-value { min-width: 0; max-width: none; }
