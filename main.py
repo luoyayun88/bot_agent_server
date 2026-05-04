@@ -151,6 +151,25 @@ class BotRuntimeStatusRequest(BotRuntimeBaseRequest):
     runtime_json: Optional[Dict[str, Any]] = None
 
 
+class BotRuntimeRmStateUpdateRequest(BotRuntimeBaseRequest):
+    scope: str
+    target_bot_kind: Optional[str] = None
+    active: bool
+    action: str = "flatten_and_halt"
+    reset_mode: str = "manual"
+    reset_at_epoch: Optional[int] = None
+    source_command_id: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class BotRuntimeRmStateAckRequest(BotRuntimeBaseRequest):
+    scope: str
+    target_bot_kind: Optional[str] = None
+    observed_state_version: int
+    decision: str
+    last_error: Optional[str] = None
+
+
 def resolve_db_url(path=NEURO_DB_CONF, db_mode: Optional[str] = None):
     mode = (db_mode or "").strip().lower()
     if mode == "test":
@@ -414,6 +433,248 @@ def bot_runtime_touch(cur, env, account_login, instance_id, column_name):
         """,
         (env, account_login, instance_id),
     )
+
+
+RM_STATE_SCOPES = {"account", "bot"}
+RM_STATE_ACTIONS = {"halt_only", "flatten_and_halt"}
+RM_STATE_RESET_MODES = {"manual", "next_day", "next_week", "defined_date"}
+RM_STATE_DECISIONS = {"continue", "halt_only", "flatten_and_halt"}
+
+
+def ensure_rm_state_schema(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_param.rm_state (
+            env               TEXT NOT NULL DEFAULT 'prod',
+            account_login     BIGINT NOT NULL,
+            scope             TEXT NOT NULL,
+            bot_kind          TEXT NOT NULL DEFAULT '',
+            active            BOOLEAN NOT NULL DEFAULT false,
+            action            TEXT NOT NULL DEFAULT 'halt_only',
+            reset_mode        TEXT NOT NULL DEFAULT 'manual',
+            reset_at          TIMESTAMPTZ,
+            state_version     BIGINT NOT NULL DEFAULT 0,
+            source_command_id BIGINT,
+            reason            TEXT,
+            updated_by        TEXT,
+            updated_source    TEXT,
+            updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (env, account_login, scope, bot_kind),
+            CHECK (scope IN ('account', 'bot')),
+            CHECK (action IN ('halt_only', 'flatten_and_halt')),
+            CHECK (reset_mode IN ('manual', 'next_day', 'next_week', 'defined_date')),
+            CHECK ((scope = 'account' AND bot_kind = '') OR (scope = 'bot' AND bot_kind <> ''))
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_rm_state_active
+            ON bot_param.rm_state (env, account_login, active, scope, bot_kind)
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_param.rm_state_ack (
+            env                    TEXT NOT NULL DEFAULT 'prod',
+            account_login          BIGINT NOT NULL,
+            bot_kind               TEXT NOT NULL,
+            bot_id                 TEXT NOT NULL,
+            instance_id            TEXT NOT NULL,
+            scope                  TEXT NOT NULL,
+            target_bot_kind        TEXT NOT NULL DEFAULT '',
+            observed_state_version BIGINT NOT NULL,
+            decision               TEXT NOT NULL,
+            last_error             TEXT,
+            applied_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (env, account_login, bot_kind, bot_id, instance_id, scope, target_bot_kind),
+            CHECK (scope IN ('account', 'bot')),
+            CHECK (decision IN ('continue', 'halt_only', 'flatten_and_halt'))
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_rm_state_ack_account
+            ON bot_param.rm_state_ack (env, account_login, scope, target_bot_kind, applied_at DESC)
+        """
+    )
+
+
+def normalize_rm_state_scope(scope):
+    value = (scope or "").strip().lower()
+    if value not in RM_STATE_SCOPES:
+        raise ValueError("scope must be account or bot")
+    return value
+
+
+def normalize_rm_state_bot_kind(scope, target_bot_kind):
+    if scope == "account":
+        return ""
+    value = (target_bot_kind or "").strip().lower()
+    if not re.match(r"^n\d+$", value):
+        raise ValueError("target_bot_kind must be n* for bot scope")
+    return value
+
+
+def normalize_rm_state_action(action):
+    value = (action or "").strip().lower()
+    if value not in RM_STATE_ACTIONS:
+        raise ValueError("action must be halt_only or flatten_and_halt")
+    return value
+
+
+def normalize_rm_state_reset_mode(reset_mode):
+    value = (reset_mode or "").strip().lower()
+    if value not in RM_STATE_RESET_MODES:
+        raise ValueError("reset_mode must be manual, next_day, next_week, or defined_date")
+    return value
+
+
+def rm_state_reset_at(reset_at_epoch):
+    if reset_at_epoch is None:
+        return None
+    value = int(reset_at_epoch)
+    if value <= 0:
+        return None
+    return datetime.fromtimestamp(value, tz=timezone.utc)
+
+
+def rm_state_decision(active, action):
+    if not active:
+        return "continue"
+    return "flatten_and_halt" if action == "flatten_and_halt" else "halt_only"
+
+
+def rm_state_row_dict(row):
+    if not row:
+        return None
+    result = dict(row)
+    result["decision"] = rm_state_decision(bool(result.get("active")), result.get("action"))
+    return result
+
+
+def expire_rm_states(cur, env, account_login):
+    ensure_rm_state_schema(cur)
+    cur.execute(
+        """
+        UPDATE bot_param.rm_state
+           SET active = false,
+               state_version = state_version + 1,
+               updated_source = 'runtime-expire',
+               updated_at = now(),
+               reason = COALESCE(reason, '') || CASE WHEN reason IS NULL OR reason = '' THEN '' ELSE ' | ' END || 'auto expired'
+         WHERE env = %s
+           AND account_login = %s
+           AND active = true
+           AND reset_mode IN ('next_day', 'next_week', 'defined_date')
+           AND reset_at IS NOT NULL
+           AND reset_at <= now()
+        """,
+        (env, int(account_login)),
+    )
+
+
+def upsert_rm_state(cur, env, account_login, scope, bot_kind, active, action, reset_mode, reset_at, source_command_id, reason, updated_by, updated_source):
+    ensure_rm_state_schema(cur)
+    cur.execute(
+        """
+        INSERT INTO bot_param.rm_state (
+            env, account_login, scope, bot_kind, active, action, reset_mode,
+            reset_at, state_version, source_command_id, reason, updated_by, updated_source
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, %s, %s)
+        ON CONFLICT (env, account_login, scope, bot_kind)
+        DO UPDATE SET
+            active = EXCLUDED.active,
+            action = EXCLUDED.action,
+            reset_mode = EXCLUDED.reset_mode,
+            reset_at = EXCLUDED.reset_at,
+            state_version = bot_param.rm_state.state_version + 1,
+            source_command_id = EXCLUDED.source_command_id,
+            reason = EXCLUDED.reason,
+            updated_by = EXCLUDED.updated_by,
+            updated_source = EXCLUDED.updated_source,
+            updated_at = now()
+        RETURNING env,
+                  account_login,
+                  scope,
+                  NULLIF(bot_kind, '') AS bot_kind,
+                  active,
+                  action,
+                  reset_mode,
+                  reset_at,
+                  state_version,
+                  source_command_id,
+                  reason,
+                  updated_by,
+                  updated_source,
+                  updated_at
+        """,
+        (
+            env,
+            int(account_login),
+            scope,
+            bot_kind,
+            bool(active),
+            action,
+            reset_mode,
+            reset_at,
+            source_command_id,
+            reason,
+            updated_by,
+            updated_source,
+        ),
+    )
+    return rm_state_row_dict(cur.fetchone())
+
+
+def load_effective_rm_state(cur, env, account_login, bot_kind):
+    expire_rm_states(cur, env, account_login)
+    cur.execute(
+        """
+        SELECT env,
+               account_login,
+               scope,
+               NULLIF(bot_kind, '') AS bot_kind,
+               active,
+               action,
+               reset_mode,
+               reset_at,
+               state_version,
+               source_command_id,
+               reason,
+               updated_by,
+               updated_source,
+               updated_at
+          FROM bot_param.rm_state
+         WHERE env = %s
+           AND account_login = %s
+           AND (
+                (scope = 'account' AND bot_kind = '')
+                OR
+                (scope = 'bot' AND bot_kind = %s)
+           )
+         ORDER BY scope
+        """,
+        (env, int(account_login), bot_kind),
+    )
+    states = [rm_state_row_dict(row) for row in cur.fetchall()]
+    account_state = next((row for row in states if row["scope"] == "account"), None)
+    bot_state = next((row for row in states if row["scope"] == "bot"), None)
+    active_states = [row for row in (account_state, bot_state) if row and row["active"]]
+    decision = "continue"
+    if any(row["decision"] == "flatten_and_halt" for row in active_states):
+        decision = "flatten_and_halt"
+    elif any(row["decision"] == "halt_only" for row in active_states):
+        decision = "halt_only"
+    effective = {
+        "decision": decision,
+        "state_version": max([int(row["state_version"]) for row in active_states] or [0]),
+        "active_scopes": [row["scope"] for row in active_states],
+        "reason": " | ".join([row.get("reason") or "" for row in active_states if row.get("reason")]),
+    }
+    return account_state, bot_state, effective
 
 
 def bot_runtime_load_changed_params(cur, env, account_login, bot_kind, bot_id, old_version_no, new_version_no, active_config_id):
@@ -3061,6 +3322,67 @@ async def config_ui_runtime_status(request: Request, account_login: Optional[Lis
         conn.close()
 
 
+@app.get("/config-ui/api/rm-state")
+async def config_ui_rm_state(request: Request, account_login: Optional[List[int]] = Query(None)):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    account_logins = []
+    for account in account_login or []:
+        account = int(account)
+        if account not in account_logins:
+            account_logins.append(account)
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            ensure_rm_state_schema(cur)
+            params = [actor]
+            account_filter = ""
+            if account_logins:
+                for account in account_logins:
+                    if not ensure_actor_account_access(cur, actor, account, can_apply=False):
+                        return config_ui_json_error(403, f"account {account} is not available")
+                account_filter = "AND s.account_login = ANY(%s)"
+                params.append(account_logins)
+            cur.execute(
+                f"""
+                SELECT s.env,
+                       s.account_login,
+                       oa.account_label,
+                       s.scope,
+                       NULLIF(s.bot_kind, '') AS bot_kind,
+                       s.active,
+                       s.action,
+                       s.reset_mode,
+                       s.reset_at,
+                       s.state_version,
+                       s.source_command_id,
+                       s.reason,
+                       s.updated_by,
+                       s.updated_source,
+                       s.updated_at
+                  FROM bot_param.rm_state s
+                  JOIN bot_param.operator_account oa
+                    ON oa.env = s.env
+                   AND oa.account_login = s.account_login
+                   AND oa.db_user = %s
+                   AND oa.enabled = true
+                 WHERE s.env = 'prod'
+                   {account_filter}
+                 ORDER BY s.account_login, s.scope, s.bot_kind
+                """,
+                tuple(params),
+            )
+            rows = [rm_state_row_dict(row) for row in cur.fetchall()]
+        conn.commit()
+        return {"ok": True, "rm_states": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        conn.rollback()
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
 @app.post("/config-ui/api/rm-command")
 async def config_ui_rm_command(req: RmControlCommandRequest, request: Request):
     _, actor, auth = require_config_ui_api(request)
@@ -3316,6 +3638,159 @@ async def bot_runtime_config_current(req: BotRuntimeBaseRequest, request: Reques
             "changed_params": changed_params,
             "version": CODE_VERSION,
         }
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/bot-runtime/rm-state/update")
+async def bot_runtime_rm_state_update(req: BotRuntimeRmStateUpdateRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    try:
+        env, account_login, bot_kind, bot_id, source_id, instance_id = normalize_runtime_identity(req)
+        if bot_kind != RM_CONTROLLER_BOT or bot_id != RM_CONTROLLER_BOT_ID:
+            raise ValueError("only rm_controller can update RM state")
+        scope = normalize_rm_state_scope(req.scope)
+        target_bot_kind = normalize_rm_state_bot_kind(scope, req.target_bot_kind)
+        action = normalize_rm_state_action(req.action)
+        reset_mode = normalize_rm_state_reset_mode(req.reset_mode)
+        reset_at = rm_state_reset_at(req.reset_at_epoch)
+    except ValueError as exc:
+        return bot_runtime_json_error(400, str(exc))
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            row = upsert_rm_state(
+                cur,
+                env,
+                account_login,
+                scope,
+                target_bot_kind,
+                req.active,
+                action,
+                reset_mode,
+                reset_at,
+                req.source_command_id,
+                (req.reason or "").strip() or None,
+                instance_id,
+                "rm_controller",
+            )
+            bot_runtime_touch(cur, env, account_login, instance_id, "last_command_check_at")
+        conn.commit()
+        return {"ok": True, "rm_state": row, "version": CODE_VERSION}
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/bot-runtime/rm-state")
+async def bot_runtime_rm_state(req: BotRuntimeBaseRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    try:
+        env, account_login, bot_kind, bot_id, source_id, instance_id = normalize_runtime_identity(req)
+    except ValueError as exc:
+        return bot_runtime_json_error(400, str(exc))
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            account_state, bot_state, effective = load_effective_rm_state(cur, env, account_login, bot_kind)
+            bot_runtime_touch(cur, env, account_login, instance_id, "last_command_check_at")
+        conn.commit()
+        return {
+            "ok": True,
+            "env": env,
+            "account_login": account_login,
+            "bot_kind": bot_kind,
+            "bot_id": bot_id,
+            "source_id": source_id,
+            "instance_id": instance_id,
+            "account_state": account_state,
+            "bot_state": bot_state,
+            "effective_state": effective,
+            "version": CODE_VERSION,
+        }
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/bot-runtime/rm-state/ack")
+async def bot_runtime_rm_state_ack(req: BotRuntimeRmStateAckRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    try:
+        env, account_login, bot_kind, bot_id, source_id, instance_id = normalize_runtime_identity(req)
+        scope = normalize_rm_state_scope(req.scope)
+        target_bot_kind = normalize_rm_state_bot_kind(scope, req.target_bot_kind)
+        decision = (req.decision or "").strip().lower()
+        if decision not in RM_STATE_DECISIONS:
+            raise ValueError("decision must be continue, halt_only, or flatten_and_halt")
+    except ValueError as exc:
+        return bot_runtime_json_error(400, str(exc))
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            ensure_rm_state_schema(cur)
+            cur.execute(
+                """
+                INSERT INTO bot_param.rm_state_ack (
+                    env, account_login, bot_kind, bot_id, instance_id,
+                    scope, target_bot_kind, observed_state_version,
+                    decision, last_error, applied_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (env, account_login, bot_kind, bot_id, instance_id, scope, target_bot_kind)
+                DO UPDATE SET
+                    observed_state_version = EXCLUDED.observed_state_version,
+                    decision = EXCLUDED.decision,
+                    last_error = EXCLUDED.last_error,
+                    applied_at = now()
+                RETURNING env,
+                          account_login,
+                          bot_kind,
+                          bot_id,
+                          instance_id,
+                          scope,
+                          NULLIF(target_bot_kind, '') AS target_bot_kind,
+                          observed_state_version,
+                          decision,
+                          last_error,
+                          applied_at
+                """,
+                (
+                    env,
+                    account_login,
+                    bot_kind,
+                    bot_id,
+                    instance_id,
+                    scope,
+                    target_bot_kind,
+                    int(req.observed_state_version),
+                    decision,
+                    req.last_error,
+                ),
+            )
+            row = dict(cur.fetchone())
+            bot_runtime_touch(cur, env, account_login, instance_id, "last_command_check_at")
+        conn.commit()
+        return {"ok": True, "rm_state_ack": row, "version": CODE_VERSION}
     except Exception as exc:
         conn.rollback()
         return bot_runtime_json_error(500, first_error_line(exc))
