@@ -1297,28 +1297,31 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     tr.group-break td { border-top: 10px solid var(--bg); }
     tr.group-break td:first-child { box-shadow: inset 4px 0 0 #3d7cae; }
     tr.group-break .group { background: #eef4fb; color: #1f5f8c; }
-    .params-table th:nth-child(1), .params-table td.group { width: 10%; }
-    .params-table th:nth-child(2), .params-table td.param { width: 18%; }
-    .params-table th:nth-child(3), .params-table td.desc { width: 24%; }
-    .params-table th:nth-child(4), .params-table td.current { width: 18%; }
-    .params-table th:nth-child(5), .params-table td.new-value { width: 17%; }
-    .params-table th:nth-child(6), .params-table td.reason { width: 13%; }
+    .params-table th:nth-child(1), .params-table td.group { width: 9%; }
+    .params-table th:nth-child(2), .params-table td.param { width: 16%; }
+    .params-table th:nth-child(3), .params-table td.desc { width: 21%; }
+    .params-table th:nth-child(4), .params-table td.current { width: 14%; }
+    .params-table th:nth-child(5), .params-table td.prev-value { width: 15%; }
+    .params-table th:nth-child(6), .params-table td.new-value { width: 14%; }
+    .params-table th:nth-child(7), .params-table td.reason { width: 11%; }
     .group { color: #49566a; font-weight: 600; white-space: normal; overflow-wrap: anywhere; }
     .param { font-family: Consolas, Menlo, monospace; font-size: 12px; white-space: normal; overflow-wrap: anywhere; }
     .desc { overflow-wrap: anywhere; }
     .current { font-family: Consolas, Menlo, monospace; color: #147a3d; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .new-value, .reason { min-width: 0; }
-    .new-value input, .new-value select, .reason input { width: 100%; min-width: 0; }
+    .prev-value, .new-value, .reason { min-width: 0; }
+    .prev-value select, .new-value input, .new-value select, .reason input { width: 100%; min-width: 0; }
+    .prev-value select:disabled { color: var(--muted); background: #f8fafc; }
     .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
     .changed-count { color: var(--muted); font-size: 14px; }
     @media (max-width: 1100px) {
       .params-table th:first-child, .params-table td.group { display: none; }
       .params-table tr.group-break td:nth-child(2) { box-shadow: inset 4px 0 0 #3d7cae; }
-      .params-table th:nth-child(2), .params-table td.param { width: 22%; }
-      .params-table th:nth-child(3), .params-table td.desc { width: 28%; }
-      .params-table th:nth-child(4), .params-table td.current { width: 20%; }
-      .params-table th:nth-child(5), .params-table td.new-value { width: 18%; }
-      .params-table th:nth-child(6), .params-table td.reason { width: 12%; }
+      .params-table th:nth-child(2), .params-table td.param { width: 20%; }
+      .params-table th:nth-child(3), .params-table td.desc { width: 25%; }
+      .params-table th:nth-child(4), .params-table td.current { width: 17%; }
+      .params-table th:nth-child(5), .params-table td.prev-value { width: 16%; }
+      .params-table th:nth-child(6), .params-table td.new-value { width: 13%; }
+      .params-table th:nth-child(7), .params-table td.reason { width: 9%; }
     }
     @media (max-width: 760px) {
       .header-inner { align-items: flex-start; display: grid; grid-template-columns: minmax(0, 1fr) auto; }
@@ -1343,9 +1346,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
       .param::after { content: attr(data-desc); display: block; margin-top: 4px; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
       .desc { display: none; }
-      .current, .new-value { grid-column: 1 / -1; min-width: 0; max-width: none; }
-      .current::before, .new-value::before { display: block; margin-bottom: 5px; font-family: Inter, Segoe UI, Arial, sans-serif; font-size: 12px; font-weight: 700; color: var(--muted); white-space: nowrap; }
+      .current, .prev-value, .new-value { grid-column: 1 / -1; min-width: 0; max-width: none; }
+      .current::before, .prev-value::before, .new-value::before { display: block; margin-bottom: 5px; font-family: Inter, Segoe UI, Arial, sans-serif; font-size: 12px; font-weight: 700; color: var(--muted); white-space: nowrap; }
       .current::before { content: "current value"; color: #147a3d; }
+      .prev-value::before { content: "prev value"; }
       .new-value::before { content: "new"; }
       .current { font-family: Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
       .footer { align-items: stretch; flex-direction: column; }
@@ -1424,6 +1428,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
               <th>input_param</th>
               <th>param_desc</th>
               <th>current_value</th>
+              <th>prev_value</th>
               <th>new value</th>
               <th>reason</th>
             </tr>
@@ -1921,6 +1926,78 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return input;
     }
 
+    function auditOptionLabel(item) {
+      const when = item.changed_at || '';
+      const oldValue = item.old_value == null ? '' : String(item.old_value);
+      const newValue = item.new_value == null ? '' : String(item.new_value);
+      return (when ? when + ' | ' : '') + oldValue + ' -> ' + newValue;
+    }
+
+    function applyPrevValue(select) {
+      const selected = select.selectedOptions && select.selectedOptions.length ? select.selectedOptions[0] : null;
+      const value = selected ? selected.dataset.oldValue || '' : '';
+      if (!value) return;
+      const rowId = select.dataset.rowId;
+      const target = els.paramsBody.querySelector('.new-value-input[data-row-id="' + rowId + '"]');
+      if (!target) return;
+      if (target.tagName === 'SELECT') {
+        const exists = Array.from(target.options).some(option => option.value === value);
+        if (!exists) {
+          setStatus('Previous value is not allowed for this dictionary parameter', true);
+          select.value = '';
+          return;
+        }
+      }
+      target.value = value;
+      const reason = els.paramsBody.querySelector('.reason-input[data-row-id="' + rowId + '"]');
+      if (reason && !reason.value.trim()) {
+        reason.value = 'rollback from audit ' + (selected.dataset.changedAt || '');
+      }
+      updateChangedCount();
+    }
+
+    async function buildPrevValueControl(row) {
+      const select = document.createElement('select');
+      select.className = 'prev-value-input';
+      select.dataset.rowId = row.row_id;
+      const empty = document.createElement('option');
+      empty.value = '';
+      empty.textContent = 'No history';
+      select.appendChild(empty);
+
+      const currentValue = row.current_value == null ? '' : String(row.current_value);
+      const history = Array.isArray(row.prev_values) ? row.prev_values : [];
+      let allowed = null;
+      if (row.has_choices) {
+        const choices = await getChoices(row.bot, row.input_param);
+        allowed = new Set(choices.map(choice => String(choice.allowed_value)));
+      }
+
+      let count = 0;
+      const seen = new Set();
+      for (const item of history) {
+        const oldValue = item && item.old_value != null ? String(item.old_value) : '';
+        if (!oldValue || oldValue === currentValue || seen.has(oldValue)) continue;
+        if (allowed && !allowed.has(oldValue)) continue;
+        seen.add(oldValue);
+        const opt = document.createElement('option');
+        opt.value = String(count + 1);
+        opt.textContent = auditOptionLabel(item);
+        opt.dataset.oldValue = oldValue;
+        opt.dataset.changedAt = item.changed_at || '';
+        select.appendChild(opt);
+        count++;
+      }
+
+      if (!count) {
+        select.disabled = true;
+      } else {
+        select.firstChild.textContent = 'Choose previous';
+        select.addEventListener('change', () => applyPrevValue(select));
+      }
+      return select;
+    }
+
     async function loadParams() {
       const account = els.accountSelect.value;
       const bot = els.botSelect.value;
@@ -1953,6 +2030,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         tr.appendChild(paramCell(row));
         tr.appendChild(textCell('desc', row.param_desc));
         tr.appendChild(textCell('current', row.current_value));
+
+        const prevTd = document.createElement('td');
+        prevTd.className = 'prev-value';
+        prevTd.appendChild(await buildPrevValueControl(row));
+        tr.appendChild(prevTd);
 
         const newTd = document.createElement('td');
         newTd.className = 'new-value';
@@ -3151,12 +3233,39 @@ async def config_ui_params(request: Request, account_login: int, bot: str):
                           FROM bot_param.bot_config_allowed_value av
                         WHERE av.bot = e.bot
                            AND av.input_param = e.input_param
-                    ) AS has_choices
+                    ) AS has_choices,
+                    COALESCE(audit.prev_values, '[]'::jsonb) AS prev_values
                   FROM bot_param.bot_config_user_editor e
                   JOIN bot_param.bot_config_param_catalog pc
                     ON pc.bot_kind = e.bot
                    AND COALESCE(pc.input_param_name, pc.param_key) = e.input_param
                    AND COALESCE(pc.user_editable, true) = true
+                  LEFT JOIN LATERAL (
+                    SELECT jsonb_agg(
+                               jsonb_build_object(
+                                 'changed_at', to_char(hist.changed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC',
+                                 'old_value', hist.old_value,
+                                 'new_value', hist.new_value,
+                                 'changed_by', hist.changed_by
+                               )
+                               ORDER BY hist.changed_at DESC
+                           ) AS prev_values
+                      FROM (
+                        SELECT a.changed_at,
+                               a.old_value #>> '{}' AS old_value,
+                               a.new_value #>> '{}' AS new_value,
+                               a.changed_by
+                          FROM bot_param.bot_param_audit a
+                         WHERE a.env = 'prod'
+                           AND a.account_login = e.account_login
+                           AND a.bot_kind = e.bot
+                           AND a.param_path = pc.param_path
+                           AND a.old_value IS NOT NULL
+                           AND NULLIF(a.old_value #>> '{}', '') IS NOT NULL
+                         ORDER BY a.changed_at DESC
+                         LIMIT 10
+                      ) hist
+                  ) audit ON true
                   JOIN bot_param.operator_account oa
                     ON oa.env = 'prod'
                    AND oa.account_login = e.account_login
