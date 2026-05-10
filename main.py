@@ -6,6 +6,7 @@ import os, json, traceback, re, threading, asyncio, time, tempfile, base64, hash
 from urllib.parse import parse_qs
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 try:
@@ -19,7 +20,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-CODE_VERSION = "v1.04"
+CODE_VERSION = "v1.07"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -112,6 +113,28 @@ class ConfigUiSaveRequest(BaseModel):
     copy_to_account_login: Optional[int] = None
     copy_to_account_logins: Optional[List[int]] = None
     changes: List[ConfigUiChange]
+
+
+class ParamCatalogChange(BaseModel):
+    bot_kind: Optional[str] = None
+    param_key: str
+    section_name: Optional[str] = None
+    input_param_name: Optional[str] = None
+    display_name: Optional[str] = None
+    param_desc: Optional[str] = None
+    param_path: Optional[str] = None
+    value_type: Optional[str] = None
+    min_numeric: Optional[str] = None
+    max_numeric: Optional[str] = None
+    allowed_values: Optional[List[str]] = None
+    sort_order: Optional[int] = None
+    user_editable: Optional[bool] = None
+
+
+class ParamCatalogSaveRequest(BaseModel):
+    account_login: int
+    bot: str
+    changes: List[ParamCatalogChange]
 
 
 class RmControlCommandRequest(BaseModel):
@@ -385,6 +408,138 @@ def resolve_new_value_columns(cur, bot, input_param, value):
     if has_dictionary:
         return value, None
     return None, value
+
+
+def clean_optional_text(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def clean_required_text(value, field_name):
+    text = clean_optional_text(value)
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    return text
+
+
+def normalize_catalog_numeric(value, field_name):
+    text = clean_optional_text(value)
+    if text is None:
+        return None
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{field_name} must be numeric")
+
+
+def normalize_catalog_allowed_values(values):
+    if not values:
+        return None
+    cleaned = []
+    seen = set()
+    for value in values:
+        text = clean_optional_text(value)
+        if not text or text in seen:
+            continue
+        cleaned.append(text)
+        seen.add(text)
+    return cleaned or None
+
+
+def sync_catalog_allowed_value_rows(cur, bot, input_param, allowed_values):
+    bot = (bot or "").strip().lower()
+    input_param = clean_required_text(input_param, "input_param")
+    if allowed_values:
+        cur.execute(
+            """
+            DELETE FROM bot_param.bot_config_allowed_value
+             WHERE bot = %s
+               AND input_param = %s
+               AND NOT (allowed_value = ANY(%s))
+            """,
+            (bot, input_param, allowed_values),
+        )
+        for sort_order, allowed_value in enumerate(allowed_values, start=1):
+            cur.execute(
+                """
+                INSERT INTO bot_param.bot_config_allowed_value (
+                    bot, input_param, allowed_value, value_desc, sort_order
+                )
+                VALUES (%s, %s, %s, NULL, %s)
+                ON CONFLICT (bot, input_param, allowed_value)
+                DO UPDATE SET sort_order = EXCLUDED.sort_order
+                """,
+                (bot, input_param, allowed_value, sort_order),
+            )
+    else:
+        cur.execute(
+            """
+            DELETE FROM bot_param.bot_config_allowed_value
+             WHERE bot = %s
+               AND input_param = %s
+            """,
+            (bot, input_param),
+        )
+
+
+def bot_config_param_catalog_columns(cur):
+    cur.execute(
+        """
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_schema = 'bot_param'
+           AND table_name = 'bot_config_param_catalog'
+        """
+    )
+    return {row[0] for row in cur.fetchall()}
+
+
+def refresh_bot_config_editors(cur, account_login, bot):
+    bot = (bot or "").strip().lower()
+    for fn_name in ("refresh_bot_config_editor", "refresh_bot_config_user_editor"):
+        savepoint = f"cfg_{fn_name}"
+        cur.execute(f"SAVEPOINT {savepoint}")
+        try:
+            cur.execute(f"SELECT bot_param.{fn_name}(%s, %s, %s)", ("prod", int(account_login), bot))
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+
+
+def catalog_refresh_accounts(cur, actor, source_account_login, bot):
+    bot = (bot or "").strip().lower()
+    cur.execute(
+        """
+        SELECT DISTINCT oa.account_login
+          FROM bot_param.operator_account oa
+         WHERE oa.env = 'prod'
+           AND oa.db_user = %s
+           AND oa.enabled = true
+           AND oa.can_apply = true
+           AND (
+                oa.account_login = %s
+                OR EXISTS (
+                    SELECT 1
+                      FROM bot_param.bot_config_current c
+                     WHERE c.env = oa.env
+                       AND c.account_login = oa.account_login
+                       AND c.bot_kind = %s
+                )
+           )
+         ORDER BY oa.account_login
+        """,
+        (actor, int(source_account_login), bot),
+    )
+    accounts = [int(row[0]) for row in cur.fetchall()]
+    refreshed = []
+    for account_login in accounts:
+        refresh_bot_config_editors(cur, account_login, bot)
+        refreshed.append(account_login)
+    return refreshed
 
 
 def first_error_line(exc):
@@ -752,10 +907,12 @@ RM_CONTROL_COMMAND_DESCRIPTIONS = {
     "status": "Show account RM state, active account stop, per-bot stops and runtime heartbeat.",
     "config": "Show current RM limits and owner configuration.",
     "stop_account": "Stop trading on the selected account until the selected period expires or resume is sent.",
+    "pause_account": "Pause new trading on the selected account without flattening open positions.",
     "resume": "Clear current account stop and keep today's baseline.",
     "rm_daystart": "Clear current account stop and restore today's day-start baseline.",
     "rm_reset": "Rearm RM from current balance/equity.",
     "stop_bots": "Stop only selected bot families on the account.",
+    "pause_bots": "Pause only selected bot families without flattening open positions.",
     "resume_bots": "Clear stops for selected bot families.",
 }
 RM_CONTROL_INPUT_PARAMS = {
@@ -1081,6 +1238,18 @@ def build_rm_control_command(account_login, req: RmControlCommandRequest):
             return f"/{int(account_login)} stop {normalize_rm_until(req.until)}"
         raise ValueError("duration must be manual, day, week, or until")
 
+    if action == "pause_account":
+        duration = (req.duration or "").strip().lower()
+        if duration == "manual":
+            return f"/{int(account_login)} pause"
+        if duration == "day":
+            return f"/{int(account_login)} day_pause"
+        if duration == "week":
+            return f"/{int(account_login)} week_pause"
+        if duration == "until":
+            return f"/{int(account_login)} pause {normalize_rm_until(req.until)}"
+        raise ValueError("duration must be manual, day, week, or until")
+
     if action == "stop_bots":
         bots = ",".join(normalize_rm_bot_ids(req.bot_ids))
         duration = (req.duration or "").strip().lower()
@@ -1091,6 +1260,17 @@ def build_rm_control_command(account_login, req: RmControlCommandRequest):
         else:
             raise ValueError("duration must be manual, day, week, or until")
         return f"/{int(account_login)} stop bots {bots} {stop_until}"
+
+    if action == "pause_bots":
+        bots = ",".join(normalize_rm_bot_ids(req.bot_ids))
+        duration = (req.duration or "").strip().lower()
+        if duration in ("manual", "day", "week"):
+            pause_until = duration
+        elif duration == "until":
+            pause_until = normalize_rm_until(req.until)
+        else:
+            raise ValueError("duration must be manual, day, week, or until")
+        return f"/{int(account_login)} pause bots {bots} {pause_until}"
 
     if action == "resume_bots":
         bots = ",".join(normalize_rm_bot_ids(req.bot_ids))
@@ -1250,7 +1430,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .toolbar { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; margin-bottom: 12px; }
     .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
     label { color: var(--muted); font-size: 12px; font-weight: 600; }
-    select, input[type="text"], input[type="search"] { border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; color: var(--text); min-height: 38px; padding: 8px 10px; width: 100%; }
+    select, input[type="text"], input[type="search"], textarea { border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; color: var(--text); min-height: 38px; padding: 8px 10px; width: 100%; }
+    textarea { resize: vertical; min-height: 58px; line-height: 1.3; }
     .copy-line { display: flex; gap: 8px; align-items: center; min-height: 38px; border: 1px solid var(--border); border-radius: 6px; background: #fff; padding: 8px 10px; }
     .copy-line input { width: auto; }
     .target-list { min-height: 86px; max-height: 112px; overflow-y: auto; border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; padding: 4px; }
@@ -1311,6 +1492,25 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .prev-value, .new-value, .reason { min-width: 0; }
     .prev-value select, .new-value input, .new-value select, .reason input { width: 100%; min-width: 0; }
     .prev-value select:disabled { color: var(--muted); background: #f8fafc; }
+    .catalog-wrap { overflow-x: auto; }
+    .catalog-table { min-width: 1580px; }
+    .catalog-table th:nth-child(1), .catalog-table td.catalog-key { width: 11%; }
+    .catalog-table th:nth-child(2), .catalog-table td.catalog-section { width: 8%; }
+    .catalog-table th:nth-child(3), .catalog-table td.catalog-input { width: 10%; }
+    .catalog-table th:nth-child(4), .catalog-table td.catalog-display { width: 11%; }
+    .catalog-table th:nth-child(5), .catalog-table td.catalog-desc { width: 16%; }
+    .catalog-table th:nth-child(6), .catalog-table td.catalog-path { width: 13%; }
+    .catalog-table th:nth-child(7), .catalog-table td.catalog-type { width: 8%; }
+    .catalog-table th:nth-child(8), .catalog-table td.catalog-range { width: 7%; }
+    .catalog-table th:nth-child(9), .catalog-table td.catalog-values { width: 11%; }
+    .catalog-table th:nth-child(10), .catalog-table td.catalog-sort { width: 5%; }
+    .catalog-table th:nth-child(11), .catalog-table td.catalog-editable { width: 5%; }
+    .catalog-key { font-family: Consolas, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
+    .catalog-table input, .catalog-table select, .catalog-table textarea { min-width: 0; font-size: 12px; }
+    .catalog-table .catalog-number { text-align: right; }
+    .catalog-range-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; }
+    .catalog-toggle { min-height: 38px; display: flex; align-items: center; justify-content: center; }
+    .catalog-toggle input { width: auto; }
     .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
     .changed-count { color: var(--muted); font-size: 14px; }
     @media (max-width: 1100px) {
@@ -1333,16 +1533,19 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .tabs { margin-top: 8px; }
       .tab-btn { flex: 1 0 auto; min-height: 42px; }
       .table-wrap { border: 0; border-radius: 0; overflow-x: visible; background: transparent; }
-      .params-table, .params-table thead, .params-table tbody, .params-table tr, .params-table td { display: block; width: 100%; }
-      .params-table { min-width: 0; border-collapse: separate; }
-      .params-table thead { display: none; }
-      .params-table tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
-      .params-table tr.hidden { display: none; }
+      .params-table, .params-table thead, .params-table tbody, .params-table tr, .params-table td,
+      .catalog-table, .catalog-table thead, .catalog-table tbody, .catalog-table tr, .catalog-table td { display: block; width: 100%; }
+      .params-table, .catalog-table { min-width: 0; border-collapse: separate; }
+      .params-table thead, .catalog-table thead { display: none; }
+      .params-table tr, .catalog-table tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
+      .params-table tr.hidden, .catalog-table tr.hidden { display: none; }
       .params-table tr.group-break { margin-top: 18px; border-top: 3px solid #3d7cae; }
       .params-table tr.group-break td { border-top: 0; }
       .params-table tr.group-break td:nth-child(2) { box-shadow: none; }
-      .params-table td { border-bottom: 0; padding: 0; min-width: 0; width: 100% !important; }
+      .params-table td, .catalog-table td { border-bottom: 0; padding: 0; min-width: 0; width: 100% !important; }
       .params-table td.group, .params-table td.reason { display: none; }
+      .catalog-table td::before { content: attr(data-label); display: block; margin-bottom: 5px; font-size: 12px; font-weight: 700; color: var(--muted); }
+      .catalog-range-grid { grid-template-columns: 1fr 1fr; }
       .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
       .param::after { content: attr(data-desc); display: block; margin-top: 4px; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
       .desc { display: none; }
@@ -1354,7 +1557,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .current { font-family: Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
       .footer { align-items: stretch; flex-direction: column; }
       .footer button { width: 100%; min-height: 44px; }
-      select, input[type="text"], input[type="search"] { min-height: 44px; font-size: 16px; }
+      select, input[type="text"], input[type="search"], textarea { min-height: 44px; font-size: 16px; }
       .target-list { max-height: 144px; }
       .target-option { min-height: 34px; font-size: 14px; }
       .rm-control { padding: 10px; }
@@ -1387,21 +1590,25 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
   <main>
     <div id="status" class="status"></div>
 
+    <section class="toolbar" aria-label="context selectors">
+      <div class="field">
+        <label for="accountSelect">Account</label>
+        <select id="accountSelect"></select>
+      </div>
+      <div class="field">
+        <label for="botSelect">Bot</label>
+        <select id="botSelect"></select>
+      </div>
+    </section>
+
     <nav class="tabs" role="tablist" aria-label="form tabs">
       <button id="paramsTab" class="tab-btn is-active" type="button" role="tab" aria-selected="true" aria-controls="paramsPanel">Params</button>
+      <button id="paramsConfigTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="paramsConfigPanel">Params_config</button>
       <button id="rmTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="rmPanel">RM command</button>
     </nav>
 
     <section id="paramsPanel" class="tab-panel" role="tabpanel" aria-labelledby="paramsTab">
       <section class="toolbar" aria-label="filters">
-        <div class="field">
-          <label for="accountSelect">Account</label>
-          <select id="accountSelect"></select>
-        </div>
-        <div class="field">
-          <label for="botSelect">Bot</label>
-          <select id="botSelect"></select>
-        </div>
         <div class="field">
           <label for="groupFilter">Group</label>
           <select id="groupFilter"><option value="">All groups</option></select>
@@ -1443,6 +1650,41 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       </section>
     </section>
 
+    <section id="paramsConfigPanel" class="tab-panel" role="tabpanel" aria-labelledby="paramsConfigTab" hidden>
+      <section class="toolbar" aria-label="catalog filters">
+        <div class="field">
+          <label for="catalogSearchInput">Search</label>
+          <input id="catalogSearchInput" type="search" placeholder="param_key, input_param, path">
+        </div>
+      </section>
+
+      <section class="table-wrap catalog-wrap">
+        <table class="catalog-table">
+          <thead>
+            <tr>
+              <th>param_key</th>
+              <th>section</th>
+              <th>input_param</th>
+              <th>display</th>
+              <th>description</th>
+              <th>param_path</th>
+              <th>type</th>
+              <th>min/max</th>
+              <th>allowed_values</th>
+              <th>sort</th>
+              <th>editable</th>
+            </tr>
+          </thead>
+          <tbody id="paramsConfigBody"></tbody>
+        </table>
+      </section>
+
+      <section class="footer">
+        <div id="paramsConfigChangedCount" class="changed-count">0 catalog rows changed</div>
+        <button id="paramsConfigSaveBtn" type="button" disabled>Save catalog</button>
+      </section>
+    </section>
+
     <section id="rmPanel" class="tab-panel" role="tabpanel" aria-labelledby="rmTab" hidden>
       <section class="rm-control" aria-label="rm-control">
         <div class="rm-head">
@@ -1460,10 +1702,12 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
               <option value="status">Status</option>
               <option value="config">Config</option>
               <option value="stop_account">Stop account</option>
+              <option value="pause_account">Pause account</option>
               <option value="resume">Resume account</option>
               <option value="rm_daystart">RM daystart</option>
               <option value="rm_reset">RM reset</option>
               <option value="stop_bots">Stop selected bots</option>
+              <option value="pause_bots">Pause selected bots</option>
               <option value="resume_bots">Resume selected bots</option>
             </select>
             <div id="rmCommandDescription" class="rm-desc"></div>
@@ -1475,7 +1719,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
           <div class="field" id="rmPeriodField">
             <label>Period</label>
             <div id="rmPeriodList" class="rm-check-list">
-              <label class="rm-option"><input type="checkbox" value="manual" checked> Manual</label>
+              <label class="rm-option"><input type="checkbox" value="manual" checked> Manual resume</label>
               <label class="rm-option"><input type="checkbox" value="day"> Day</label>
               <label class="rm-option"><input type="checkbox" value="week"> Week</label>
               <label class="rm-option"><input type="checkbox" value="until"> Until</label>
@@ -1503,13 +1747,17 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       status: 'Show account RM state, active account stop, selected bot stops and runtime heartbeat.',
       config: 'Show current RM limits and owner configuration.',
       stop_account: 'Stop trading on the selected account for the selected period.',
+      pause_account: 'Pause new trading on the selected account without flattening open positions.',
       resume: "Clear current account stop and keep today's baseline.",
       rm_daystart: "Clear current account stop and restore today's day-start baseline.",
       rm_reset: 'Rearm RM from current balance/equity.',
       stop_bots: 'Stop only selected bot families for the selected period.',
+      pause_bots: 'Pause only selected bot families without flattening open positions.',
       resume_bots: 'Clear stops for selected bot families.'
     };
     let currentBotRows = [];
+    let currentCatalogRows = [];
+    const CATALOG_VALUE_TYPES = ['bool', 'int', 'numeric', 'text', 'json'];
 
     const els = {
       sessionUser: document.getElementById('sessionUser'),
@@ -1535,13 +1783,19 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       rmRefreshStatusBtn: document.getElementById('rmRefreshStatusBtn'),
       rmRuntimeList: document.getElementById('rmRuntimeList'),
       paramsTab: document.getElementById('paramsTab'),
+      paramsConfigTab: document.getElementById('paramsConfigTab'),
       rmTab: document.getElementById('rmTab'),
       paramsPanel: document.getElementById('paramsPanel'),
+      paramsConfigPanel: document.getElementById('paramsConfigPanel'),
       rmPanel: document.getElementById('rmPanel'),
       status: document.getElementById('status'),
       paramsBody: document.getElementById('paramsBody'),
       changedCount: document.getElementById('changedCount'),
-      saveBtn: document.getElementById('saveBtn')
+      saveBtn: document.getElementById('saveBtn'),
+      catalogSearchInput: document.getElementById('catalogSearchInput'),
+      paramsConfigBody: document.getElementById('paramsConfigBody'),
+      paramsConfigChangedCount: document.getElementById('paramsConfigChangedCount'),
+      paramsConfigSaveBtn: document.getElementById('paramsConfigSaveBtn')
     };
 
     els.sessionUser.textContent = SESSION_USER;
@@ -1555,12 +1809,17 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
 
     function switchFormTab(tab) {
       const showRm = tab === 'rm';
-      els.paramsPanel.hidden = showRm;
+      const showCatalog = tab === 'catalog';
+      els.paramsPanel.hidden = showRm || showCatalog;
+      els.paramsConfigPanel.hidden = !showCatalog;
       els.rmPanel.hidden = !showRm;
-      els.paramsTab.classList.toggle('is-active', !showRm);
+      els.paramsTab.classList.toggle('is-active', !showRm && !showCatalog);
+      els.paramsConfigTab.classList.toggle('is-active', showCatalog);
       els.rmTab.classList.toggle('is-active', showRm);
-      els.paramsTab.setAttribute('aria-selected', showRm ? 'false' : 'true');
+      els.paramsTab.setAttribute('aria-selected', showRm || showCatalog ? 'false' : 'true');
+      els.paramsConfigTab.setAttribute('aria-selected', showCatalog ? 'true' : 'false');
       els.rmTab.setAttribute('aria-selected', showRm ? 'true' : 'false');
+      if (showCatalog) loadParamCatalog().catch(exc => setStatus(exc.message, true));
       if (showRm) loadRuntimeStatus().catch(exc => setStatus(exc.message, true));
     }
 
@@ -1717,6 +1976,19 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return els.rmUntilInput.value.trim();
     }
 
+    function formatRmLocalNow() {
+      const now = new Date();
+      const pad = value => String(value).padStart(2, '0');
+      return now.getFullYear() + '.' + pad(now.getMonth() + 1) + '.' + pad(now.getDate()) +
+        ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+    }
+
+    function ensureRmUntilDefault() {
+      if (!els.rmUntilInput.value.trim()) {
+        els.rmUntilInput.value = formatRmLocalNow();
+      }
+    }
+
     function selectedRmPeriod() {
       return singleCheckedValue(els.rmPeriodList, 'manual');
     }
@@ -1724,16 +1996,17 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     function buildRmCommandCore() {
       const action = els.rmActionSelect.value;
       const period = selectedRmPeriod();
-      if (action === 'stop_account') {
-        if (period === 'manual') return 'halt';
-        if (period === 'day') return 'day_stop';
-        if (period === 'week') return 'week_stop';
-        return 'stop ' + (rmUntilValue() || 'YYYY.MM.DD HH:MM');
+      if (action === 'stop_account' || action === 'pause_account') {
+        const isPause = action === 'pause_account';
+        if (period === 'manual') return isPause ? 'pause' : 'halt';
+        if (period === 'day') return isPause ? 'day_pause' : 'day_stop';
+        if (period === 'week') return isPause ? 'week_pause' : 'week_stop';
+        return (isPause ? 'pause ' : 'stop ') + (rmUntilValue() || 'YYYY.MM.DD HH:MM');
       }
-      if (action === 'stop_bots') {
+      if (action === 'stop_bots' || action === 'pause_bots') {
         const bots = checkedValues(els.rmBotList).join(',');
         const duration = period === 'until' ? (rmUntilValue() || 'YYYY.MM.DD HH:MM') : period;
-        return bots ? 'stop bots ' + bots + ' ' + duration : 'choose n* bots';
+        return bots ? (action === 'pause_bots' ? 'pause bots ' : 'stop bots ') + bots + ' ' + duration : 'choose n* bots';
       }
       if (action === 'resume_bots') {
         const bots = checkedValues(els.rmBotList).join(',');
@@ -1750,10 +2023,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
 
     function updateRmCommandUi() {
       const action = els.rmActionSelect.value;
-      const needsBots = action === 'stop_bots' || action === 'resume_bots';
-      const needsPeriod = action === 'stop_account' || action === 'stop_bots';
+      const needsBots = action === 'stop_bots' || action === 'pause_bots' || action === 'resume_bots';
+      const needsPeriod = action === 'stop_account' || action === 'pause_account' || action === 'stop_bots' || action === 'pause_bots';
       const needsUntil = needsPeriod && selectedRmPeriod() === 'until';
 
+      if (needsPeriod) ensureRmUntilDefault();
       els.rmBotField.style.display = needsBots ? '' : 'none';
       els.rmPeriodField.style.display = needsPeriod ? '' : 'none';
       els.rmUntilField.style.display = needsUntil ? '' : 'none';
@@ -1858,6 +2132,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       if (n9) els.botSelect.value = 'n9';
       await loadCopyTargets();
       await loadParams();
+      if (!els.paramsConfigPanel.hidden) await loadParamCatalog();
     }
 
     async function loadCopyTargets() {
@@ -2059,6 +2334,273 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       setStatus(rows.length + ' parameters loaded');
     }
 
+    function catalogLabelCell(className, label, content) {
+      const td = document.createElement('td');
+      td.className = className || '';
+      td.dataset.label = label;
+      if (content instanceof Node) {
+        td.appendChild(content);
+      } else {
+        td.textContent = content == null ? '' : String(content);
+      }
+      return td;
+    }
+
+    function normalizedControlValue(control) {
+      if (!control) return '';
+      if (control.type === 'checkbox') return control.checked ? '1' : '0';
+      return String(control.value || '').trim();
+    }
+
+    function catalogControlChanged(control) {
+      return normalizedControlValue(control) !== String(control.dataset.original || '');
+    }
+
+    function catalogTextInput(row, field, placeholder) {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'catalog-input-control';
+      input.dataset.field = field;
+      input.placeholder = placeholder || '';
+      input.value = row[field] == null ? '' : String(row[field]);
+      input.dataset.original = input.value.trim();
+      input.addEventListener('input', updateCatalogChangedCount);
+      return input;
+    }
+
+    function catalogTextarea(row, field, placeholder) {
+      const textarea = document.createElement('textarea');
+      textarea.className = 'catalog-input-control';
+      textarea.dataset.field = field;
+      textarea.placeholder = placeholder || '';
+      textarea.value = Array.isArray(row[field]) ? row[field].join('\n') : (row[field] == null ? '' : String(row[field]));
+      textarea.dataset.original = field === 'allowed_values' ? normalizeAllowedValuesText(textarea.value) : textarea.value.trim();
+      textarea.addEventListener('input', updateCatalogChangedCount);
+      return textarea;
+    }
+
+    function catalogTypeSelect(row) {
+      const select = document.createElement('select');
+      select.className = 'catalog-input-control';
+      select.dataset.field = 'value_type';
+      const current = row.value_type == null ? '' : String(row.value_type);
+      const values = current && !CATALOG_VALUE_TYPES.includes(current) ? [current, ...CATALOG_VALUE_TYPES] : CATALOG_VALUE_TYPES;
+      for (const value of values) {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = value;
+        select.appendChild(opt);
+      }
+      select.value = current || 'text';
+      select.dataset.original = select.value.trim();
+      select.addEventListener('change', updateCatalogChangedCount);
+      return select;
+    }
+
+    function catalogCheckbox(row, field) {
+      const label = document.createElement('label');
+      label.className = 'catalog-toggle';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.className = 'catalog-input-control';
+      input.dataset.field = field;
+      input.checked = row[field] !== false;
+      input.dataset.original = input.checked ? '1' : '0';
+      input.addEventListener('change', updateCatalogChangedCount);
+      label.appendChild(input);
+      return label;
+    }
+
+    function catalogRangeControls(row) {
+      const wrap = document.createElement('div');
+      wrap.className = 'catalog-range-grid';
+      const minInput = catalogTextInput(row, 'min_numeric', 'min');
+      const maxInput = catalogTextInput(row, 'max_numeric', 'max');
+      minInput.classList.add('catalog-number');
+      maxInput.classList.add('catalog-number');
+      wrap.appendChild(minInput);
+      wrap.appendChild(maxInput);
+      return wrap;
+    }
+
+    function normalizeAllowedValuesText(text) {
+      return parseAllowedValues(text).join('\n');
+    }
+
+    function parseAllowedValues(text) {
+      const parts = String(text || '').split(/[\n,]+/);
+      const values = [];
+      const seen = new Set();
+      for (const part of parts) {
+        const value = part.trim();
+        if (!value || seen.has(value)) continue;
+        values.push(value);
+        seen.add(value);
+      }
+      return values;
+    }
+
+    function catalogControl(tr, field) {
+      return tr.querySelector('.catalog-input-control[data-field="' + field + '"]');
+    }
+
+    function catalogTextValue(tr, field) {
+      const control = catalogControl(tr, field);
+      const value = control ? String(control.value || '').trim() : '';
+      return value || null;
+    }
+
+    function catalogIntegerValue(tr, field, validate) {
+      const value = catalogTextValue(tr, field);
+      if (value == null) return null;
+      if (!/^-?\d+$/.test(value)) {
+        if (validate) throw new Error(field + ' must be integer');
+        return null;
+      }
+      return Number(value);
+    }
+
+    function catalogRowPayload(tr, validate) {
+      const userEditable = catalogControl(tr, 'user_editable');
+      return {
+        bot_kind: tr.dataset.botKind,
+        param_key: tr.dataset.paramKey,
+        section_name: catalogTextValue(tr, 'section_name'),
+        input_param_name: catalogTextValue(tr, 'input_param_name'),
+        display_name: catalogTextValue(tr, 'display_name'),
+        param_desc: catalogTextValue(tr, 'param_desc'),
+        param_path: catalogTextValue(tr, 'param_path'),
+        value_type: catalogTextValue(tr, 'value_type'),
+        min_numeric: catalogTextValue(tr, 'min_numeric'),
+        max_numeric: catalogTextValue(tr, 'max_numeric'),
+        allowed_values: parseAllowedValues(catalogControl(tr, 'allowed_values')?.value || ''),
+        sort_order: catalogIntegerValue(tr, 'sort_order', validate),
+        user_editable: userEditable ? userEditable.checked : true
+      };
+    }
+
+    function renderCatalogRow(row) {
+      const tr = document.createElement('tr');
+      tr.dataset.botKind = row.bot_kind || '';
+      tr.dataset.paramKey = row.param_key || '';
+      tr.dataset.search = [
+        row.param_key,
+        row.section_name,
+        row.input_param_name,
+        row.display_name,
+        row.param_desc,
+        row.param_path,
+        row.value_type,
+        Array.isArray(row.allowed_values) ? row.allowed_values.join(' ') : ''
+      ].filter(Boolean).join(' ').toLowerCase();
+      tr.appendChild(catalogLabelCell('catalog-key', 'param_key', row.param_key));
+      tr.appendChild(catalogLabelCell('catalog-section', 'section', catalogTextInput(row, 'section_name', 'section')));
+      tr.appendChild(catalogLabelCell('catalog-input', 'input_param', catalogTextInput(row, 'input_param_name', 'input_param')));
+      tr.appendChild(catalogLabelCell('catalog-display', 'display', catalogTextInput(row, 'display_name', 'display name')));
+      tr.appendChild(catalogLabelCell('catalog-desc', 'description', catalogTextarea(row, 'param_desc', 'description')));
+      tr.appendChild(catalogLabelCell('catalog-path', 'param_path', catalogTextInput(row, 'param_path', 'json.path')));
+      tr.appendChild(catalogLabelCell('catalog-type', 'type', catalogTypeSelect(row)));
+      tr.appendChild(catalogLabelCell('catalog-range', 'min/max', catalogRangeControls(row)));
+      tr.appendChild(catalogLabelCell('catalog-values', 'allowed_values', catalogTextarea(row, 'allowed_values', 'one value per line')));
+      tr.appendChild(catalogLabelCell('catalog-sort', 'sort', catalogTextInput(row, 'sort_order', 'sort')));
+      tr.appendChild(catalogLabelCell('catalog-editable', 'editable', catalogCheckbox(row, 'user_editable')));
+      return tr;
+    }
+
+    async function loadParamCatalog() {
+      const account = els.accountSelect.value;
+      const bot = els.botSelect.value;
+      els.paramsConfigBody.innerHTML = '';
+      currentCatalogRows = [];
+      updateCatalogChangedCount();
+      if (!account || !bot) return;
+      setStatus('Loading parameter catalog...');
+      const data = await api('/config-ui/api/param-catalog?account_login=' + encodeURIComponent(account) + '&bot=' + encodeURIComponent(bot));
+      currentCatalogRows = data.params || [];
+      for (const row of currentCatalogRows) {
+        els.paramsConfigBody.appendChild(renderCatalogRow(row));
+      }
+      applyCatalogFilter();
+      updateCatalogChangedCount();
+      setStatus(currentCatalogRows.length + ' catalog rows loaded');
+    }
+
+    function applyCatalogFilter() {
+      const query = els.catalogSearchInput.value.trim().toLowerCase();
+      for (const tr of els.paramsConfigBody.querySelectorAll('tr')) {
+        tr.classList.toggle('hidden', !!query && !tr.dataset.search.includes(query));
+      }
+    }
+
+    function getCatalogChangedRows(validate) {
+      const changes = [];
+      for (const tr of els.paramsConfigBody.querySelectorAll('tr')) {
+        let changed = false;
+        for (const control of tr.querySelectorAll('.catalog-input-control')) {
+          if (control.dataset.field === 'allowed_values') {
+            if (normalizeAllowedValuesText(control.value) !== String(control.dataset.original || '')) changed = true;
+          } else if (catalogControlChanged(control)) {
+            changed = true;
+          }
+          if (changed) break;
+        }
+        if (changed) changes.push(catalogRowPayload(tr, !!validate));
+      }
+      return changes;
+    }
+
+    function updateCatalogChangedCount() {
+      const count = getCatalogChangedRows(false).length;
+      els.paramsConfigChangedCount.textContent = count + (count === 1 ? ' catalog row changed' : ' catalog rows changed');
+      els.paramsConfigSaveBtn.disabled = count === 0;
+    }
+
+    async function saveParamCatalogChanges() {
+      let changes;
+      try {
+        changes = getCatalogChangedRows(true);
+      } catch (exc) {
+        setStatus(exc.message, true);
+        return;
+      }
+      if (!changes.length) return;
+      for (const change of changes) {
+        if (!change.param_path) {
+          setStatus(change.param_key + ': param_path is required', true);
+          return;
+        }
+        if (!change.value_type) {
+          setStatus(change.param_key + ': value_type is required', true);
+          return;
+        }
+      }
+      els.paramsConfigSaveBtn.disabled = true;
+      setStatus('Saving catalog...');
+      const payload = {
+        account_login: Number(els.accountSelect.value),
+        bot: els.botSelect.value,
+        changes
+      };
+      try {
+        const data = await api('/config-ui/api/param-catalog/save', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const refreshed = (data.refreshed_accounts || []).length;
+        const savedMessage = 'Saved ' + (data.updated_count || 0) + ' catalog row(s); refreshed ' + refreshed + ' account(s)';
+        setStatus(savedMessage);
+        await loadParamCatalog();
+        await loadParams();
+        await loadCopyTargets();
+        setStatus(savedMessage);
+      } catch (exc) {
+        setStatus(exc.message, true);
+      } finally {
+        updateCatalogChangedCount();
+      }
+    }
+
     function applyFilters() {
       const group = els.groupFilter.value;
       const query = els.searchInput.value.trim().toLowerCase();
@@ -2126,13 +2668,20 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     }
 
     els.accountSelect.addEventListener('change', async () => { syncRmCurrentAccount(); await loadBots(); });
-    els.botSelect.addEventListener('change', async () => { await loadCopyTargets(); await loadParams(); });
+    els.botSelect.addEventListener('change', async () => {
+      await loadCopyTargets();
+      await loadParams();
+      if (!els.paramsConfigPanel.hidden) await loadParamCatalog();
+    });
     els.groupFilter.addEventListener('change', applyFilters);
     els.searchInput.addEventListener('input', applyFilters);
+    els.catalogSearchInput.addEventListener('input', applyCatalogFilter);
     els.copyToggle.addEventListener('change', loadCopyTargets);
     els.saveBtn.addEventListener('click', saveChanges);
     els.paramsTab.addEventListener('click', () => switchFormTab('params'));
+    els.paramsConfigTab.addEventListener('click', () => switchFormTab('catalog'));
     els.rmTab.addEventListener('click', () => switchFormTab('rm'));
+    els.paramsConfigSaveBtn.addEventListener('click', saveParamCatalogChanges);
     els.rmActionSelect.addEventListener('change', updateRmCommandUi);
     for (const input of els.rmPeriodList.querySelectorAll('input[type="checkbox"]')) {
       input.addEventListener('change', () => {
@@ -3281,6 +3830,204 @@ async def config_ui_params(request: Request, account_login: int, bot: str):
             rows = [dict(row) for row in cur.fetchall()]
         return {"ok": True, "params": rows, "version": CODE_VERSION}
     except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.get("/config-ui/api/param-catalog")
+async def config_ui_param_catalog(request: Request, account_login: int, bot: str):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    bot = (bot or "").strip().lower()
+    if not bot:
+        return config_ui_json_error(400, "bot is required")
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            if not ensure_actor_account_access(cur, actor, account_login, can_apply=False):
+                return config_ui_json_error(403, "account is not available for actor")
+            set_actor(cur, actor)
+            if is_rm_controller_bot(bot):
+                ensure_rm_controller_db_config(cur, account_login)
+                bot = RM_CONTROLLER_BOT
+            columns = bot_config_param_catalog_columns(cur)
+            min_numeric_expr = "pc.min_numeric" if "min_numeric" in columns else "NULL::numeric AS min_numeric"
+            max_numeric_expr = "pc.max_numeric" if "max_numeric" in columns else "NULL::numeric AS max_numeric"
+            cur.execute(
+                f"""
+                SELECT pc.bot_kind,
+                       pc.section_name,
+                       pc.param_key,
+                       pc.input_param_name,
+                       pc.display_name,
+                       pc.param_desc,
+                       pc.param_path,
+                       pc.value_type,
+                       {min_numeric_expr},
+                       {max_numeric_expr},
+                       COALESCE(pc.allowed_values, av.allowed_values) AS allowed_values,
+                       pc.sort_order,
+                       COALESCE(pc.user_editable, true) AS user_editable
+                  FROM bot_param.bot_config_param_catalog pc
+                  LEFT JOIN LATERAL (
+                    SELECT array_agg(v.allowed_value ORDER BY v.sort_order, v.allowed_value) AS allowed_values
+                      FROM bot_param.bot_config_allowed_value v
+                     WHERE v.bot = pc.bot_kind
+                       AND v.input_param = COALESCE(pc.input_param_name, pc.param_key)
+                  ) av ON true
+                 WHERE pc.bot_kind = %s
+                 ORDER BY COALESCE(pc.sort_order, 999999),
+                          COALESCE(pc.section_name, ''),
+                          pc.param_key
+                """,
+                (bot,),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+            for row in rows:
+                for numeric_field in ("min_numeric", "max_numeric"):
+                    if row.get(numeric_field) is not None:
+                        row[numeric_field] = str(row[numeric_field])
+                if row.get("allowed_values") is None:
+                    row["allowed_values"] = []
+        conn.commit()
+        return {"ok": True, "params": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        conn.rollback()
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/config-ui/api/param-catalog/save")
+async def config_ui_param_catalog_save(req: ParamCatalogSaveRequest, request: Request):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    bot = (req.bot or "").strip().lower()
+    if not bot:
+        return config_ui_json_error(400, "bot is required")
+    if not req.changes:
+        return config_ui_json_error(400, "changes is empty")
+    if len(req.changes) > 200:
+        return config_ui_json_error(400, "too many changes")
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        updated = []
+        refreshed_accounts = []
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            set_actor(cur, actor)
+            if not ensure_actor_account_access(cur, actor, req.account_login, can_apply=True):
+                return config_ui_json_error(403, "account is not available for apply")
+            if is_rm_controller_bot(bot):
+                ensure_rm_controller_db_config(cur, req.account_login)
+                bot = RM_CONTROLLER_BOT
+            columns = bot_config_param_catalog_columns(cur)
+            has_min_numeric = "min_numeric" in columns
+            has_max_numeric = "max_numeric" in columns
+
+            for change in req.changes:
+                change_bot = (change.bot_kind or bot).strip().lower()
+                if change_bot != bot:
+                    raise ValueError(f"{change.param_key}: bot_kind must stay {bot}")
+
+                param_key = clean_required_text(change.param_key, "param_key")
+                param_path = clean_required_text(change.param_path, f"{param_key}.param_path")
+                value_type = clean_required_text(change.value_type, f"{param_key}.value_type").lower()
+                input_param_name = clean_optional_text(change.input_param_name)
+                allowed_values = normalize_catalog_allowed_values(change.allowed_values)
+                user_editable = True if change.user_editable is None else bool(change.user_editable)
+
+                cur.execute(
+                    """
+                    SELECT COALESCE(input_param_name, param_key) AS input_param
+                      FROM bot_param.bot_config_param_catalog
+                     WHERE bot_kind = %s
+                       AND param_key = %s
+                     FOR UPDATE
+                    """,
+                    (bot, param_key),
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    raise ValueError(f"{param_key}: catalog row not found")
+                old_input_param = existing["input_param"]
+                new_input_param = input_param_name or param_key
+
+                set_columns = [
+                    ("section_name", clean_optional_text(change.section_name)),
+                    ("input_param_name", input_param_name),
+                    ("display_name", clean_optional_text(change.display_name)),
+                    ("param_desc", clean_optional_text(change.param_desc)),
+                    ("param_path", param_path),
+                    ("value_type", value_type),
+                    ("allowed_values", allowed_values),
+                    ("sort_order", change.sort_order),
+                    ("user_editable", user_editable),
+                ]
+                if has_min_numeric:
+                    set_columns.insert(6, ("min_numeric", normalize_catalog_numeric(change.min_numeric, f"{param_key}.min_numeric")))
+                if has_max_numeric:
+                    insert_at = 7 if has_min_numeric else 6
+                    set_columns.insert(insert_at, ("max_numeric", normalize_catalog_numeric(change.max_numeric, f"{param_key}.max_numeric")))
+
+                set_sql = ", ".join(f"{column_name} = %s" for column_name, _ in set_columns)
+                values = [value for _, value in set_columns]
+                min_numeric_expr = "min_numeric" if has_min_numeric else "NULL::numeric AS min_numeric"
+                max_numeric_expr = "max_numeric" if has_max_numeric else "NULL::numeric AS max_numeric"
+                cur.execute(
+                    f"""
+                    UPDATE bot_param.bot_config_param_catalog
+                       SET {set_sql}
+                     WHERE bot_kind = %s
+                       AND param_key = %s
+                     RETURNING bot_kind,
+                               section_name,
+                               param_key,
+                               input_param_name,
+                               display_name,
+                               param_desc,
+                               param_path,
+                               value_type,
+                               {min_numeric_expr},
+                               {max_numeric_expr},
+                               allowed_values,
+                               sort_order,
+                               COALESCE(user_editable, true) AS user_editable
+                    """,
+                    tuple(values + [bot, param_key]),
+                )
+                row = dict(cur.fetchone())
+                for numeric_field in ("min_numeric", "max_numeric"):
+                    if row.get(numeric_field) is not None:
+                        row[numeric_field] = str(row[numeric_field])
+                if row.get("allowed_values") is None:
+                    row["allowed_values"] = []
+                updated.append(row)
+
+                if old_input_param != new_input_param:
+                    sync_catalog_allowed_value_rows(cur, bot, old_input_param, None)
+                sync_catalog_allowed_value_rows(cur, bot, new_input_param, allowed_values)
+
+            refreshed_accounts = catalog_refresh_accounts(cur, actor, req.account_login, bot)
+
+        conn.commit()
+        return {
+            "ok": True,
+            "actor": actor,
+            "updated": updated,
+            "updated_count": len(updated),
+            "refreshed_accounts": refreshed_accounts,
+            "version": CODE_VERSION,
+        }
+    except ValueError as exc:
+        conn.rollback()
+        return config_ui_json_error(400, str(exc))
+    except Exception as exc:
+        conn.rollback()
         return config_ui_json_error(500, first_error_line(exc))
     finally:
         conn.close()
