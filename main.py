@@ -146,6 +146,10 @@ class RmControlCommandRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class RecommendationDecisionRequest(BaseModel):
+    reason: Optional[str] = None
+
+
 class BotRuntimeBaseRequest(BaseModel):
     env: str = "prod"
     account_login: int
@@ -504,6 +508,34 @@ def bot_config_param_catalog_columns(cur):
         """
     )
     return {row[0] for row in cur.fetchall()}
+
+
+def table_columns(cur, schema, table):
+    cur.execute(
+        """
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_schema = %s
+           AND table_name = %s
+        """,
+        (schema, table),
+    )
+    return {row[0] for row in cur.fetchall()}
+
+
+def table_exists(cur, schema, table):
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM information_schema.tables
+             WHERE table_schema = %s
+               AND table_name = %s
+        )
+        """,
+        (schema, table),
+    )
+    return bool(cur.fetchone()[0])
 
 
 def refresh_bot_config_editors(cur, account_login, bot):
@@ -1563,6 +1595,136 @@ def insert_rm_control_command(cur, account, actor, command_text, reason, action)
     return dict(cur.fetchone())
 
 
+RECOMMENDATION_VALUE_COLUMNS = ("recommended_value", "new_value", "target_value")
+RECOMMENDATION_INPUT_COLUMNS = ("input_param", "param_key", "input_param_name")
+RECOMMENDATION_OLD_VALUE_COLUMNS = ("old_value", "current_value")
+
+
+def recommendation_json_expr(columns):
+    json_cols = [name for name in ("evidence", "evidence_json") if name in columns]
+    if not json_cols:
+        return "'{}'::jsonb"
+    return "COALESCE(" + ", ".join(f"r.{name}" for name in json_cols) + ", '{}'::jsonb)"
+
+
+def recommendation_text_expr(columns, column_names, evidence_keys, default_sql="NULL::text"):
+    evidence = recommendation_json_expr(columns)
+    parts = []
+    for name in column_names:
+        if name in columns:
+            parts.append(f"NULLIF(to_jsonb(r.{name}) #>> '{{}}', '')")
+    for key in evidence_keys:
+        parts.append(f"NULLIF({evidence}->>'{key}', '')")
+    if not parts:
+        return default_sql
+    return "COALESCE(" + ", ".join(parts) + ")"
+
+
+def recommendation_numeric_expr(columns, column_name):
+    if column_name not in columns:
+        return "NULL::numeric"
+    return f"r.{column_name}::numeric"
+
+
+def recommendation_bool_expr(columns, column_name):
+    if column_name not in columns:
+        return "NULL::boolean"
+    return f"r.{column_name}::boolean"
+
+
+def recommendation_timestamp_expr(columns, column_name):
+    if column_name not in columns:
+        return "NULL::timestamptz"
+    return f"r.{column_name}"
+
+
+def recommendation_select_sql(columns, for_update=False, by_id=False):
+    evidence = recommendation_json_expr(columns)
+    bot_kind_expr = "r.bot_kind" if "bot_kind" in columns else "NULL::text"
+    bot_id_expr = "r.bot_id" if "bot_id" in columns else bot_kind_expr
+    symbol_expr = "r.symbol" if "symbol" in columns else "NULL::text"
+    tf_expr = "r.tf" if "tf" in columns else ("r.timeframe" if "timeframe" in columns else "NULL::text")
+    status_expr = "r.status" if "status" in columns else "'new'::text"
+    decision_type_expr = "r.decision_type" if "decision_type" in columns else "NULL::text"
+    severity_expr = "r.severity" if "severity" in columns else "NULL::text"
+    confidence_expr = recommendation_numeric_expr(columns, "confidence")
+    trend_expr = recommendation_numeric_expr(columns, "trend_strength")
+    min_sample_expr = recommendation_bool_expr(columns, "min_sample_reached")
+    created_at_expr = recommendation_timestamp_expr(columns, "created_at")
+    expires_at_expr = recommendation_timestamp_expr(columns, "expires_at")
+    cooldown_expr = recommendation_timestamp_expr(columns, "cooldown_until")
+    input_expr = recommendation_text_expr(columns, RECOMMENDATION_INPUT_COLUMNS, ("input_param", "param_key", "input_param_name"))
+    recommended_expr = recommendation_text_expr(columns, RECOMMENDATION_VALUE_COLUMNS, ("recommended_value", "new_value", "target_value"))
+    old_expr = recommendation_text_expr(columns, RECOMMENDATION_OLD_VALUE_COLUMNS, ("old_value", "current_value"))
+    reason_expr = "r.reason" if "reason" in columns else "NULL::text"
+    order_expr = "r.created_at DESC, r.recommendation_id DESC" if "created_at" in columns else "r.recommendation_id DESC"
+    lock_expr = " FOR UPDATE OF r" if for_update else ""
+
+    id_filter = "AND r.recommendation_id = %s" if by_id else ""
+    status_filter = "" if by_id or "status" not in columns else "AND r.status IN ('new', 'approved')"
+    return f"""
+        SELECT r.recommendation_id,
+               r.account_login,
+               {bot_kind_expr} AS bot_kind,
+               {bot_id_expr} AS bot_id,
+               {symbol_expr} AS symbol,
+               {tf_expr} AS tf,
+               {decision_type_expr} AS decision_type,
+               {severity_expr} AS severity,
+               {status_expr} AS status,
+               {confidence_expr} AS confidence,
+               {trend_expr} AS trend_strength,
+               {min_sample_expr} AS min_sample_reached,
+               {created_at_expr} AS created_at,
+               {expires_at_expr} AS expires_at,
+               {cooldown_expr} AS cooldown_until,
+               {input_expr} AS input_param,
+               {old_expr} AS old_value,
+               {recommended_expr} AS recommended_value,
+               {reason_expr} AS reason,
+               {evidence} AS evidence
+          FROM bot_online.bot_control_recommendation r
+          JOIN bot_param.operator_account oa
+            ON oa.env = 'prod'
+           AND oa.account_login = r.account_login
+           AND oa.db_user = %s
+           AND oa.enabled = true
+         WHERE r.account_login = %s
+           {"" if "env" not in columns else "AND r.env = 'prod'"}
+           {id_filter}
+           {status_filter}
+         ORDER BY {order_expr}
+         LIMIT 100
+         {lock_expr}
+    """
+
+
+def recommendation_status_update_sql(columns, status, actor, reason):
+    set_parts = ["status = %s"]
+    values = [status]
+    if status == "approved":
+        if "approved_by" in columns:
+            set_parts.append("approved_by = %s")
+            values.append(actor)
+        if "approved_at" in columns:
+            set_parts.append("approved_at = now()")
+    elif status == "rejected":
+        if "rejected_by" in columns:
+            set_parts.append("rejected_by = %s")
+            values.append(actor)
+        if "rejected_at" in columns:
+            set_parts.append("rejected_at = now()")
+    if reason and "operator_reason" in columns:
+        set_parts.append("operator_reason = %s")
+        values.append(reason)
+    sql = f"""
+        UPDATE bot_online.bot_control_recommendation
+           SET {", ".join(set_parts)}
+         WHERE recommendation_id = %s
+    """
+    return sql, values
+
+
 def config_ui_login_html(error=None):
     error_block = ""
     if error:
@@ -1713,6 +1875,19 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .catalog-range-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; }
     .catalog-toggle { min-height: 38px; display: flex; align-items: center; justify-content: center; }
     .catalog-toggle input { width: auto; }
+    .consul-table th:nth-child(1), .consul-table td.rec-id { width: 8%; }
+    .consul-table th:nth-child(2), .consul-table td.rec-bot { width: 11%; }
+    .consul-table th:nth-child(3), .consul-table td.rec-param { width: 16%; }
+    .consul-table th:nth-child(4), .consul-table td.rec-values { width: 18%; }
+    .consul-table th:nth-child(5), .consul-table td.rec-signal { width: 15%; }
+    .consul-table th:nth-child(6), .consul-table td.rec-reason { width: 22%; }
+    .consul-table th:nth-child(7), .consul-table td.rec-actions { width: 10%; }
+    .rec-values, .rec-param { font-family: Consolas, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
+    .rec-reason { overflow-wrap: anywhere; }
+    .rec-signal { color: var(--muted); overflow-wrap: anywhere; }
+    .rec-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .rec-actions button { padding: 7px 9px; font-size: 12px; }
+    .rec-actions button.reject { background: #eef2f6; color: #8d1f1f; border: 1px solid #e3b0b0; }
     .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
     .changed-count { color: var(--muted); font-size: 14px; }
     @media (max-width: 1100px) {
@@ -1736,17 +1911,18 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .tab-btn { flex: 1 0 auto; min-height: 42px; }
       .table-wrap { border: 0; border-radius: 0; overflow-x: visible; background: transparent; }
       .params-table, .params-table thead, .params-table tbody, .params-table tr, .params-table td,
-      .catalog-table, .catalog-table thead, .catalog-table tbody, .catalog-table tr, .catalog-table td { display: block; width: 100%; }
-      .params-table, .catalog-table { min-width: 0; border-collapse: separate; }
-      .params-table thead, .catalog-table thead { display: none; }
-      .params-table tr, .catalog-table tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
-      .params-table tr.hidden, .catalog-table tr.hidden { display: none; }
+      .catalog-table, .catalog-table thead, .catalog-table tbody, .catalog-table tr, .catalog-table td,
+      .consul-table, .consul-table thead, .consul-table tbody, .consul-table tr, .consul-table td { display: block; width: 100%; }
+      .params-table, .catalog-table, .consul-table { min-width: 0; border-collapse: separate; }
+      .params-table thead, .catalog-table thead, .consul-table thead { display: none; }
+      .params-table tr, .catalog-table tr, .consul-table tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
+      .params-table tr.hidden, .catalog-table tr.hidden, .consul-table tr.hidden { display: none; }
       .params-table tr.group-break { margin-top: 18px; border-top: 3px solid #3d7cae; }
       .params-table tr.group-break td { border-top: 0; }
       .params-table tr.group-break td:nth-child(2) { box-shadow: none; }
-      .params-table td, .catalog-table td { border-bottom: 0; padding: 0; min-width: 0; width: 100% !important; }
+      .params-table td, .catalog-table td, .consul-table td { border-bottom: 0; padding: 0; min-width: 0; width: 100% !important; }
       .params-table td.group, .params-table td.reason { display: none; }
-      .catalog-table td::before { content: attr(data-label); display: block; margin-bottom: 5px; font-size: 12px; font-weight: 700; color: var(--muted); }
+      .catalog-table td::before, .consul-table td::before { content: attr(data-label); display: block; margin-bottom: 5px; font-size: 12px; font-weight: 700; color: var(--muted); }
       .catalog-range-grid { grid-template-columns: 1fr 1fr; }
       .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
       .param::after { content: attr(data-desc); display: block; margin-top: 4px; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
@@ -1806,6 +1982,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     <nav class="tabs" role="tablist" aria-label="form tabs">
       <button id="paramsTab" class="tab-btn is-active" type="button" role="tab" aria-selected="true" aria-controls="paramsPanel">Params</button>
       <button id="paramsConfigTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="paramsConfigPanel">Params_config</button>
+      <button id="consulTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="consulPanel">Consul</button>
       <button id="rmTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="rmPanel">RM command</button>
     </nav>
 
@@ -1880,6 +2057,31 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       <section class="footer">
         <div id="paramsConfigChangedCount" class="changed-count">0 catalog rows changed</div>
         <button id="paramsConfigSaveBtn" type="button" disabled>Save catalog</button>
+      </section>
+    </section>
+
+    <section id="consulPanel" class="tab-panel" role="tabpanel" aria-labelledby="consulTab" hidden>
+      <section class="rm-control" aria-label="consul-recommendations">
+        <div class="rm-head">
+          <div class="rm-title">Parameter recommendations</div>
+          <button id="consulRefreshBtn" class="secondary" type="button">Refresh</button>
+        </div>
+        <section class="table-wrap">
+          <table class="consul-table">
+            <thead>
+              <tr>
+                <th>id</th>
+                <th>bot</th>
+                <th>input_param</th>
+                <th>values</th>
+                <th>signal</th>
+                <th>reason</th>
+                <th>action</th>
+              </tr>
+            </thead>
+            <tbody id="consulBody"></tbody>
+          </table>
+        </section>
       </section>
     </section>
 
@@ -1982,10 +2184,14 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       rmRuntimeList: document.getElementById('rmRuntimeList'),
       paramsTab: document.getElementById('paramsTab'),
       paramsConfigTab: document.getElementById('paramsConfigTab'),
+      consulTab: document.getElementById('consulTab'),
       rmTab: document.getElementById('rmTab'),
       paramsPanel: document.getElementById('paramsPanel'),
       paramsConfigPanel: document.getElementById('paramsConfigPanel'),
+      consulPanel: document.getElementById('consulPanel'),
       rmPanel: document.getElementById('rmPanel'),
+      consulBody: document.getElementById('consulBody'),
+      consulRefreshBtn: document.getElementById('consulRefreshBtn'),
       status: document.getElementById('status'),
       paramsBody: document.getElementById('paramsBody'),
       changedCount: document.getElementById('changedCount'),
@@ -2008,16 +2214,21 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     function switchFormTab(tab) {
       const showRm = tab === 'rm';
       const showCatalog = tab === 'catalog';
-      els.paramsPanel.hidden = showRm || showCatalog;
+      const showConsul = tab === 'consul';
+      els.paramsPanel.hidden = showRm || showCatalog || showConsul;
       els.paramsConfigPanel.hidden = !showCatalog;
+      els.consulPanel.hidden = !showConsul;
       els.rmPanel.hidden = !showRm;
-      els.paramsTab.classList.toggle('is-active', !showRm && !showCatalog);
+      els.paramsTab.classList.toggle('is-active', !showRm && !showCatalog && !showConsul);
       els.paramsConfigTab.classList.toggle('is-active', showCatalog);
+      els.consulTab.classList.toggle('is-active', showConsul);
       els.rmTab.classList.toggle('is-active', showRm);
-      els.paramsTab.setAttribute('aria-selected', showRm || showCatalog ? 'false' : 'true');
+      els.paramsTab.setAttribute('aria-selected', showRm || showCatalog || showConsul ? 'false' : 'true');
       els.paramsConfigTab.setAttribute('aria-selected', showCatalog ? 'true' : 'false');
+      els.consulTab.setAttribute('aria-selected', showConsul ? 'true' : 'false');
       els.rmTab.setAttribute('aria-selected', showRm ? 'true' : 'false');
       if (showCatalog) loadParamCatalog().catch(exc => setStatus(exc.message, true));
+      if (showConsul) loadConsulRecommendations().catch(exc => setStatus(exc.message, true));
       if (showRm) loadRuntimeStatus().catch(exc => setStatus(exc.message, true));
     }
 
@@ -2331,6 +2542,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       await loadCopyTargets();
       await loadParams();
       if (!els.paramsConfigPanel.hidden) await loadParamCatalog();
+      if (!els.consulPanel.hidden) await loadConsulRecommendations();
     }
 
     async function loadCopyTargets() {
@@ -2358,6 +2570,97 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       td.className = className || '';
       td.textContent = text == null ? '' : String(text);
       return td;
+    }
+
+    function labeledTextCell(className, label, text) {
+      const td = textCell(className, text);
+      td.dataset.label = label;
+      return td;
+    }
+
+    function recommendationSignalText(row) {
+      const parts = [];
+      if (row.status) parts.push('status=' + row.status);
+      if (row.trend_strength != null) parts.push('trend=' + row.trend_strength);
+      if (row.confidence != null) parts.push('confidence=' + row.confidence);
+      if (row.min_sample_reached != null) parts.push('sample=' + (row.min_sample_reached ? 'ok' : 'low'));
+      if (row.cooldown_until) parts.push('cooldown until ' + row.cooldown_until);
+      return parts.join('\n');
+    }
+
+    function recommendationValuesText(row) {
+      const oldValue = row.old_value == null ? '' : String(row.old_value);
+      const newValue = row.recommended_value == null ? '' : String(row.recommended_value);
+      return oldValue ? oldValue + ' -> ' + newValue : newValue;
+    }
+
+    function renderConsulRecommendations(rows) {
+      els.consulBody.innerHTML = '';
+      if (!rows.length) {
+        const tr = document.createElement('tr');
+        const td = labeledTextCell('', 'recommendations', 'No active parameter recommendations');
+        td.colSpan = 7;
+        tr.appendChild(td);
+        els.consulBody.appendChild(tr);
+        return;
+      }
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        tr.appendChild(labeledTextCell('rec-id', 'id', row.recommendation_id));
+        tr.appendChild(labeledTextCell('rec-bot', 'bot', [row.bot_kind, row.symbol, row.tf].filter(Boolean).join(' / ')));
+        tr.appendChild(labeledTextCell('rec-param', 'input_param', row.input_param || ''));
+        tr.appendChild(labeledTextCell('rec-values', 'values', recommendationValuesText(row)));
+        tr.appendChild(labeledTextCell('rec-signal', 'signal', recommendationSignalText(row)));
+        tr.appendChild(labeledTextCell('rec-reason', 'reason', row.reason || ''));
+
+        const actions = document.createElement('td');
+        actions.className = 'rec-actions';
+        actions.dataset.label = 'action';
+        const canAct = String(row.status || '').toLowerCase() === 'new';
+        const approve = document.createElement('button');
+        approve.type = 'button';
+        approve.textContent = 'Approve';
+        approve.disabled = !canAct;
+        approve.addEventListener('click', () => decideRecommendation(row.recommendation_id, 'approve'));
+        const reject = document.createElement('button');
+        reject.type = 'button';
+        reject.className = 'reject';
+        reject.textContent = 'Reject';
+        reject.disabled = !canAct;
+        reject.addEventListener('click', () => decideRecommendation(row.recommendation_id, 'reject'));
+        actions.appendChild(approve);
+        actions.appendChild(reject);
+        tr.appendChild(actions);
+        els.consulBody.appendChild(tr);
+      }
+    }
+
+    async function loadConsulRecommendations() {
+      const account = els.accountSelect.value;
+      els.consulBody.innerHTML = '';
+      if (!account) return;
+      setStatus('Loading Consul recommendations...');
+      const data = await api('/config-ui/api/recommendations?account_login=' + encodeURIComponent(account));
+      const rows = data.recommendations || [];
+      renderConsulRecommendations(rows);
+      setStatus(rows.length + ' active recommendation(s) loaded');
+    }
+
+    async function decideRecommendation(recommendationId, action) {
+      if (!recommendationId) return;
+      setStatus((action === 'approve' ? 'Approving' : 'Rejecting') + ' recommendation #' + recommendationId + '...');
+      try {
+        await api('/config-ui/api/recommendations/' + encodeURIComponent(recommendationId) + '/' + action, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reason: 'Consul ' + CONFIG_ACTOR})
+        });
+        await loadConsulRecommendations();
+        await loadParams();
+        setStatus('Recommendation #' + recommendationId + ' ' + (action === 'approve' ? 'approved' : 'rejected'));
+      } catch (exc) {
+        setStatus(exc.message, true);
+      }
     }
 
     function paramCell(row) {
@@ -2875,6 +3178,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       await loadCopyTargets();
       await loadParams();
       if (!els.paramsConfigPanel.hidden) await loadParamCatalog();
+      if (!els.consulPanel.hidden) await loadConsulRecommendations();
     });
     els.groupFilter.addEventListener('change', applyFilters);
     els.searchInput.addEventListener('input', applyFilters);
@@ -2883,6 +3187,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.saveBtn.addEventListener('click', saveChanges);
     els.paramsTab.addEventListener('click', () => switchFormTab('params'));
     els.paramsConfigTab.addEventListener('click', () => switchFormTab('catalog'));
+    els.consulTab.addEventListener('click', () => switchFormTab('consul'));
     els.rmTab.addEventListener('click', () => switchFormTab('rm'));
     els.paramsConfigSaveBtn.addEventListener('click', saveParamCatalogChanges);
     els.rmActionSelect.addEventListener('change', updateRmCommandUi);
@@ -2901,6 +3206,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.rmUntilInput.addEventListener('input', updateRmCommandUi);
     els.rmSendBtn.addEventListener('click', sendRmCommand);
     els.rmRefreshStatusBtn.addEventListener('click', () => loadRuntimeStatus().catch(exc => setStatus(exc.message, true)));
+    els.consulRefreshBtn.addEventListener('click', () => loadConsulRecommendations().catch(exc => setStatus(exc.message, true)));
 
     fillRmBotList([]);
     updateRmCommandUi();
@@ -4490,6 +4796,181 @@ async def config_ui_rm_command(req: RmControlCommandRequest, request: Request):
         conn.close()
 
 
+@app.get("/config-ui/api/recommendations")
+async def config_ui_recommendations(request: Request, account_login: int):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            if not ensure_actor_account_access(cur, actor, account_login, can_apply=False):
+                return config_ui_json_error(403, "account is not available for actor")
+            if not table_exists(cur, "bot_online", "bot_control_recommendation"):
+                return {"ok": True, "recommendations": [], "version": CODE_VERSION}
+            columns = table_columns(cur, "bot_online", "bot_control_recommendation")
+            if "recommendation_id" not in columns or "account_login" not in columns:
+                return config_ui_json_error(500, "bot_online.bot_control_recommendation is missing required columns")
+            cur.execute(recommendation_select_sql(columns), (actor, account_login))
+            rows = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "recommendations": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/config-ui/api/recommendations/{recommendation_id}/approve")
+async def config_ui_recommendation_approve(recommendation_id: int, req: RecommendationDecisionRequest, request: Request):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            if not table_exists(cur, "bot_online", "bot_control_recommendation"):
+                return config_ui_json_error(404, "bot_online.bot_control_recommendation does not exist")
+            columns = table_columns(cur, "bot_online", "bot_control_recommendation")
+            if "recommendation_id" not in columns or "account_login" not in columns:
+                return config_ui_json_error(500, "bot_online.bot_control_recommendation is missing required columns")
+            if "status" not in columns:
+                return config_ui_json_error(500, "bot_online.bot_control_recommendation.status is required")
+
+            cur.execute(
+                """
+                SELECT account_login
+                  FROM bot_online.bot_control_recommendation
+                 WHERE recommendation_id = %s
+                """,
+                (recommendation_id,),
+            )
+            account_row = cur.fetchone()
+            if not account_row:
+                return config_ui_json_error(404, "recommendation not found")
+            account_login = int(account_row["account_login"])
+            if not ensure_actor_account_access(cur, actor, account_login, can_apply=True):
+                return config_ui_json_error(403, "account is not available for apply")
+
+            cur.execute(recommendation_select_sql(columns, for_update=True, by_id=True), (actor, account_login, recommendation_id))
+            row = cur.fetchone()
+            if not row:
+                return config_ui_json_error(404, "recommendation not found")
+            rec = dict(row)
+            if str(rec.get("status") or "").lower() != "new":
+                raise ValueError("only recommendation with status=new can be approved")
+            if str(rec.get("decision_type") or "").lower() != "param_change":
+                raise ValueError("only decision_type=param_change can be approved through Consul")
+
+            bot = (rec.get("bot_kind") or rec.get("bot_id") or "").strip().lower()
+            input_param = (rec.get("input_param") or "").strip()
+            recommended_value = "" if rec.get("recommended_value") is None else str(rec.get("recommended_value")).strip()
+            if not bot:
+                raise ValueError("recommendation bot_kind is empty")
+            if not input_param:
+                raise ValueError("recommendation input_param/param_key is empty")
+            if not recommended_value:
+                raise ValueError("recommendation recommended_value is empty")
+
+            cur.execute(
+                """
+                SELECT e.row_id, e.account_login, e.bot, e.input_param
+                  FROM bot_param.bot_config_user_editor e
+                  JOIN bot_param.bot_config_param_catalog pc
+                    ON pc.bot_kind = e.bot
+                   AND COALESCE(pc.input_param_name, pc.param_key) = e.input_param
+                   AND COALESCE(pc.user_editable, true) = true
+                 WHERE e.account_login = %s
+                   AND e.bot = %s
+                   AND e.input_param = %s
+                 FOR UPDATE OF e
+                """,
+                (account_login, bot, input_param),
+            )
+            editor_row = cur.fetchone()
+            if not editor_row:
+                raise ValueError(f"config editor row not found for {bot}.{input_param}")
+            new_choice, new_value = resolve_new_value_columns(cur, bot, input_param, recommended_value)
+            reason = clean_optional_text(req.reason) or clean_optional_text(rec.get("reason")) or f"recommendation #{recommendation_id}"
+            cur.execute(
+                """
+                UPDATE bot_param.bot_config_user_editor
+                   SET new_choice = %s,
+                       new_value = %s,
+                       reason = %s
+                 WHERE row_id = %s
+                """,
+                (new_choice, new_value, reason, editor_row["row_id"]),
+            )
+
+            update_sql, update_values = recommendation_status_update_sql(columns, "approved", actor, clean_optional_text(req.reason))
+            cur.execute(update_sql, tuple(update_values + [recommendation_id]))
+        conn.commit()
+        return {
+            "ok": True,
+            "recommendation_id": recommendation_id,
+            "status": "approved",
+            "bot": bot,
+            "input_param": input_param,
+            "recommended_value": recommended_value,
+            "version": CODE_VERSION,
+        }
+    except ValueError as exc:
+        conn.rollback()
+        return config_ui_json_error(400, str(exc))
+    except Exception as exc:
+        conn.rollback()
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/config-ui/api/recommendations/{recommendation_id}/reject")
+async def config_ui_recommendation_reject(recommendation_id: int, req: RecommendationDecisionRequest, request: Request):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            if not table_exists(cur, "bot_online", "bot_control_recommendation"):
+                return config_ui_json_error(404, "bot_online.bot_control_recommendation does not exist")
+            columns = table_columns(cur, "bot_online", "bot_control_recommendation")
+            if "recommendation_id" not in columns or "account_login" not in columns:
+                return config_ui_json_error(500, "bot_online.bot_control_recommendation is missing required columns")
+            if "status" not in columns:
+                return config_ui_json_error(500, "bot_online.bot_control_recommendation.status is required")
+            cur.execute(
+                """
+                SELECT account_login, status
+                  FROM bot_online.bot_control_recommendation
+                 WHERE recommendation_id = %s
+                 FOR UPDATE
+                """,
+                (recommendation_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return config_ui_json_error(404, "recommendation not found")
+            if not ensure_actor_account_access(cur, actor, int(row["account_login"]), can_apply=True):
+                return config_ui_json_error(403, "account is not available for apply")
+            if str(row["status"] or "").lower() != "new":
+                raise ValueError("only recommendation with status=new can be rejected")
+            update_sql, update_values = recommendation_status_update_sql(columns, "rejected", actor, clean_optional_text(req.reason))
+            cur.execute(update_sql, tuple(update_values + [recommendation_id]))
+        conn.commit()
+        return {"ok": True, "recommendation_id": recommendation_id, "status": "rejected", "version": CODE_VERSION}
+    except ValueError as exc:
+        conn.rollback()
+        return config_ui_json_error(400, str(exc))
+    except Exception as exc:
+        conn.rollback()
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
 @app.post("/config-ui/api/save")
 async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
     _, actor, auth = require_config_ui_api(request)
@@ -4614,6 +5095,114 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
     except Exception as exc:
         conn.rollback()
         return config_ui_json_error(400, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/bot-runtime/recommendation/next-notification")
+async def bot_runtime_recommendation_next_notification(req: BotRuntimeBaseRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    try:
+        env, account_login, bot_kind, bot_id, source_id, instance_id = normalize_runtime_identity(req)
+    except ValueError as exc:
+        return bot_runtime_json_error(400, str(exc))
+    if bot_kind != RM_CONTROLLER_BOT or bot_id != RM_CONTROLLER_BOT_ID:
+        return bot_runtime_json_error(400, "recommendation notifications are only for rm_controller")
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        recommendation = None
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            if not table_exists(cur, "bot_online", "bot_control_recommendation"):
+                conn.commit()
+                return {"ok": True, "recommendation": None, "version": CODE_VERSION}
+            columns = table_columns(cur, "bot_online", "bot_control_recommendation")
+            required = {
+                "recommendation_id",
+                "env",
+                "account_login",
+                "bot_kind",
+                "decision_type",
+                "status",
+                "created_at",
+                "expires_at",
+                "bot_id",
+                "symbol",
+                "tf",
+                "input_param",
+                "param_key",
+                "old_value",
+                "recommended_value",
+                "reason",
+                "confidence",
+                "trend_strength",
+                "min_sample_reached",
+                "cooldown_until",
+                "telegram_notified_at",
+                "telegram_notified_by",
+            }
+            if not required.issubset(columns):
+                conn.commit()
+                return {"ok": True, "recommendation": None, "version": CODE_VERSION}
+
+            cur.execute(
+                """
+                SELECT recommendation_id
+                  FROM bot_online.bot_control_recommendation
+                 WHERE env = %s
+                   AND account_login = %s
+                   AND status = 'new'
+                   AND decision_type = 'param_change'
+                   AND telegram_notified_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > now())
+                 ORDER BY created_at ASC, recommendation_id ASC
+                 LIMIT 1
+                 FOR UPDATE SKIP LOCKED
+                """,
+                (env, account_login),
+            )
+            row = cur.fetchone()
+            if row:
+                recommendation_id = int(row["recommendation_id"])
+                cur.execute(
+                    """
+                    UPDATE bot_online.bot_control_recommendation
+                       SET telegram_notified_at = now(),
+                           telegram_notified_by = %s
+                     WHERE recommendation_id = %s
+                    """,
+                    (instance_id, recommendation_id),
+                )
+                cur.execute(
+                    """
+                    SELECT recommendation_id,
+                           account_login,
+                           bot_kind,
+                           COALESCE(bot_id, bot_kind) AS bot_id,
+                           symbol,
+                           tf,
+                           COALESCE(input_param, param_key) AS input_param,
+                           old_value,
+                           recommended_value,
+                           reason,
+                           confidence::text AS confidence,
+                           trend_strength::text AS trend_strength,
+                           min_sample_reached,
+                           cooldown_until::text AS cooldown_until
+                      FROM bot_online.bot_control_recommendation
+                     WHERE recommendation_id = %s
+                    """,
+                    (recommendation_id,),
+                )
+                recommendation = dict(cur.fetchone())
+        conn.commit()
+        return {"ok": True, "recommendation": recommendation, "version": CODE_VERSION}
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
     finally:
         conn.close()
 
