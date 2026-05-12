@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-CODE_VERSION = "v1.07"
+CODE_VERSION = "v1.08"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -155,6 +155,16 @@ class BotRuntimeBaseRequest(BaseModel):
     instance_id: str
     applied_version_no: Optional[int] = None
     command_id: Optional[int] = None
+
+
+class BotRuntimeParamValue(BaseModel):
+    input_param: str
+    value: Optional[str] = None
+
+
+class BotRuntimeResolveOnInitRequest(BotRuntimeBaseRequest):
+    program_defaults: List[BotRuntimeParamValue] = []
+    input_values: List[BotRuntimeParamValue] = []
 
 
 class BotRuntimeFinishRequest(BaseModel):
@@ -588,6 +598,203 @@ def bot_runtime_touch(cur, env, account_login, instance_id, column_name):
         """,
         (env, account_login, instance_id),
     )
+
+
+def runtime_param_map(items):
+    out = {}
+    for item in items or []:
+        input_param = (item.input_param or "").strip()
+        if not input_param:
+            continue
+        value = "" if item.value is None else str(item.value).strip()
+        out[input_param] = value
+    return out
+
+
+def json_path_get(config, path):
+    cur = config or {}
+    for part in (path or "").split("."):
+        if not part:
+            continue
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def json_path_set(config, path, value):
+    cur = config
+    parts = [p for p in (path or "").split(".") if p]
+    if not parts:
+        return
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def config_json_hash(config):
+    payload = json.dumps(config or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def coerce_config_json_value(value, value_type):
+    text = "" if value is None else str(value).strip()
+    vt = (value_type or "text").strip().lower()
+    if vt == "bool":
+        return text.lower() in ("true", "t", "yes", "y", "on", "1")
+    if vt == "int":
+        return int(Decimal(text))
+    if vt in ("numeric", "double", "float", "number"):
+        dec = Decimal(text)
+        if dec == dec.to_integral_value():
+            return int(dec)
+        return float(dec)
+    if vt == "json":
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+    return text
+
+
+def normalize_runtime_param_value(value, value_type):
+    if value is None:
+        return ""
+    vt = (value_type or "text").strip().lower()
+    text = str(value).strip()
+    if vt == "bool":
+        return "true" if text.lower() in ("true", "t", "yes", "y", "on", "1") else "false"
+    if vt == "int":
+        try:
+            return str(int(Decimal(text)))
+        except Exception:
+            return text
+    if vt in ("numeric", "double", "float", "number"):
+        try:
+            dec = Decimal(text).normalize()
+            return format(dec, "f").rstrip("0").rstrip(".") if "." in format(dec, "f") else format(dec, "f")
+        except Exception:
+            return text
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return text
+
+
+def load_runtime_param_catalog(cur, bot_kind):
+    cur.execute(
+        """
+        SELECT pc.input_param_name AS input_param,
+               pc.param_key,
+               pc.param_path,
+               pc.value_type,
+               pc.sort_order
+          FROM bot_param.bot_config_param_catalog pc
+         WHERE pc.bot_kind = %s
+           AND pc.input_param_name IS NOT NULL
+           AND pc.param_path IS NOT NULL
+           AND COALESCE(pc.user_editable, true) = true
+         ORDER BY pc.sort_order, pc.input_param_name
+        """,
+        (bot_kind,),
+    )
+    return [dict(row) for row in cur.fetchall()]
+
+
+def load_runtime_current_config(cur, env, account_login, bot_kind, bot_id):
+    cur.execute(
+        """
+        SELECT c.active_version_no,
+               c.active_config_id,
+               c.config_hash,
+               v.config_json
+          FROM bot_param.bot_config_current c
+          JOIN bot_param.bot_config_version v
+            ON v.config_version_id = c.active_config_id
+         WHERE c.env = %s
+           AND c.account_login = %s
+           AND c.bot_kind = %s
+           AND c.bot_id = %s
+        """,
+        (env, account_login, bot_kind, bot_id),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def insert_runtime_config_version(cur, env, account_login, bot_kind, bot_id, config, config_hash, reason, source):
+    cur.execute(
+        """
+        SELECT COALESCE(MAX(version_no), 0) + 1
+          FROM bot_param.bot_config_version
+         WHERE env = %s
+           AND account_login = %s
+           AND bot_kind = %s
+           AND bot_id = %s
+        """,
+        (env, account_login, bot_kind, bot_id),
+    )
+    version_no = int(cur.fetchone()[0] or 1)
+    config_text = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    cur.execute(
+        """
+        INSERT INTO bot_param.bot_config_version (
+            env, account_login, bot_kind, bot_id, config_scope, version_no,
+            status, config_json, config_hash, validation_status, validation_errors,
+            created_by, created_source, created_reason,
+            approved_by, approved_at, activated_by, activated_at
+        )
+        VALUES (
+            %s, %s, %s, %s, 'bot', %s,
+            'active', %s::jsonb, %s, 'ok', '[]'::jsonb,
+            current_user::text, %s, %s,
+            current_user::text, now(), current_user::text, now()
+        )
+        RETURNING config_version_id
+        """,
+        (env, account_login, bot_kind, bot_id, version_no, config_text, config_hash, source, reason),
+    )
+    config_id = int(cur.fetchone()[0])
+    cur.execute(
+        """
+        INSERT INTO bot_param.bot_config_current (
+            env, account_login, bot_kind, bot_id, active_version_no,
+            active_config_id, config_hash, updated_by, updated_source
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, current_user::text, %s)
+        ON CONFLICT (env, account_login, bot_kind, bot_id)
+        DO UPDATE SET
+            active_version_no = EXCLUDED.active_version_no,
+            active_config_id = EXCLUDED.active_config_id,
+            config_hash = EXCLUDED.config_hash,
+            updated_by = EXCLUDED.updated_by,
+            updated_source = EXCLUDED.updated_source,
+            updated_at = now()
+        """,
+        (env, account_login, bot_kind, bot_id, version_no, config_id, config_hash, source),
+    )
+    return version_no, config_id
+
+
+def runtime_params_from_config(catalog, config):
+    params = []
+    for item in catalog:
+        value = json_path_get(config, item["param_path"])
+        if value is None:
+            continue
+        params.append(
+            {
+                "input_param": item["input_param"],
+                "param_key": item.get("param_key"),
+                "param_path": item["param_path"],
+                "value_type": item.get("value_type"),
+                "value": normalize_runtime_param_value(value, item.get("value_type")),
+            }
+        )
+    return params
 
 
 RM_STATE_SCOPES = {"account", "bot"}
@@ -1493,19 +1700,14 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .prev-value select, .new-value input, .new-value select, .reason input { width: 100%; min-width: 0; }
     .prev-value select:disabled { color: var(--muted); background: #f8fafc; }
     .catalog-wrap { overflow-x: auto; }
-    .catalog-table { min-width: 1580px; }
-    .catalog-table th:nth-child(1), .catalog-table td.catalog-key { width: 11%; }
-    .catalog-table th:nth-child(2), .catalog-table td.catalog-section { width: 8%; }
-    .catalog-table th:nth-child(3), .catalog-table td.catalog-input { width: 10%; }
-    .catalog-table th:nth-child(4), .catalog-table td.catalog-display { width: 11%; }
-    .catalog-table th:nth-child(5), .catalog-table td.catalog-desc { width: 16%; }
-    .catalog-table th:nth-child(6), .catalog-table td.catalog-path { width: 13%; }
-    .catalog-table th:nth-child(7), .catalog-table td.catalog-type { width: 8%; }
-    .catalog-table th:nth-child(8), .catalog-table td.catalog-range { width: 7%; }
-    .catalog-table th:nth-child(9), .catalog-table td.catalog-values { width: 11%; }
-    .catalog-table th:nth-child(10), .catalog-table td.catalog-sort { width: 5%; }
-    .catalog-table th:nth-child(11), .catalog-table td.catalog-editable { width: 5%; }
-    .catalog-key { font-family: Consolas, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
+    .catalog-table { min-width: 1040px; }
+    .catalog-table th:nth-child(1), .catalog-table td.catalog-editable { width: 7%; }
+    .catalog-table th:nth-child(2), .catalog-table td.catalog-section { width: 11%; }
+    .catalog-table th:nth-child(3), .catalog-table td.catalog-input { width: 15%; }
+    .catalog-table th:nth-child(4), .catalog-table td.catalog-display { width: 15%; }
+    .catalog-table th:nth-child(5), .catalog-table td.catalog-desc { width: 27%; }
+    .catalog-table th:nth-child(6), .catalog-table td.catalog-values { width: 18%; }
+    .catalog-table th:nth-child(7), .catalog-table td.catalog-sort { width: 7%; }
     .catalog-table input, .catalog-table select, .catalog-table textarea { min-width: 0; font-size: 12px; }
     .catalog-table .catalog-number { text-align: right; }
     .catalog-range-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; }
@@ -1654,7 +1856,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       <section class="toolbar" aria-label="catalog filters">
         <div class="field">
           <label for="catalogSearchInput">Search</label>
-          <input id="catalogSearchInput" type="search" placeholder="param_key, input_param, path">
+          <input id="catalogSearchInput" type="search" placeholder="input_param, display, description">
         </div>
       </section>
 
@@ -1662,17 +1864,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         <table class="catalog-table">
           <thead>
             <tr>
-              <th>param_key</th>
+              <th>editable</th>
               <th>section</th>
               <th>input_param</th>
               <th>display</th>
               <th>description</th>
-              <th>param_path</th>
-              <th>type</th>
-              <th>min/max</th>
               <th>allowed_values</th>
               <th>sort</th>
-              <th>editable</th>
             </tr>
           </thead>
           <tbody id="paramsConfigBody"></tbody>
@@ -2450,6 +2648,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return value || null;
     }
 
+    function catalogDataValue(tr, field) {
+      const value = tr.dataset[field] == null ? '' : String(tr.dataset[field]).trim();
+      return value || null;
+    }
+
     function catalogIntegerValue(tr, field, validate) {
       const value = catalogTextValue(tr, field);
       if (value == null) return null;
@@ -2469,10 +2672,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         input_param_name: catalogTextValue(tr, 'input_param_name'),
         display_name: catalogTextValue(tr, 'display_name'),
         param_desc: catalogTextValue(tr, 'param_desc'),
-        param_path: catalogTextValue(tr, 'param_path'),
-        value_type: catalogTextValue(tr, 'value_type'),
-        min_numeric: catalogTextValue(tr, 'min_numeric'),
-        max_numeric: catalogTextValue(tr, 'max_numeric'),
+        param_path: catalogTextValue(tr, 'param_path') || catalogDataValue(tr, 'paramPath'),
+        value_type: catalogTextValue(tr, 'value_type') || catalogDataValue(tr, 'valueType'),
+        min_numeric: catalogTextValue(tr, 'min_numeric') || catalogDataValue(tr, 'minNumeric'),
+        max_numeric: catalogTextValue(tr, 'max_numeric') || catalogDataValue(tr, 'maxNumeric'),
         allowed_values: parseAllowedValues(catalogControl(tr, 'allowed_values')?.value || ''),
         sort_order: catalogIntegerValue(tr, 'sort_order', validate),
         user_editable: userEditable ? userEditable.checked : true
@@ -2483,6 +2686,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       const tr = document.createElement('tr');
       tr.dataset.botKind = row.bot_kind || '';
       tr.dataset.paramKey = row.param_key || '';
+      tr.dataset.paramPath = row.param_path || '';
+      tr.dataset.valueType = row.value_type || '';
+      tr.dataset.minNumeric = row.min_numeric == null ? '' : String(row.min_numeric);
+      tr.dataset.maxNumeric = row.max_numeric == null ? '' : String(row.max_numeric);
       tr.dataset.search = [
         row.param_key,
         row.section_name,
@@ -2493,17 +2700,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         row.value_type,
         Array.isArray(row.allowed_values) ? row.allowed_values.join(' ') : ''
       ].filter(Boolean).join(' ').toLowerCase();
-      tr.appendChild(catalogLabelCell('catalog-key', 'param_key', row.param_key));
+      tr.appendChild(catalogLabelCell('catalog-editable', 'editable', catalogCheckbox(row, 'user_editable')));
       tr.appendChild(catalogLabelCell('catalog-section', 'section', catalogTextInput(row, 'section_name', 'section')));
       tr.appendChild(catalogLabelCell('catalog-input', 'input_param', catalogTextInput(row, 'input_param_name', 'input_param')));
       tr.appendChild(catalogLabelCell('catalog-display', 'display', catalogTextInput(row, 'display_name', 'display name')));
       tr.appendChild(catalogLabelCell('catalog-desc', 'description', catalogTextarea(row, 'param_desc', 'description')));
-      tr.appendChild(catalogLabelCell('catalog-path', 'param_path', catalogTextInput(row, 'param_path', 'json.path')));
-      tr.appendChild(catalogLabelCell('catalog-type', 'type', catalogTypeSelect(row)));
-      tr.appendChild(catalogLabelCell('catalog-range', 'min/max', catalogRangeControls(row)));
       tr.appendChild(catalogLabelCell('catalog-values', 'allowed_values', catalogTextarea(row, 'allowed_values', 'one value per line')));
       tr.appendChild(catalogLabelCell('catalog-sort', 'sort', catalogTextInput(row, 'sort_order', 'sort')));
-      tr.appendChild(catalogLabelCell('catalog-editable', 'editable', catalogCheckbox(row, 'user_editable')));
       return tr;
     }
 
@@ -4494,6 +4697,143 @@ async def bot_runtime_config_current(req: BotRuntimeBaseRequest, request: Reques
             "changed_params": changed_params,
             "version": CODE_VERSION,
         }
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.post("/bot-runtime/config/resolve-on-init")
+async def bot_runtime_config_resolve_on_init(req: BotRuntimeResolveOnInitRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    try:
+        env, account_login, bot_kind, bot_id, source_id, instance_id = normalize_runtime_identity(req)
+    except ValueError as exc:
+        return bot_runtime_json_error(400, str(exc))
+
+    program_defaults = runtime_param_map(req.program_defaults)
+    input_values = runtime_param_map(req.input_values)
+    if not program_defaults and not input_values:
+        return bot_runtime_json_error(400, "program_defaults or input_values are required")
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            catalog = load_runtime_param_catalog(cur, bot_kind)
+            if not catalog:
+                conn.rollback()
+                return bot_runtime_json_error(404, f"param catalog not found for bot_kind={bot_kind}")
+
+            current = load_runtime_current_config(cur, env, account_login, bot_kind, bot_id)
+            old_version_no = req.applied_version_no
+            current_config = dict(current["config_json"] or {}) if current else {}
+            effective_config = json.loads(json.dumps(current_config, separators=(",", ":"), ensure_ascii=False)) if current_config else {}
+            changed_params = []
+            has_db_config = current is not None
+            config_changed = not has_db_config
+
+            for item in catalog:
+                input_param = item["input_param"]
+                param_path = item["param_path"]
+                value_type = item.get("value_type")
+                db_value = json_path_get(current_config, param_path)
+                default_provided = input_param in program_defaults
+                input_provided = input_param in input_values
+                default_value = program_defaults.get(input_param)
+                input_value = input_values.get(input_param)
+
+                is_override = False
+                if default_provided and input_provided:
+                    is_override = (
+                        normalize_runtime_param_value(input_value, value_type)
+                        != normalize_runtime_param_value(default_value, value_type)
+                    )
+
+                if is_override:
+                    effective_value_text = input_value
+                    old_text = normalize_runtime_param_value(db_value, value_type) if db_value is not None else ""
+                    new_text = normalize_runtime_param_value(effective_value_text, value_type)
+                    if old_text != new_text:
+                        config_changed = True
+                        changed_params.append(
+                            {
+                                "input_param": input_param,
+                                "old_value": old_text,
+                                "new_value": new_text,
+                                "reason": "mt5_input_override_on_init",
+                            }
+                        )
+                    json_path_set(
+                        effective_config,
+                        param_path,
+                        coerce_config_json_value(effective_value_text, value_type),
+                    )
+                elif db_value is not None:
+                    json_path_set(effective_config, param_path, db_value)
+                elif default_provided:
+                    if has_db_config:
+                        config_changed = True
+                    json_path_set(
+                        effective_config,
+                        param_path,
+                        coerce_config_json_value(default_value, value_type),
+                    )
+                elif input_provided and not has_db_config:
+                    json_path_set(
+                        effective_config,
+                        param_path,
+                        coerce_config_json_value(input_value, value_type),
+                    )
+
+            effective_hash = config_json_hash(effective_config)
+            wrote_version = False
+            active_version_no = int(current["active_version_no"]) if current else 0
+            active_config_id = int(current["active_config_id"]) if current else 0
+            current_hash = current["config_hash"] if current else ""
+
+            if config_changed and current_hash != effective_hash:
+                active_version_no, active_config_id = insert_runtime_config_version(
+                    cur,
+                    env,
+                    account_login,
+                    bot_kind,
+                    bot_id,
+                    effective_config,
+                    effective_hash,
+                    "mt5_input_override_on_init" if changed_params else "mt5_input_defaults_bootstrap",
+                    "bot-runtime-resolve-on-init",
+                )
+                wrote_version = True
+                refresh_bot_config_editors(cur, account_login, bot_kind)
+            response_hash = effective_hash if wrote_version else (current_hash or effective_hash)
+
+            bot_runtime_touch(cur, env, account_login, instance_id, "last_config_check_at")
+
+        conn.commit()
+        return {
+            "ok": True,
+            "env": env,
+            "account_login": account_login,
+            "bot_kind": bot_kind,
+            "bot_id": bot_id,
+            "source_id": source_id,
+            "instance_id": instance_id,
+            "old_version_no": old_version_no,
+            "version_no": active_version_no,
+            "active_config_id": active_config_id,
+            "config_hash": response_hash,
+            "wrote_version": wrote_version,
+            "params": runtime_params_from_config(catalog, effective_config),
+            "changed_params": changed_params,
+            "version": CODE_VERSION,
+        }
+    except (InvalidOperation, ValueError) as exc:
+        conn.rollback()
+        return bot_runtime_json_error(400, str(exc))
     except Exception as exc:
         conn.rollback()
         return bot_runtime_json_error(500, first_error_line(exc))
