@@ -1977,12 +1977,16 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         <label for="botSelect">Bot</label>
         <select id="botSelect"></select>
       </div>
+      <div class="field">
+        <label>Mode</label>
+        <label class="copy-line"><input id="adminModeToggle" type="checkbox"> Admin mode</label>
+      </div>
     </section>
 
     <nav class="tabs" role="tablist" aria-label="form tabs">
       <button id="paramsTab" class="tab-btn is-active" type="button" role="tab" aria-selected="true" aria-controls="paramsPanel">Params</button>
-      <button id="paramsConfigTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="paramsConfigPanel">Params_config</button>
-      <button id="consulTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="consulPanel">Consul</button>
+      <button id="paramsConfigTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="paramsConfigPanel" hidden>Params_config</button>
+      <button id="consulTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="consulPanel" hidden>Consul</button>
       <button id="rmTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="rmPanel">RM command</button>
     </nav>
 
@@ -2165,6 +2169,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       codeVersion: document.getElementById('codeVersion'),
       accountSelect: document.getElementById('accountSelect'),
       botSelect: document.getElementById('botSelect'),
+      adminModeToggle: document.getElementById('adminModeToggle'),
       groupFilter: document.getElementById('groupFilter'),
       searchInput: document.getElementById('searchInput'),
       copyToggle: document.getElementById('copyToggle'),
@@ -2211,7 +2216,20 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       els.status.className = isError ? 'status error' : 'status';
     }
 
+    function updateAdminModeUi() {
+      const showAdmin = !!els.adminModeToggle.checked;
+      els.paramsConfigTab.hidden = !showAdmin;
+      if (!showAdmin && !els.paramsConfigPanel.hidden) switchFormTab('params');
+    }
+
+    function setConsulTabVisible(visible) {
+      els.consulTab.hidden = !visible;
+      if (!visible && !els.consulPanel.hidden) switchFormTab('params');
+    }
+
     function switchFormTab(tab) {
+      if (tab === 'catalog' && !els.adminModeToggle.checked) tab = 'params';
+      if (tab === 'consul' && els.consulTab.hidden) tab = 'params';
       const showRm = tab === 'rm';
       const showCatalog = tab === 'catalog';
       const showConsul = tab === 'consul';
@@ -2531,6 +2549,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     async function loadBots() {
       const account = els.accountSelect.value;
       fillSelect(els.botSelect, [], 'bot', 'display_name', '');
+      setConsulTabVisible(false);
+      els.consulBody.innerHTML = '';
       if (!account) return;
       setStatus('Loading bots...');
       const data = await api('/config-ui/api/bots?account_login=' + encodeURIComponent(account));
@@ -2542,7 +2562,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       await loadCopyTargets();
       await loadParams();
       if (!els.paramsConfigPanel.hidden) await loadParamCatalog();
-      if (!els.consulPanel.hidden) await loadConsulRecommendations();
+      const wasConsulOpen = !els.consulPanel.hidden;
+      try {
+        await loadConsulRecommendations({silent: !wasConsulOpen});
+      } catch (exc) {
+        setConsulTabVisible(false);
+        if (wasConsulOpen) setStatus(exc.message, true);
+      }
     }
 
     async function loadCopyTargets() {
@@ -2635,15 +2661,21 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       }
     }
 
-    async function loadConsulRecommendations() {
+    async function loadConsulRecommendations(options = {}) {
+      const silent = !!options.silent;
       const account = els.accountSelect.value;
       els.consulBody.innerHTML = '';
-      if (!account) return;
-      setStatus('Loading Consul recommendations...');
+      if (!account) {
+        setConsulTabVisible(false);
+        return [];
+      }
+      if (!silent) setStatus('Loading Consul recommendations...');
       const data = await api('/config-ui/api/recommendations?account_login=' + encodeURIComponent(account));
       const rows = data.recommendations || [];
+      setConsulTabVisible(rows.length > 0);
       renderConsulRecommendations(rows);
-      setStatus(rows.length + ' active recommendation(s) loaded');
+      if (!silent) setStatus(rows.length + ' active recommendation(s) loaded');
+      return rows;
     }
 
     async function decideRecommendation(recommendationId, action) {
@@ -3178,12 +3210,19 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       await loadCopyTargets();
       await loadParams();
       if (!els.paramsConfigPanel.hidden) await loadParamCatalog();
-      if (!els.consulPanel.hidden) await loadConsulRecommendations();
+      const wasConsulOpen = !els.consulPanel.hidden;
+      try {
+        await loadConsulRecommendations({silent: !wasConsulOpen});
+      } catch (exc) {
+        setConsulTabVisible(false);
+        if (wasConsulOpen) setStatus(exc.message, true);
+      }
     });
     els.groupFilter.addEventListener('change', applyFilters);
     els.searchInput.addEventListener('input', applyFilters);
     els.catalogSearchInput.addEventListener('input', applyCatalogFilter);
     els.copyToggle.addEventListener('change', loadCopyTargets);
+    els.adminModeToggle.addEventListener('change', updateAdminModeUi);
     els.saveBtn.addEventListener('click', saveChanges);
     els.paramsTab.addEventListener('click', () => switchFormTab('params'));
     els.paramsConfigTab.addEventListener('click', () => switchFormTab('catalog'));
@@ -3208,6 +3247,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.rmRefreshStatusBtn.addEventListener('click', () => loadRuntimeStatus().catch(exc => setStatus(exc.message, true)));
     els.consulRefreshBtn.addEventListener('click', () => loadConsulRecommendations().catch(exc => setStatus(exc.message, true)));
 
+    updateAdminModeUi();
+    setConsulTabVisible(false);
     fillRmBotList([]);
     updateRmCommandUi();
     loadAccounts().catch(exc => setStatus(exc.message, true));
