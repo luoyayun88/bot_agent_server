@@ -2161,6 +2161,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     };
     let currentBotRows = [];
     let currentCatalogRows = [];
+    let paramsLoadSeq = 0;
     const CATALOG_VALUE_TYPES = ['bool', 'int', 'numeric', 'text', 'json'];
 
     const els = {
@@ -2809,10 +2810,12 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     async function loadParams() {
       const account = els.accountSelect.value;
       const bot = els.botSelect.value;
+      const loadSeq = ++paramsLoadSeq;
       els.paramsBody.innerHTML = '';
       if (!account || !bot) return;
       setStatus('Loading parameters...');
       const data = await api('/config-ui/api/params?account_login=' + encodeURIComponent(account) + '&bot=' + encodeURIComponent(bot));
+      if (loadSeq !== paramsLoadSeq || account !== els.accountSelect.value || bot !== els.botSelect.value) return;
       const rows = data.params || [];
       const groups = Array.from(new Set(rows.map(r => r.param_group || '').filter(Boolean))).sort();
       const currentGroup = els.groupFilter.value;
@@ -2826,7 +2829,9 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       if (groups.includes(currentGroup)) els.groupFilter.value = currentGroup;
 
       let previousGroup = null;
+      const fragment = document.createDocumentFragment();
       for (const row of rows) {
+        if (loadSeq !== paramsLoadSeq || account !== els.accountSelect.value || bot !== els.botSelect.value) return;
         const rowGroup = row.param_group || '';
         const tr = document.createElement('tr');
         if (previousGroup !== null && rowGroup !== previousGroup) tr.classList.add('group-break');
@@ -2842,11 +2847,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         const prevTd = document.createElement('td');
         prevTd.className = 'prev-value';
         prevTd.appendChild(await buildPrevValueControl(row));
+        if (loadSeq !== paramsLoadSeq || account !== els.accountSelect.value || bot !== els.botSelect.value) return;
         tr.appendChild(prevTd);
 
         const newTd = document.createElement('td');
         newTd.className = 'new-value';
         newTd.appendChild(await buildValueControl(row));
+        if (loadSeq !== paramsLoadSeq || account !== els.accountSelect.value || bot !== els.botSelect.value) return;
         tr.appendChild(newTd);
 
         const reasonTd = document.createElement('td');
@@ -2860,8 +2867,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         reason.addEventListener('input', updateChangedCount);
         reasonTd.appendChild(reason);
         tr.appendChild(reasonTd);
-        els.paramsBody.appendChild(tr);
+        fragment.appendChild(tr);
       }
+      els.paramsBody.innerHTML = '';
+      els.paramsBody.appendChild(fragment);
       applyFilters();
       updateChangedCount();
       setStatus(rows.length + ' parameters loaded');
