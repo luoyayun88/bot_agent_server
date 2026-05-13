@@ -906,8 +906,8 @@ def normalize_rm_state_bot_kind(scope, target_bot_kind):
     if scope == "account":
         return ""
     value = (target_bot_kind or "").strip().lower()
-    if not re.match(r"^n\d+$", value):
-        raise ValueError("target_bot_kind must be n* for bot scope")
+    if not re.match(r"^(n\d+|bot123)$", value):
+        raise ValueError("target_bot_kind must be n* or bot123 for bot scope")
     return value
 
 
@@ -1427,7 +1427,7 @@ def normalize_rm_bot_ids(bot_ids):
     normalized = []
     for bot_id in bot_ids or []:
         value = (bot_id or "").strip().lower()
-        if not re.match(r"^n\d+$", value):
+        if not re.match(r"^(n\d+|bot123)$", value):
             raise ValueError(f"unsupported bot id: {bot_id}")
         if value not in normalized:
             normalized.append(value)
@@ -2358,7 +2358,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     }
 
     function isRmStopBot(bot) {
-      return /^n\d+$/i.test(String(bot || '').trim());
+      return /^(n\d+|bot123)$/i.test(String(bot || '').trim());
     }
 
     function fillRmBotList(rows = currentBotRows) {
@@ -2370,7 +2370,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       if (!rmBots.length) {
         const empty = document.createElement('div');
         empty.className = 'rm-option';
-        empty.textContent = 'No n* bots for selected account';
+        empty.textContent = 'No RM-stop bots for selected account';
         els.rmBotList.appendChild(empty);
         updateRmCommandUi();
         return;
@@ -2433,11 +2433,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       if (action === 'stop_bots' || action === 'pause_bots') {
         const bots = checkedValues(els.rmBotList).join(',');
         const duration = period === 'until' ? (rmUntilValue() || 'YYYY.MM.DD HH:MM') : period;
-        return bots ? (action === 'pause_bots' ? 'pause bots ' : 'stop bots ') + bots + ' ' + duration : 'choose n* bots';
+        return bots ? (action === 'pause_bots' ? 'pause bots ' : 'stop bots ') + bots + ' ' + duration : 'choose bots';
       }
       if (action === 'resume_bots') {
         const bots = checkedValues(els.rmBotList).join(',');
-        return bots ? 'resume bots ' + bots : 'choose n* bots';
+        return bots ? 'resume bots ' + bots : 'choose bots';
       }
       return {
         status: 'status',
