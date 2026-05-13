@@ -1150,8 +1150,8 @@ RM_CONTROL_COMMAND_DESCRIPTIONS = {
     "resume": "Clear current account stop and keep today's baseline.",
     "rm_daystart": "Clear current account stop and restore today's day-start baseline.",
     "rm_reset": "Rearm RM from current balance/equity.",
-    "stop_bots": "Stop only selected bot families on the account.",
-    "pause_bots": "Pause only selected bot families without flattening open positions.",
+    "stop_bots": "Hard stop for selected bot families: FLATTEN_AND_HALT. Blocks new entries and tells bots to flatten/close open positions.",
+    "pause_bots": "Soft pause for selected bot families: HALT_ONLY. Blocks new entries, but keeps open positions running. No flatten.",
     "resume_bots": "Clear stops for selected bot families.",
 }
 RM_CONTROL_INPUT_PARAMS = {
@@ -1825,7 +1825,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .rm-option { display: flex; align-items: center; gap: 8px; min-height: 28px; padding: 3px 5px; border-radius: 4px; color: var(--text); font-size: 13px; font-weight: 500; }
     .rm-option:hover { background: var(--rm-soft); }
     .rm-option input { width: auto; flex: 0 0 auto; }
-    .rm-desc { min-height: 34px; padding: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .rm-desc { min-height: 34px; padding: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.35; white-space: pre-line; }
     .rm-preview { min-height: 38px; max-height: 96px; overflow: auto; margin: 0; padding: 8px 10px; border: 1px solid var(--rm-border); border-radius: 6px; background: #f7fcfa; color: #26413d; font: 12px Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
     .rm-footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: start; margin-top: 10px; }
     .runtime-list { margin-top: 10px; overflow-x: hidden; }
@@ -2110,8 +2110,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
               <option value="resume">Resume account</option>
               <option value="rm_daystart">RM daystart</option>
               <option value="rm_reset">RM reset</option>
-              <option value="stop_bots">Stop selected bots</option>
-              <option value="pause_bots">Pause selected bots</option>
+              <option value="stop_bots">Stop selected bots - close positions</option>
+              <option value="pause_bots">Pause selected bots - keep positions</option>
               <option value="resume_bots">Resume selected bots</option>
             </select>
             <div id="rmCommandDescription" class="rm-desc"></div>
@@ -2155,8 +2155,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       resume: "Clear current account stop and keep today's baseline.",
       rm_daystart: "Clear current account stop and restore today's day-start baseline.",
       rm_reset: 'Rearm RM from current balance/equity.',
-      stop_bots: 'Stop only selected bot families for the selected period.',
-      pause_bots: 'Pause only selected bot families without flattening open positions.',
+      stop_bots: 'Hard stop for selected bot families: FLATTEN_AND_HALT.\nBlocks new entries and tells bots to flatten/close open positions for the selected period.',
+      pause_bots: 'Soft pause for selected bot families: HALT_ONLY.\nBlocks new entries for the selected period, but keeps open positions running. No flatten.',
       resume_bots: 'Clear stops for selected bot families.'
     };
     let currentBotRows = [];
