@@ -1926,7 +1926,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .catalog-range-grid { grid-template-columns: 1fr 1fr; }
       .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
       .param::after { content: attr(data-desc); display: block; margin-top: 4px; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
-      .desc { display: none; }
+      .params-table td.desc { display: none; }
       .current, .prev-value, .new-value { grid-column: 1 / -1; min-width: 0; max-width: none; }
       .current::before, .prev-value::before, .new-value::before { display: block; margin-bottom: 5px; font-family: Inter, Segoe UI, Arial, sans-serif; font-size: 12px; font-weight: 700; color: var(--muted); white-space: nowrap; }
       .current::before { content: "current value"; color: #147a3d; }
