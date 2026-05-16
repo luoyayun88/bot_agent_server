@@ -1817,6 +1817,9 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     #rmTab:hover { background: var(--rm-soft); }
     #rmTab.is-active { background: var(--rm-bg); border-color: var(--rm-border); color: var(--rm-accent); }
     .tab-panel[hidden] { display: none; }
+    .analytics-frame-wrap { min-height: 220px; padding: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+    .analytics-frame-grid { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+    .analytics-frame { display: block; width: min(100%, 450px); height: 200px; border: 0; background: #fff; }
     .rm-control { margin-bottom: 12px; padding: 12px; background: var(--rm-bg); border: 1px solid var(--rm-border); border-radius: 8px; box-shadow: inset 4px 0 0 var(--rm-accent); }
     .rm-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
     .rm-title { font-size: 15px; font-weight: 700; color: #0b534d; }
@@ -1988,6 +1991,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       <button id="paramsConfigTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="paramsConfigPanel" hidden>Params_config</button>
       <button id="consulTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="consulPanel" hidden>Consul</button>
       <button id="rmTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="rmPanel">RM command</button>
+      <button id="analyticsTab" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="analyticsPanel">Analytics</button>
     </nav>
 
     <section id="paramsPanel" class="tab-panel" role="tabpanel" aria-labelledby="paramsTab">
@@ -2141,6 +2145,15 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         <div id="rmRuntimeList" class="runtime-list"></div>
       </section>
     </section>
+
+    <section id="analyticsPanel" class="tab-panel" role="tabpanel" aria-labelledby="analyticsTab" hidden>
+      <section class="analytics-frame-wrap">
+        <div class="analytics-frame-grid">
+          <iframe class="analytics-frame" title="Analytics panel 25" width="450" height="200" frameborder="0" loading="lazy" data-src="https://luoyayun88.grafana.net/d-solo/lullw7f/finexpert-profit?orgId=1&amp;from=1776339359428&amp;to=1778931359428&amp;timezone=browser&amp;dtab=profit-by-bot&amp;var-source_id=$__all&amp;var-sym=$__all&amp;var-tf=$__all&amp;var-filedate=$__all&amp;var-year=$__all&amp;var-month=5&amp;var-req_id=$__all&amp;var-max_filedate=2026-05-15&amp;editIndex=7&amp;panelId=panel-25"></iframe>
+          <iframe class="analytics-frame" title="Analytics panel 24" width="450" height="200" frameborder="0" loading="lazy" data-src="https://luoyayun88.grafana.net/d-solo/lullw7f/finexpert-profit?orgId=1&amp;from=1776339359428&amp;to=1778931359428&amp;timezone=browser&amp;dtab=profit-by-bot&amp;var-source_id=$__all&amp;var-sym=$__all&amp;var-tf=$__all&amp;var-filedate=$__all&amp;var-year=$__all&amp;var-month=5&amp;var-req_id=$__all&amp;var-max_filedate=2026-05-15&amp;editIndex=7&amp;panelId=panel-24"></iframe>
+        </div>
+      </section>
+    </section>
   </main>
   <script>
     const SESSION_USER = __SESSION_USER__;
@@ -2192,10 +2205,12 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       paramsConfigTab: document.getElementById('paramsConfigTab'),
       consulTab: document.getElementById('consulTab'),
       rmTab: document.getElementById('rmTab'),
+      analyticsTab: document.getElementById('analyticsTab'),
       paramsPanel: document.getElementById('paramsPanel'),
       paramsConfigPanel: document.getElementById('paramsConfigPanel'),
       consulPanel: document.getElementById('consulPanel'),
       rmPanel: document.getElementById('rmPanel'),
+      analyticsPanel: document.getElementById('analyticsPanel'),
       consulBody: document.getElementById('consulBody'),
       consulRefreshBtn: document.getElementById('consulRefreshBtn'),
       status: document.getElementById('status'),
@@ -2228,27 +2243,40 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       if (!visible && !els.consulPanel.hidden) switchFormTab('params');
     }
 
+    function loadAnalyticsFrame() {
+      for (const frame of els.analyticsPanel.querySelectorAll('iframe[data-src]')) {
+        if (frame.dataset.loaded === '1') continue;
+        frame.src = frame.dataset.src;
+        frame.dataset.loaded = '1';
+      }
+    }
+
     function switchFormTab(tab) {
       if (tab === 'catalog' && !els.adminModeToggle.checked) tab = 'params';
       if (tab === 'consul' && els.consulTab.hidden) tab = 'params';
       const showRm = tab === 'rm';
       const showCatalog = tab === 'catalog';
       const showConsul = tab === 'consul';
-      els.paramsPanel.hidden = showRm || showCatalog || showConsul;
+      const showAnalytics = tab === 'analytics';
+      els.paramsPanel.hidden = showRm || showCatalog || showConsul || showAnalytics;
       els.paramsConfigPanel.hidden = !showCatalog;
       els.consulPanel.hidden = !showConsul;
       els.rmPanel.hidden = !showRm;
-      els.paramsTab.classList.toggle('is-active', !showRm && !showCatalog && !showConsul);
+      els.analyticsPanel.hidden = !showAnalytics;
+      els.paramsTab.classList.toggle('is-active', !showRm && !showCatalog && !showConsul && !showAnalytics);
       els.paramsConfigTab.classList.toggle('is-active', showCatalog);
       els.consulTab.classList.toggle('is-active', showConsul);
       els.rmTab.classList.toggle('is-active', showRm);
-      els.paramsTab.setAttribute('aria-selected', showRm || showCatalog || showConsul ? 'false' : 'true');
+      els.analyticsTab.classList.toggle('is-active', showAnalytics);
+      els.paramsTab.setAttribute('aria-selected', showRm || showCatalog || showConsul || showAnalytics ? 'false' : 'true');
       els.paramsConfigTab.setAttribute('aria-selected', showCatalog ? 'true' : 'false');
       els.consulTab.setAttribute('aria-selected', showConsul ? 'true' : 'false');
       els.rmTab.setAttribute('aria-selected', showRm ? 'true' : 'false');
+      els.analyticsTab.setAttribute('aria-selected', showAnalytics ? 'true' : 'false');
       if (showCatalog) loadParamCatalog().catch(exc => setStatus(exc.message, true));
       if (showConsul) loadConsulRecommendations().catch(exc => setStatus(exc.message, true));
       if (showRm) loadRuntimeStatus().catch(exc => setStatus(exc.message, true));
+      if (showAnalytics) loadAnalyticsFrame();
     }
 
     async function api(path, options = {}) {
@@ -3237,6 +3265,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.paramsConfigTab.addEventListener('click', () => switchFormTab('catalog'));
     els.consulTab.addEventListener('click', () => switchFormTab('consul'));
     els.rmTab.addEventListener('click', () => switchFormTab('rm'));
+    els.analyticsTab.addEventListener('click', () => switchFormTab('analytics'));
     els.paramsConfigSaveBtn.addEventListener('click', saveParamCatalogChanges);
     els.rmActionSelect.addEventListener('change', updateRmCommandUi);
     for (const input of els.rmPeriodList.querySelectorAll('input[type="checkbox"]')) {
