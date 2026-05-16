@@ -413,6 +413,17 @@ def parse_config_ui_date(value, field_name="filedate"):
     raise ValueError(f"{field_name} must be YYYY-MM-DD")
 
 
+def config_ui_analytics_filedate_date_sql(alias="cp"):
+    prefix = f"{alias}." if alias else ""
+    raw = f"NULLIF(btrim({prefix}filedate::text), '')"
+    return (
+        "CASE "
+        f"WHEN left({raw}, 10) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$' THEN left({raw}, 10)::date "
+        f"WHEN {raw} ~ '^\\d{{8}}$' THEN to_date({raw}, 'YYYYMMDD') "
+        "ELSE NULL END"
+    )
+
+
 def config_ui_analytics_source_fallback(source_id):
     sid = (source_id or "").strip().lower()
     return {
@@ -2777,15 +2788,22 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return Math.trunc(number).toLocaleString();
     }
 
+    function analyticsDefaultYear() {
+      return String(new Date().getFullYear());
+    }
+
     function analyticsQueryString() {
       const params = new URLSearchParams();
       const filedate = els.analyticsFiledateInput.value.trim();
-      const year = els.analyticsYearInput.value.trim();
+      let year = els.analyticsYearInput.value.trim();
       const month = els.analyticsMonthSelect.value.trim();
       if (filedate) {
         params.set('filedate', filedate);
       } else {
-        if (month && !year) throw new Error('Choose year for month filter');
+        if (month && !year) {
+          year = analyticsDefaultYear();
+          els.analyticsYearInput.value = year;
+        }
         if (year) params.set('year', year);
         if (month) params.set('month', month);
       }
@@ -3504,7 +3522,12 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.rmRefreshStatusBtn.addEventListener('click', () => loadRuntimeStatus().catch(exc => setStatus(exc.message, true)));
     els.consulRefreshBtn.addEventListener('click', () => loadConsulRecommendations().catch(exc => setStatus(exc.message, true)));
     els.analyticsYearInput.addEventListener('input', () => { analyticsLoaded = false; });
-    els.analyticsMonthSelect.addEventListener('change', () => { analyticsLoaded = false; });
+    els.analyticsMonthSelect.addEventListener('change', () => {
+      if (els.analyticsMonthSelect.value && !els.analyticsYearInput.value.trim()) {
+        els.analyticsYearInput.value = analyticsDefaultYear();
+      }
+      analyticsLoaded = false;
+    });
     els.analyticsFiledateInput.addEventListener('input', () => { analyticsLoaded = false; });
     els.analyticsApplyBtn.addEventListener('click', () => {
       analyticsLoaded = false;
@@ -4905,6 +4928,7 @@ async def config_ui_analytics_profit_by_source(
             query_filedate = None
             period_label = None
             filter_mode = "latest"
+            filedate_expr = config_ui_analytics_filedate_date_sql("cp")
             where_sql = ""
             params = []
 
@@ -4912,7 +4936,7 @@ async def config_ui_analytics_profit_by_source(
                 query_filedate = exact_filedate
                 period_label = exact_filedate.isoformat()
                 filter_mode = "filedate"
-                where_sql = "cp.filedate = %s"
+                where_sql = "cp.filedate_date = %s"
                 params = [query_filedate]
             elif year is not None:
                 if year < 2000 or year > 2100:
@@ -4929,12 +4953,21 @@ async def config_ui_analytics_profit_by_source(
                     end_date = date(year + 1, 1, 1)
                     period_label = f"{year:04d}"
                     filter_mode = "year"
-                where_sql = "cp.filedate >= %s AND cp.filedate < %s"
+                where_sql = "cp.filedate_date >= %s AND cp.filedate_date < %s"
                 params = [start_date, end_date]
             elif month is not None:
                 raise ValueError("year is required with month")
             else:
-                cur.execute("SELECT MAX(filedate) AS filedate FROM cust_positions")
+                cur.execute(
+                    f"""
+                    SELECT MAX(filedate_date) AS filedate
+                      FROM (
+                        SELECT {filedate_expr} AS filedate_date
+                          FROM cust_positions cp
+                      ) latest
+                     WHERE filedate_date IS NOT NULL
+                    """
+                )
                 latest = cur.fetchone()
                 query_filedate = latest["filedate"] if latest else None
                 period_label = config_ui_db_text(query_filedate)
@@ -4950,18 +4983,25 @@ async def config_ui_analytics_profit_by_source(
                         "rows": [],
                         "version": CODE_VERSION,
                     }
-                where_sql = "cp.filedate = %s"
+                where_sql = "cp.filedate_date = %s"
                 params = [query_filedate]
 
             cur.execute(
                 f"""
-                WITH source_rows AS (
+                WITH positions AS (
                     SELECT cp.source_id::text AS source_id,
+                           cp.profit,
+                           cp.position,
+                           {filedate_expr} AS filedate_date
+                      FROM cust_positions cp
+                ),
+                source_rows AS (
+                    SELECT cp.source_id,
                            COALESCE(SUM(cp.profit), 0) AS profit,
                            COUNT(DISTINCT cp.position) AS deals
-                      FROM cust_positions cp
+                      FROM positions cp
                      WHERE {where_sql}
-                     GROUP BY cp.source_id::text
+                     GROUP BY cp.source_id
                 )
                 SELECT sr.source_id,
                        bc.bot_kind,
