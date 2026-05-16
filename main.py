@@ -385,6 +385,22 @@ def config_ui_conn():
     return psycopg2.connect(db_url, sslmode="require")
 
 
+def config_ui_db_text(value):
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def config_ui_db_decimal(value):
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 def set_actor(cur, actor):
     cur.execute("SELECT set_config('bot_param.actor', %s, true)", (actor,))
 
@@ -1817,9 +1833,6 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     #rmTab:hover { background: var(--rm-soft); }
     #rmTab.is-active { background: var(--rm-bg); border-color: var(--rm-border); color: var(--rm-accent); }
     .tab-panel[hidden] { display: none; }
-    .analytics-frame-wrap { min-height: 220px; padding: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
-    .analytics-frame-grid { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
-    .analytics-frame { display: block; width: min(100%, 450px); height: 200px; border: 0; background: #fff; }
     .rm-control { margin-bottom: 12px; padding: 12px; background: var(--rm-bg); border: 1px solid var(--rm-border); border-radius: 8px; box-shadow: inset 4px 0 0 var(--rm-accent); }
     .rm-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
     .rm-title { font-size: 15px; font-weight: 700; color: #0b534d; }
@@ -1891,6 +1904,20 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .rec-actions { display: flex; gap: 6px; flex-wrap: wrap; }
     .rec-actions button { padding: 7px 9px; font-size: 12px; }
     .rec-actions button.reject { background: #eef2f6; color: #8d1f1f; border: 1px solid #e3b0b0; }
+    .analytics-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+    .analytics-title { font-size: 15px; font-weight: 700; color: #263445; }
+    .analytics-summary { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 12px; margin-bottom: 12px; }
+    .analytics-stat { min-width: 0; padding: 8px 0; border-bottom: 2px solid #dfe7ef; }
+    .analytics-label { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
+    .analytics-value { margin-top: 4px; color: var(--text); font-size: 20px; font-weight: 800; overflow-wrap: anywhere; }
+    .analytics-table th:nth-child(1), .analytics-table td.analytics-source { width: 46%; }
+    .analytics-table th:nth-child(2), .analytics-table td.analytics-deals { width: 18%; }
+    .analytics-table th:nth-child(3), .analytics-table td.analytics-profit { width: 36%; }
+    .analytics-source { font-family: Consolas, Menlo, monospace; overflow-wrap: anywhere; }
+    .analytics-deals, .analytics-profit { text-align: right; font-family: Consolas, Menlo, monospace; }
+    .analytics-profit { font-weight: 800; }
+    .profit-positive { background: #1f8f4d; color: #fff; }
+    .profit-negative { background: #c73535; color: #fff; }
     .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
     .changed-count { color: var(--muted); font-size: 14px; }
     @media (max-width: 1100px) {
@@ -1915,17 +1942,22 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .table-wrap { border: 0; border-radius: 0; overflow-x: visible; background: transparent; }
       .params-table, .params-table thead, .params-table tbody, .params-table tr, .params-table td,
       .catalog-table, .catalog-table thead, .catalog-table tbody, .catalog-table tr, .catalog-table td,
-      .consul-table, .consul-table thead, .consul-table tbody, .consul-table tr, .consul-table td { display: block; width: 100%; }
-      .params-table, .catalog-table, .consul-table { min-width: 0; border-collapse: separate; }
-      .params-table thead, .catalog-table thead, .consul-table thead { display: none; }
-      .params-table tr, .catalog-table tr, .consul-table tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
-      .params-table tr.hidden, .catalog-table tr.hidden, .consul-table tr.hidden { display: none; }
+      .consul-table, .consul-table thead, .consul-table tbody, .consul-table tr, .consul-table td,
+      .analytics-table, .analytics-table thead, .analytics-table tbody, .analytics-table tr, .analytics-table td { display: block; width: 100%; }
+      .params-table, .catalog-table, .consul-table, .analytics-table { min-width: 0; border-collapse: separate; }
+      .params-table thead, .catalog-table thead, .consul-table thead, .analytics-table thead { display: none; }
+      .params-table tr, .catalog-table tr, .consul-table tr, .analytics-table tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; background: var(--panel); }
+      .params-table tr.hidden, .catalog-table tr.hidden, .consul-table tr.hidden, .analytics-table tr.hidden { display: none; }
       .params-table tr.group-break { margin-top: 18px; border-top: 3px solid #3d7cae; }
       .params-table tr.group-break td { border-top: 0; }
       .params-table tr.group-break td:nth-child(2) { box-shadow: none; }
-      .params-table td, .catalog-table td, .consul-table td { border-bottom: 0; padding: 0; min-width: 0; width: 100% !important; }
+      .params-table td, .catalog-table td, .consul-table td, .analytics-table td { border-bottom: 0; padding: 0; min-width: 0; width: 100% !important; }
       .params-table td.group, .params-table td.reason { display: none; }
-      .catalog-table td::before, .consul-table td::before { content: attr(data-label); display: block; margin-bottom: 5px; font-size: 12px; font-weight: 700; color: var(--muted); }
+      .catalog-table td::before, .consul-table td::before, .analytics-table td::before { content: attr(data-label); display: block; margin-bottom: 5px; font-size: 12px; font-weight: 700; color: var(--muted); }
+      .analytics-summary { grid-template-columns: 1fr; }
+      .analytics-deals, .analytics-profit { text-align: left; }
+      .analytics-profit { padding: 8px 10px !important; }
+      .analytics-profit::before { color: rgba(255, 255, 255, .82) !important; }
       .catalog-range-grid { grid-template-columns: 1fr 1fr; }
       .param { grid-column: 1 / -1; font-family: Consolas, Menlo, monospace; font-size: 13px; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
       .param::after { content: attr(data-desc); display: block; margin-top: 4px; font-family: Inter, Segoe UI, Arial, sans-serif; font-weight: 500; color: var(--muted); }
@@ -2147,11 +2179,35 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     </section>
 
     <section id="analyticsPanel" class="tab-panel" role="tabpanel" aria-labelledby="analyticsTab" hidden>
-      <section class="analytics-frame-wrap">
-        <div class="analytics-frame-grid">
-          <iframe class="analytics-frame" title="Analytics panel 25" width="450" height="200" frameborder="0" loading="lazy" data-src="https://luoyayun88.grafana.net/d-solo/lullw7f/finexpert-profit?orgId=1&amp;from=1776339359428&amp;to=1778931359428&amp;timezone=browser&amp;dtab=profit-by-bot&amp;var-source_id=$__all&amp;var-sym=$__all&amp;var-tf=$__all&amp;var-filedate=$__all&amp;var-year=$__all&amp;var-month=5&amp;var-req_id=$__all&amp;var-max_filedate=2026-05-15&amp;editIndex=7&amp;panelId=panel-25"></iframe>
-          <iframe class="analytics-frame" title="Analytics panel 24" width="450" height="200" frameborder="0" loading="lazy" data-src="https://luoyayun88.grafana.net/d-solo/lullw7f/finexpert-profit?orgId=1&amp;from=1776339359428&amp;to=1778931359428&amp;timezone=browser&amp;dtab=profit-by-bot&amp;var-source_id=$__all&amp;var-sym=$__all&amp;var-tf=$__all&amp;var-filedate=$__all&amp;var-year=$__all&amp;var-month=5&amp;var-req_id=$__all&amp;var-max_filedate=2026-05-15&amp;editIndex=7&amp;panelId=panel-24"></iframe>
+      <div class="analytics-head">
+        <div class="analytics-title">Profit by source_id</div>
+        <button id="analyticsRefreshBtn" class="secondary" type="button">Refresh</button>
+      </div>
+      <section class="analytics-summary" aria-label="analytics totals">
+        <div class="analytics-stat">
+          <div class="analytics-label">Filedate</div>
+          <div id="analyticsFiledate" class="analytics-value">-</div>
         </div>
+        <div class="analytics-stat">
+          <div class="analytics-label">Total deals</div>
+          <div id="analyticsTotalDeals" class="analytics-value">0</div>
+        </div>
+        <div class="analytics-stat">
+          <div class="analytics-label">Total profit</div>
+          <div id="analyticsTotalProfit" class="analytics-value">0.00</div>
+        </div>
+      </section>
+      <section class="table-wrap">
+        <table class="analytics-table">
+          <thead>
+            <tr>
+              <th>source_id</th>
+              <th>deals</th>
+              <th>profit</th>
+            </tr>
+          </thead>
+          <tbody id="analyticsBody"></tbody>
+        </table>
       </section>
     </section>
   </main>
@@ -2175,6 +2231,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     let currentBotRows = [];
     let currentCatalogRows = [];
     let paramsLoadSeq = 0;
+    let analyticsLoaded = false;
     const CATALOG_VALUE_TYPES = ['bool', 'int', 'numeric', 'text', 'json'];
 
     const els = {
@@ -2211,6 +2268,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       consulPanel: document.getElementById('consulPanel'),
       rmPanel: document.getElementById('rmPanel'),
       analyticsPanel: document.getElementById('analyticsPanel'),
+      analyticsRefreshBtn: document.getElementById('analyticsRefreshBtn'),
+      analyticsFiledate: document.getElementById('analyticsFiledate'),
+      analyticsTotalDeals: document.getElementById('analyticsTotalDeals'),
+      analyticsTotalProfit: document.getElementById('analyticsTotalProfit'),
+      analyticsBody: document.getElementById('analyticsBody'),
       consulBody: document.getElementById('consulBody'),
       consulRefreshBtn: document.getElementById('consulRefreshBtn'),
       status: document.getElementById('status'),
@@ -2243,14 +2305,6 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       if (!visible && !els.consulPanel.hidden) switchFormTab('params');
     }
 
-    function loadAnalyticsFrame() {
-      for (const frame of els.analyticsPanel.querySelectorAll('iframe[data-src]')) {
-        if (frame.dataset.loaded === '1') continue;
-        frame.src = frame.dataset.src;
-        frame.dataset.loaded = '1';
-      }
-    }
-
     function switchFormTab(tab) {
       if (tab === 'catalog' && !els.adminModeToggle.checked) tab = 'params';
       if (tab === 'consul' && els.consulTab.hidden) tab = 'params';
@@ -2276,7 +2330,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       if (showCatalog) loadParamCatalog().catch(exc => setStatus(exc.message, true));
       if (showConsul) loadConsulRecommendations().catch(exc => setStatus(exc.message, true));
       if (showRm) loadRuntimeStatus().catch(exc => setStatus(exc.message, true));
-      if (showAnalytics) loadAnalyticsFrame();
+      if (showAnalytics && !analyticsLoaded) loadAnalyticsProfit().catch(exc => setStatus(exc.message, true));
     }
 
     async function api(path, options = {}) {
@@ -2631,6 +2685,63 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       const td = textCell(className, text);
       td.dataset.label = label;
       return td;
+    }
+
+    function formatAnalyticsNumber(value, fractionDigits = 2) {
+      const number = Number(value || 0);
+      if (!Number.isFinite(number)) return '';
+      return number.toLocaleString(undefined, {
+        minimumFractionDigits: fractionDigits,
+        maximumFractionDigits: fractionDigits
+      });
+    }
+
+    function formatAnalyticsInt(value) {
+      const number = Number(value || 0);
+      if (!Number.isFinite(number)) return '0';
+      return Math.trunc(number).toLocaleString();
+    }
+
+    function renderAnalyticsProfit(data) {
+      const rows = data.rows || [];
+      els.analyticsFiledate.textContent = data.filedate || '-';
+      els.analyticsTotalDeals.textContent = formatAnalyticsInt(data.total_deals);
+      els.analyticsTotalProfit.textContent = formatAnalyticsNumber(data.total_profit, 2);
+      els.analyticsTotalProfit.classList.toggle('profit-negative', Number(data.total_profit || 0) < 0);
+      els.analyticsTotalProfit.classList.toggle('profit-positive', Number(data.total_profit || 0) >= 0);
+      els.analyticsBody.innerHTML = '';
+
+      if (!rows.length) {
+        const tr = document.createElement('tr');
+        const td = labeledTextCell('', 'analytics', 'No data');
+        td.colSpan = 3;
+        tr.appendChild(td);
+        els.analyticsBody.appendChild(tr);
+        return;
+      }
+
+      for (const row of rows) {
+        const profit = Number(row.profit || 0);
+        const tr = document.createElement('tr');
+        tr.appendChild(labeledTextCell('analytics-source', 'source_id', row.source_id == null ? '' : row.source_id));
+        tr.appendChild(labeledTextCell('analytics-deals', 'deals', formatAnalyticsInt(row.deals)));
+        tr.appendChild(labeledTextCell('analytics-profit ' + (profit < 0 ? 'profit-negative' : 'profit-positive'), 'profit', formatAnalyticsNumber(profit, 2)));
+        els.analyticsBody.appendChild(tr);
+      }
+    }
+
+    async function loadAnalyticsProfit() {
+      setStatus('Loading analytics...');
+      const tr = document.createElement('tr');
+      const td = labeledTextCell('', 'analytics', 'Loading...');
+      td.colSpan = 3;
+      tr.appendChild(td);
+      els.analyticsBody.innerHTML = '';
+      els.analyticsBody.appendChild(tr);
+      const data = await api('/config-ui/api/analytics/profit-by-source');
+      renderAnalyticsProfit(data);
+      analyticsLoaded = true;
+      setStatus('Analytics loaded for filedate ' + (data.filedate || 'no data'));
     }
 
     function recommendationSignalText(row) {
@@ -3284,6 +3395,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.rmSendBtn.addEventListener('click', sendRmCommand);
     els.rmRefreshStatusBtn.addEventListener('click', () => loadRuntimeStatus().catch(exc => setStatus(exc.message, true)));
     els.consulRefreshBtn.addEventListener('click', () => loadConsulRecommendations().catch(exc => setStatus(exc.message, true)));
+    els.analyticsRefreshBtn.addEventListener('click', () => {
+      analyticsLoaded = false;
+      loadAnalyticsProfit().catch(exc => setStatus(exc.message, true));
+    });
 
     updateAdminModeUi();
     setConsulTabVisible(false);
@@ -4645,6 +4760,71 @@ async def config_ui_choices(request: Request, bot: str, input_param: str):
             )
             rows = [dict(row) for row in cur.fetchall()]
         return {"ok": True, "actor": actor, "choices": rows, "version": CODE_VERSION}
+    except Exception as exc:
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.get("/config-ui/api/analytics/profit-by-source")
+async def config_ui_analytics_profit_by_source(request: Request):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute("SELECT MAX(filedate) AS filedate FROM cust_positions")
+            latest = cur.fetchone()
+            filedate = latest["filedate"] if latest else None
+            if filedate is None:
+                return {
+                    "ok": True,
+                    "actor": actor,
+                    "filedate": None,
+                    "total_profit": 0.0,
+                    "total_deals": 0,
+                    "rows": [],
+                    "version": CODE_VERSION,
+                }
+
+            cur.execute(
+                """
+                SELECT source_id,
+                       COALESCE(SUM(profit), 0) AS profit,
+                       COUNT(DISTINCT position) AS deals
+                  FROM cust_positions
+                 WHERE filedate = %s
+                 GROUP BY source_id
+                 ORDER BY source_id ASC
+                 LIMIT 5000
+                """,
+                (filedate,),
+            )
+            rows = []
+            total_profit = Decimal("0")
+            total_deals = 0
+            for row in cur.fetchall():
+                profit = config_ui_db_decimal(row["profit"])
+                deals = int(row["deals"] or 0)
+                total_profit += profit
+                total_deals += deals
+                rows.append(
+                    {
+                        "source_id": config_ui_db_text(row["source_id"]),
+                        "profit": float(profit),
+                        "deals": deals,
+                    }
+                )
+        return {
+            "ok": True,
+            "actor": actor,
+            "filedate": config_ui_db_text(filedate),
+            "total_profit": float(total_profit),
+            "total_deals": total_deals,
+            "rows": rows,
+            "version": CODE_VERSION,
+        }
     except Exception as exc:
         return config_ui_json_error(500, first_error_line(exc))
     finally:
