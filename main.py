@@ -5,7 +5,7 @@ from openai import OpenAI, BadRequestError
 import os, json, traceback, re, threading, asyncio, time, tempfile, base64, hashlib, hmac, secrets, html as html_lib
 from urllib.parse import parse_qs
 from typing import Optional, List, Dict, Any, Tuple
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -399,6 +399,34 @@ def config_ui_db_decimal(value):
     if isinstance(value, Decimal):
         return value
     return Decimal(str(value))
+
+
+def parse_config_ui_date(value, field_name="filedate"):
+    text = (value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError(f"{field_name} must be YYYY-MM-DD")
+
+
+def config_ui_analytics_source_fallback(source_id):
+    sid = (source_id or "").strip().lower()
+    return {
+        "m50": "n4",
+        "nm50": "n4",
+        "s2": "n5",
+        "m10": "n6",
+        "dj": "n7",
+        "inbr": "n8",
+        "smbrk": "n9",
+        "pivot": "n10",
+        "kcbb": "n11",
+        "bot123": "bot123",
+    }.get(sid)
 
 
 def set_actor(cur, actor):
@@ -1815,7 +1843,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .toolbar { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; margin-bottom: 12px; }
     .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
     label { color: var(--muted); font-size: 12px; font-weight: 600; }
-    select, input[type="text"], input[type="search"], textarea { border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; color: var(--text); min-height: 38px; padding: 8px 10px; width: 100%; }
+    select, input[type="text"], input[type="search"], input[type="date"], textarea { border: 1px solid #b8c2cc; border-radius: 6px; background: #fff; color: var(--text); min-height: 38px; padding: 8px 10px; width: 100%; }
     textarea { resize: vertical; min-height: 58px; line-height: 1.3; }
     .copy-line { display: flex; gap: 8px; align-items: center; min-height: 38px; border: 1px solid var(--border); border-radius: 6px; background: #fff; padding: 8px 10px; }
     .copy-line input { width: auto; }
@@ -1906,6 +1934,9 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .rec-actions button.reject { background: #eef2f6; color: #8d1f1f; border: 1px solid #e3b0b0; }
     .analytics-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
     .analytics-title { font-size: 15px; font-weight: 700; color: #263445; }
+    .analytics-filters { margin-bottom: 12px; }
+    .analytics-filter-actions { display: flex; gap: 8px; align-items: flex-end; }
+    .analytics-filter-actions button { flex: 1 1 0; min-width: 0; }
     .analytics-summary { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 12px; margin-bottom: 12px; }
     .analytics-stat { min-width: 0; padding: 8px 0; border-bottom: 2px solid #dfe7ef; }
     .analytics-label { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
@@ -1913,8 +1944,12 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .analytics-table th:nth-child(1), .analytics-table td.analytics-source { width: 46%; }
     .analytics-table th:nth-child(2), .analytics-table td.analytics-deals { width: 18%; }
     .analytics-table th:nth-child(3), .analytics-table td.analytics-profit { width: 36%; }
-    .analytics-source { font-family: Consolas, Menlo, monospace; overflow-wrap: anywhere; }
+    .analytics-source { overflow-wrap: anywhere; }
+    .analytics-source-main { color: var(--text); font-size: 16px; font-weight: 800; }
+    .analytics-source-bot { color: var(--accent); font-size: 17px; font-weight: 900; }
     .analytics-deals, .analytics-profit { text-align: right; font-family: Consolas, Menlo, monospace; }
+    .analytics-table th:nth-child(2), .analytics-deals { border-left: 2px solid #d0d8e2; border-right: 2px solid #d0d8e2; }
+    .analytics-deals { background: #f8fbfd; font-weight: 800; }
     .analytics-profit { font-weight: 800; }
     .profit-positive { background: #1f8f4d; color: #fff; }
     .profit-negative { background: #c73535; color: #fff; }
@@ -1970,7 +2005,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       .current { font-family: Consolas, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
       .footer { align-items: stretch; flex-direction: column; }
       .footer button { width: 100%; min-height: 44px; }
-      select, input[type="text"], input[type="search"], textarea { min-height: 44px; font-size: 16px; }
+      select, input[type="text"], input[type="search"], input[type="date"], textarea { min-height: 44px; font-size: 16px; }
       .target-list { max-height: 144px; }
       .target-option { min-height: 34px; font-size: 14px; }
       .rm-control { padding: 10px; }
@@ -2183,9 +2218,44 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         <div class="analytics-title">Profit by source_id</div>
         <button id="analyticsRefreshBtn" class="secondary" type="button">Refresh</button>
       </div>
+      <section class="toolbar analytics-filters" aria-label="analytics filters">
+        <div class="field">
+          <label for="analyticsYearInput">Year</label>
+          <input id="analyticsYearInput" type="text" inputmode="numeric" placeholder="2026">
+        </div>
+        <div class="field">
+          <label for="analyticsMonthSelect">Month</label>
+          <select id="analyticsMonthSelect">
+            <option value="">All / latest</option>
+            <option value="1">January</option>
+            <option value="2">February</option>
+            <option value="3">March</option>
+            <option value="4">April</option>
+            <option value="5">May</option>
+            <option value="6">June</option>
+            <option value="7">July</option>
+            <option value="8">August</option>
+            <option value="9">September</option>
+            <option value="10">October</option>
+            <option value="11">November</option>
+            <option value="12">December</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="analyticsFiledateInput">Date</label>
+          <input id="analyticsFiledateInput" type="date">
+        </div>
+        <div class="field">
+          <label>Filter</label>
+          <div class="analytics-filter-actions">
+            <button id="analyticsApplyBtn" type="button">Apply</button>
+            <button id="analyticsClearBtn" class="secondary" type="button">Clear</button>
+          </div>
+        </div>
+      </section>
       <section class="analytics-summary" aria-label="analytics totals">
         <div class="analytics-stat">
-          <div class="analytics-label">Filedate</div>
+          <div class="analytics-label">Period</div>
           <div id="analyticsFiledate" class="analytics-value">-</div>
         </div>
         <div class="analytics-stat">
@@ -2201,7 +2271,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         <table class="analytics-table">
           <thead>
             <tr>
-              <th>source_id</th>
+              <th>source_id (bot)</th>
               <th>deals</th>
               <th>profit</th>
             </tr>
@@ -2269,6 +2339,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       rmPanel: document.getElementById('rmPanel'),
       analyticsPanel: document.getElementById('analyticsPanel'),
       analyticsRefreshBtn: document.getElementById('analyticsRefreshBtn'),
+      analyticsApplyBtn: document.getElementById('analyticsApplyBtn'),
+      analyticsClearBtn: document.getElementById('analyticsClearBtn'),
+      analyticsYearInput: document.getElementById('analyticsYearInput'),
+      analyticsMonthSelect: document.getElementById('analyticsMonthSelect'),
+      analyticsFiledateInput: document.getElementById('analyticsFiledateInput'),
       analyticsFiledate: document.getElementById('analyticsFiledate'),
       analyticsTotalDeals: document.getElementById('analyticsTotalDeals'),
       analyticsTotalProfit: document.getElementById('analyticsTotalProfit'),
@@ -2702,9 +2777,41 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return Math.trunc(number).toLocaleString();
     }
 
+    function analyticsQueryString() {
+      const params = new URLSearchParams();
+      const filedate = els.analyticsFiledateInput.value.trim();
+      const year = els.analyticsYearInput.value.trim();
+      const month = els.analyticsMonthSelect.value.trim();
+      if (filedate) {
+        params.set('filedate', filedate);
+      } else {
+        if (month && !year) throw new Error('Choose year for month filter');
+        if (year) params.set('year', year);
+        if (month) params.set('month', month);
+      }
+      return params.toString();
+    }
+
+    function analyticsSourceCell(row) {
+      const td = document.createElement('td');
+      td.className = 'analytics-source';
+      td.dataset.label = 'source_id';
+      const source = document.createElement('span');
+      source.className = 'analytics-source-main';
+      source.textContent = row.source_id == null ? '' : String(row.source_id);
+      td.appendChild(source);
+      if (row.bot_kind) {
+        const bot = document.createElement('span');
+        bot.className = 'analytics-source-bot';
+        bot.textContent = ' (' + row.bot_kind + ')';
+        td.appendChild(bot);
+      }
+      return td;
+    }
+
     function renderAnalyticsProfit(data) {
       const rows = data.rows || [];
-      els.analyticsFiledate.textContent = data.filedate || '-';
+      els.analyticsFiledate.textContent = data.period_label || data.filedate || '-';
       els.analyticsTotalDeals.textContent = formatAnalyticsInt(data.total_deals);
       els.analyticsTotalProfit.textContent = formatAnalyticsNumber(data.total_profit, 2);
       els.analyticsTotalProfit.classList.toggle('profit-negative', Number(data.total_profit || 0) < 0);
@@ -2723,7 +2830,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       for (const row of rows) {
         const profit = Number(row.profit || 0);
         const tr = document.createElement('tr');
-        tr.appendChild(labeledTextCell('analytics-source', 'source_id', row.source_id == null ? '' : row.source_id));
+        tr.appendChild(analyticsSourceCell(row));
         tr.appendChild(labeledTextCell('analytics-deals', 'deals', formatAnalyticsInt(row.deals)));
         tr.appendChild(labeledTextCell('analytics-profit ' + (profit < 0 ? 'profit-negative' : 'profit-positive'), 'profit', formatAnalyticsNumber(profit, 2)));
         els.analyticsBody.appendChild(tr);
@@ -2738,10 +2845,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       tr.appendChild(td);
       els.analyticsBody.innerHTML = '';
       els.analyticsBody.appendChild(tr);
-      const data = await api('/config-ui/api/analytics/profit-by-source');
+      const query = analyticsQueryString();
+      const data = await api('/config-ui/api/analytics/profit-by-source' + (query ? '?' + query : ''));
       renderAnalyticsProfit(data);
       analyticsLoaded = true;
-      setStatus('Analytics loaded for filedate ' + (data.filedate || 'no data'));
+      setStatus('Analytics loaded for ' + (data.period_label || data.filedate || 'no data'));
     }
 
     function recommendationSignalText(row) {
@@ -3395,6 +3503,20 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.rmSendBtn.addEventListener('click', sendRmCommand);
     els.rmRefreshStatusBtn.addEventListener('click', () => loadRuntimeStatus().catch(exc => setStatus(exc.message, true)));
     els.consulRefreshBtn.addEventListener('click', () => loadConsulRecommendations().catch(exc => setStatus(exc.message, true)));
+    els.analyticsYearInput.addEventListener('input', () => { analyticsLoaded = false; });
+    els.analyticsMonthSelect.addEventListener('change', () => { analyticsLoaded = false; });
+    els.analyticsFiledateInput.addEventListener('input', () => { analyticsLoaded = false; });
+    els.analyticsApplyBtn.addEventListener('click', () => {
+      analyticsLoaded = false;
+      loadAnalyticsProfit().catch(exc => setStatus(exc.message, true));
+    });
+    els.analyticsClearBtn.addEventListener('click', () => {
+      els.analyticsYearInput.value = '';
+      els.analyticsMonthSelect.value = '';
+      els.analyticsFiledateInput.value = '';
+      analyticsLoaded = false;
+      loadAnalyticsProfit().catch(exc => setStatus(exc.message, true));
+    });
     els.analyticsRefreshBtn.addEventListener('click', () => {
       analyticsLoaded = false;
       loadAnalyticsProfit().catch(exc => setStatus(exc.message, true));
@@ -4767,39 +4889,97 @@ async def config_ui_choices(request: Request, bot: str, input_param: str):
 
 
 @app.get("/config-ui/api/analytics/profit-by-source")
-async def config_ui_analytics_profit_by_source(request: Request):
+async def config_ui_analytics_profit_by_source(
+    request: Request,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    filedate: Optional[str] = None,
+):
     _, actor, auth = require_config_ui_api(request)
     if auth:
         return auth
     conn = config_ui_conn()
     try:
         with conn.cursor(cursor_factory=DictCursor) as cur:
-            cur.execute("SELECT MAX(filedate) AS filedate FROM cust_positions")
-            latest = cur.fetchone()
-            filedate = latest["filedate"] if latest else None
-            if filedate is None:
-                return {
-                    "ok": True,
-                    "actor": actor,
-                    "filedate": None,
-                    "total_profit": 0.0,
-                    "total_deals": 0,
-                    "rows": [],
-                    "version": CODE_VERSION,
-                }
+            exact_filedate = parse_config_ui_date(filedate, "filedate")
+            query_filedate = None
+            period_label = None
+            filter_mode = "latest"
+            where_sql = ""
+            params = []
+
+            if exact_filedate is not None:
+                query_filedate = exact_filedate
+                period_label = exact_filedate.isoformat()
+                filter_mode = "filedate"
+                where_sql = "cp.filedate = %s"
+                params = [query_filedate]
+            elif year is not None:
+                if year < 2000 or year > 2100:
+                    raise ValueError("year must be between 2000 and 2100")
+                if month is not None:
+                    if month < 1 or month > 12:
+                        raise ValueError("month must be between 1 and 12")
+                    start_date = date(year, month, 1)
+                    end_date = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+                    period_label = f"{year:04d}-{month:02d}"
+                    filter_mode = "month"
+                else:
+                    start_date = date(year, 1, 1)
+                    end_date = date(year + 1, 1, 1)
+                    period_label = f"{year:04d}"
+                    filter_mode = "year"
+                where_sql = "cp.filedate >= %s AND cp.filedate < %s"
+                params = [start_date, end_date]
+            elif month is not None:
+                raise ValueError("year is required with month")
+            else:
+                cur.execute("SELECT MAX(filedate) AS filedate FROM cust_positions")
+                latest = cur.fetchone()
+                query_filedate = latest["filedate"] if latest else None
+                period_label = config_ui_db_text(query_filedate)
+                if query_filedate is None:
+                    return {
+                        "ok": True,
+                        "actor": actor,
+                        "filter_mode": filter_mode,
+                        "filedate": None,
+                        "period_label": None,
+                        "total_profit": 0.0,
+                        "total_deals": 0,
+                        "rows": [],
+                        "version": CODE_VERSION,
+                    }
+                where_sql = "cp.filedate = %s"
+                params = [query_filedate]
 
             cur.execute(
-                """
-                SELECT source_id,
-                       COALESCE(SUM(profit), 0) AS profit,
-                       COUNT(DISTINCT position) AS deals
-                  FROM cust_positions
-                 WHERE filedate = %s
-                 GROUP BY source_id
-                 ORDER BY source_id ASC
+                f"""
+                WITH source_rows AS (
+                    SELECT cp.source_id::text AS source_id,
+                           COALESCE(SUM(cp.profit), 0) AS profit,
+                           COUNT(DISTINCT cp.position) AS deals
+                      FROM cust_positions cp
+                     WHERE {where_sql}
+                     GROUP BY cp.source_id::text
+                )
+                SELECT sr.source_id,
+                       bc.bot_kind,
+                       sr.profit,
+                       sr.deals
+                  FROM source_rows sr
+                  LEFT JOIN LATERAL (
+                    SELECT c.bot_kind
+                      FROM bot_param.bot_catalog c
+                     WHERE lower(c.source_id) = lower(sr.source_id)
+                       AND COALESCE(c.enabled, true) = true
+                     ORDER BY COALESCE(c.sort_order, 999999), c.bot_kind
+                     LIMIT 1
+                  ) bc ON true
+                 ORDER BY sr.source_id ASC NULLS LAST
                  LIMIT 5000
                 """,
-                (filedate,),
+                tuple(params),
             )
             rows = []
             total_profit = Decimal("0")
@@ -4807,11 +4987,14 @@ async def config_ui_analytics_profit_by_source(request: Request):
             for row in cur.fetchall():
                 profit = config_ui_db_decimal(row["profit"])
                 deals = int(row["deals"] or 0)
+                source_id = config_ui_db_text(row["source_id"])
+                bot_kind = config_ui_db_text(row["bot_kind"]) or config_ui_analytics_source_fallback(source_id)
                 total_profit += profit
                 total_deals += deals
                 rows.append(
                     {
-                        "source_id": config_ui_db_text(row["source_id"]),
+                        "source_id": source_id,
+                        "bot_kind": bot_kind,
                         "profit": float(profit),
                         "deals": deals,
                     }
@@ -4819,12 +5002,16 @@ async def config_ui_analytics_profit_by_source(request: Request):
         return {
             "ok": True,
             "actor": actor,
-            "filedate": config_ui_db_text(filedate),
+            "filter_mode": filter_mode,
+            "filedate": config_ui_db_text(query_filedate),
+            "period_label": period_label,
             "total_profit": float(total_profit),
             "total_deals": total_deals,
             "rows": rows,
             "version": CODE_VERSION,
         }
+    except ValueError as exc:
+        return config_ui_json_error(400, str(exc))
     except Exception as exc:
         return config_ui_json_error(500, first_error_line(exc))
     finally:
