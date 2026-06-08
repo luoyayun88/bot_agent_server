@@ -11,16 +11,18 @@ from pathlib import Path
 
 try:
     import psycopg2
+    from psycopg2 import pool as psycopg2_pool
     from psycopg2.extras import DictCursor, execute_values
 except Exception as _pg_exc:  # Allow app to start without psycopg2
     psycopg2 = None
+    psycopg2_pool = None
     DictCursor = None
     _PSYCOPG2_IMPORT_ERROR = _pg_exc
 from pydantic import BaseModel
 
 app = FastAPI()
 
-CODE_VERSION = "v1.08"
+CODE_VERSION = "v1.09"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -256,6 +258,34 @@ def require_api_key(request: Request):
 
 CONFIG_UI_COOKIE_NAME = "config_ui_session"
 CONFIG_UI_COOKIE_MAX_AGE = 8 * 60 * 60
+CONFIG_UI_DB_POOL_LOCK = threading.Lock()
+CONFIG_UI_DB_POOL = None
+CONFIG_UI_DB_POOL_DSN = None
+CONFIG_UI_DB_POOL_LIMITS = None
+
+
+class ConfigUiPooledConnection:
+    def __init__(self, pool, conn):
+        self._pool = pool
+        self._conn = conn
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def close(self):
+        if self._closed:
+            return
+        close_conn = False
+        try:
+            if not self._conn.closed:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    close_conn = True
+        finally:
+            self._pool.putconn(self._conn, close=close_conn)
+            self._closed = True
 
 
 def config_ui_enabled():
@@ -380,9 +410,55 @@ def require_config_ui_api(request: Request):
     return username, get_config_ui_actor(), None
 
 
+def config_ui_pool_limits():
+    try:
+        minconn = int(os.getenv("CONFIG_UI_DB_POOL_MIN", "1") or "1")
+    except ValueError:
+        minconn = 1
+    try:
+        maxconn = int(os.getenv("CONFIG_UI_DB_POOL_MAX", "8") or "8")
+    except ValueError:
+        maxconn = 8
+    minconn = max(1, minconn)
+    maxconn = max(minconn, maxconn)
+    return minconn, maxconn
+
+
 def config_ui_conn():
     db_url, _ = resolve_db_url()
-    return psycopg2.connect(db_url, sslmode="require")
+    if psycopg2_pool is None:
+        return psycopg2.connect(db_url, sslmode="require")
+    limits = config_ui_pool_limits()
+    global CONFIG_UI_DB_POOL, CONFIG_UI_DB_POOL_DSN, CONFIG_UI_DB_POOL_LIMITS
+    with CONFIG_UI_DB_POOL_LOCK:
+        if (
+            CONFIG_UI_DB_POOL is None
+            or CONFIG_UI_DB_POOL_DSN != db_url
+            or CONFIG_UI_DB_POOL_LIMITS != limits
+        ):
+            if CONFIG_UI_DB_POOL is not None:
+                CONFIG_UI_DB_POOL.closeall()
+            CONFIG_UI_DB_POOL = psycopg2_pool.ThreadedConnectionPool(
+                limits[0],
+                limits[1],
+                db_url,
+                sslmode="require",
+            )
+            CONFIG_UI_DB_POOL_DSN = db_url
+            CONFIG_UI_DB_POOL_LIMITS = limits
+        pool = CONFIG_UI_DB_POOL
+    return ConfigUiPooledConnection(pool, pool.getconn())
+
+
+@app.on_event("shutdown")
+def close_config_ui_db_pool():
+    global CONFIG_UI_DB_POOL, CONFIG_UI_DB_POOL_DSN, CONFIG_UI_DB_POOL_LIMITS
+    with CONFIG_UI_DB_POOL_LOCK:
+        if CONFIG_UI_DB_POOL is not None:
+            CONFIG_UI_DB_POOL.closeall()
+            CONFIG_UI_DB_POOL = None
+            CONFIG_UI_DB_POOL_DSN = None
+            CONFIG_UI_DB_POOL_LIMITS = None
 
 
 def config_ui_db_text(value):
@@ -436,6 +512,7 @@ def config_ui_analytics_source_fallback(source_id):
         "smbrk": "n9",
         "pivot": "n10",
         "kcbb": "n11",
+        "fib": "n12",
         "bot123": "bot123",
     }.get(sid)
 
@@ -2297,6 +2374,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     const CONFIG_ACTOR = __CONFIG_ACTOR__;
     const CODE_VERSION = __CODE_VERSION__;
     const choiceCache = new Map();
+    const choiceBulkCache = new Set();
     const RM_COMMAND_DESCRIPTIONS = {
       status: 'Show account RM state, active account stop, selected bot stops and runtime heartbeat.',
       config: 'Show current RM limits and owner configuration.',
@@ -2760,6 +2838,21 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return data.choices || [];
     }
 
+    async function preloadChoices(bot) {
+      if (!bot || choiceBulkCache.has(bot)) return;
+      const data = await api('/config-ui/api/choices-bulk?bot=' + encodeURIComponent(bot));
+      const choicesByParam = data.choices_by_param || {};
+      for (const inputParam of Object.keys(choicesByParam)) {
+        choiceCache.set(bot + '|' + inputParam, choicesByParam[inputParam] || []);
+      }
+      choiceBulkCache.add(bot);
+    }
+
+    function clearChoiceCaches() {
+      choiceCache.clear();
+      choiceBulkCache.clear();
+    }
+
     function textCell(className, text) {
       const td = document.createElement('td');
       td.className = className || '';
@@ -3082,6 +3175,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       const data = await api('/config-ui/api/params?account_login=' + encodeURIComponent(account) + '&bot=' + encodeURIComponent(bot));
       if (loadSeq !== paramsLoadSeq || account !== els.accountSelect.value || bot !== els.botSelect.value) return;
       const rows = data.params || [];
+      if (rows.some(row => row.has_choices)) {
+        await preloadChoices(bot);
+        if (loadSeq !== paramsLoadSeq || account !== els.accountSelect.value || bot !== els.botSelect.value) return;
+      }
       const groups = Array.from(new Set(rows.map(r => r.param_group || '').filter(Boolean))).sort();
       const currentGroup = els.groupFilter.value;
       els.groupFilter.innerHTML = '<option value="">All groups</option>';
@@ -3402,6 +3499,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         const refreshed = (data.refreshed_accounts || []).length;
         const savedMessage = 'Saved ' + (data.updated_count || 0) + ' catalog row(s); refreshed ' + refreshed + ' account(s)';
         setStatus(savedMessage);
+        clearChoiceCaches();
         await loadParamCatalog();
         await loadParams();
         await loadCopyTargets();
@@ -4876,6 +4974,40 @@ async def config_ui_param_catalog_save(req: ParamCatalogSaveRequest, request: Re
         return config_ui_json_error(400, str(exc))
     except Exception as exc:
         conn.rollback()
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
+@app.get("/config-ui/api/choices-bulk")
+async def config_ui_choices_bulk(request: Request, bot: str):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    bot = (bot or "").strip().lower()
+    if not bot:
+        return config_ui_json_error(400, "bot is required")
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT input_param, allowed_value, value_desc
+                  FROM bot_param.bot_config_allowed_value
+                 WHERE bot = %s
+                 ORDER BY input_param, sort_order, allowed_value
+                """,
+                (bot,),
+            )
+            choices_by_param = {}
+            for row in cur.fetchall():
+                input_param = row["input_param"]
+                choices_by_param.setdefault(input_param, []).append({
+                    "allowed_value": row["allowed_value"],
+                    "value_desc": row["value_desc"],
+                })
+        return {"ok": True, "actor": actor, "choices_by_param": choices_by_param, "version": CODE_VERSION}
+    except Exception as exc:
         return config_ui_json_error(500, first_error_line(exc))
     finally:
         conn.close()
