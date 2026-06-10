@@ -4708,7 +4708,7 @@ async def config_ui_params(request: Request, account_login: int, bot: str):
                     e.row_id,
                     e.account_login,
                     e.bot,
-                    e.param_group,
+                    COALESCE(pc.section_name, e.param_group) AS param_group,
                     e.input_param,
                     e.param_desc,
                     e.current_value,
@@ -4769,7 +4769,9 @@ async def config_ui_params(request: Request, account_login: int, bot: str):
                    AND oa.can_edit = true
                  WHERE e.account_login = %s
                    AND e.bot = %s
-                 ORDER BY e.param_group, e.input_param
+                 ORDER BY COALESCE(pc.section_name, e.param_group, ''),
+                          COALESCE(pc.sort_order, 999999),
+                          e.input_param
                 """,
                 (actor, account_login, bot),
             )
