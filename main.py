@@ -12,17 +12,18 @@ from pathlib import Path
 try:
     import psycopg2
     from psycopg2 import pool as psycopg2_pool
-    from psycopg2.extras import DictCursor, execute_values
+    from psycopg2.extras import DictCursor, execute_values, Json
 except Exception as _pg_exc:  # Allow app to start without psycopg2
     psycopg2 = None
     psycopg2_pool = None
     DictCursor = None
+    Json = None
     _PSYCOPG2_IMPORT_ERROR = _pg_exc
 from pydantic import BaseModel
 
 app = FastAPI()
 
-CODE_VERSION = "v1.09"
+CODE_VERSION = "v1.11"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -207,6 +208,38 @@ class BotRuntimeRmStateAckRequest(BotRuntimeBaseRequest):
     observed_state_version: int
     decision: str
     last_error: Optional[str] = None
+
+
+class BotRuntimeCacStateItem(BaseModel):
+    source_id: str
+    mode: str = "AUTO"
+    bot_state: str = "MEASURE"
+    cfg_ver: Optional[int] = None
+    stale_sec: int = 300
+    server_utc_offset: Optional[int] = None
+    blocked: List[Dict[str, Any]] = []
+    would_blocked: List[Dict[str, Any]] = []
+    primary_min: int = 90
+    secondary_min: int = 90
+    auto_min_days: int = 7
+    auto_min_trades: int = 20
+    auto_promote_abs: float = 5.0
+    auto_max_win_share: float = 0.45
+    probe_every_days: int = 28
+    probe_days: int = 7
+    min_dwell_days: int = 5
+    max_blocks_per_day: int = 40
+    demote_drop_abs: float = 30.0
+    state_since_epoch: Optional[int] = None
+    last_transition_epoch: Optional[int] = None
+    probe_until_epoch: Optional[int] = None
+    last_probe_epoch: Optional[int] = None
+    metrics: Dict[str, Any] = {}
+    reason: Optional[str] = None
+
+
+class BotRuntimeCacStateUpdateRequest(BotRuntimeBaseRequest):
+    states: List[BotRuntimeCacStateItem] = []
 
 
 def resolve_db_url(path=NEURO_DB_CONF, db_mode: Optional[str] = None):
@@ -965,6 +998,27 @@ RM_STATE_SCOPES = {"account", "bot"}
 RM_STATE_ACTIONS = {"halt_only", "flatten_and_halt"}
 RM_STATE_RESET_MODES = {"manual", "next_day", "next_week", "defined_date"}
 RM_STATE_DECISIONS = {"continue", "halt_only", "flatten_and_halt"}
+CAC_KZ_PHASE_SOURCE_IDS = {"m50", "s2", "m10", "dj", "inbr", "smbrk", "pivot", "kcbb", "fib", "bot123"}
+CAC_KZ_SOURCE_ORDER = ["m50", "s2", "m10", "dj", "inbr", "smbrk", "pivot", "kcbb", "fib", "bot123"]
+CAC_KZ_PROBE_STAGGER_DAYS = {
+    "pivot": 0,
+    "inbr": 7,
+    "dj": 14,
+    "m10": 21,
+}
+CAC_KZ_SYMBOLS = [
+    "US30", "US500", "USTEC", "US2000", "DE40", "IT40", "F40", "UK100", "JP225", "HK50",
+    "STOXX50", "ES35", "AUS200", "CHINA50", "XAUUSD", "XAGUSD", "XBRUSD", "XTIUSD",
+    "EURGBP", "EURUSD", "EURJPY", "GBPUSD", "GBPJPY", "USDJPY", "AUDUSD", "AUDJPY",
+    "CADJPY", "NZDUSD", "USDCAD", "EURAUD", "USDCHF", "USDSEK", "USDCNH", "USDSGD",
+    "USDHKD", "EURHKD",
+]
+CAC_KZ_BLOCK_STATES = {"BETWEEN_KZ", "OUTSIDE_KZ"}
+CAC_SCHEMA_LOCK = threading.Lock()
+CAC_STATE_SCHEMA_READY = False
+CAC_STATE_SCHEMA_CHECKED = False
+CAC_DECISION_SCHEMA_READY = False
+CAC_KZ_PERSIST_SCHEMA_READY = False
 
 
 def ensure_rm_state_schema(cur):
@@ -1025,6 +1079,183 @@ def ensure_rm_state_schema(cur):
             ON bot_param.rm_state_ack (env, account_login, scope, target_bot_kind, applied_at DESC)
         """
     )
+
+
+def ensure_cac_state_schema(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_param.cac_state (
+            env                TEXT NOT NULL DEFAULT 'prod',
+            account_login      BIGINT NOT NULL,
+            source_id          TEXT NOT NULL,
+            mode               TEXT NOT NULL DEFAULT 'AUTO',
+            bot_state          TEXT NOT NULL DEFAULT 'MEASURE',
+            cfg_ver            BIGINT NOT NULL DEFAULT 0,
+            stale_sec          INTEGER NOT NULL DEFAULT 300,
+            server_utc_offset  INTEGER,
+            blocked            JSONB NOT NULL DEFAULT '[]'::jsonb,
+            payload_json        JSONB NOT NULL DEFAULT '{}'::jsonb,
+            reason             TEXT,
+            state_since        TIMESTAMPTZ,
+            last_transition_at TIMESTAMPTZ,
+            probe_until        TIMESTAMPTZ,
+            last_probe_at      TIMESTAMPTZ,
+            block_count_date   DATE,
+            block_count_today  INTEGER NOT NULL DEFAULT 0,
+            metrics_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
+            updated_by         TEXT,
+            updated_source     TEXT,
+            updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (env, account_login, source_id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_cac_state_account
+            ON bot_param.cac_state (env, account_login, source_id, updated_at DESC)
+        """
+    )
+    for ddl in (
+        "ALTER TABLE bot_param.cac_state ADD COLUMN IF NOT EXISTS state_since TIMESTAMPTZ",
+        "ALTER TABLE bot_param.cac_state ADD COLUMN IF NOT EXISTS last_transition_at TIMESTAMPTZ",
+        "ALTER TABLE bot_param.cac_state ADD COLUMN IF NOT EXISTS probe_until TIMESTAMPTZ",
+        "ALTER TABLE bot_param.cac_state ADD COLUMN IF NOT EXISTS last_probe_at TIMESTAMPTZ",
+        "ALTER TABLE bot_param.cac_state ADD COLUMN IF NOT EXISTS block_count_date DATE",
+        "ALTER TABLE bot_param.cac_state ADD COLUMN IF NOT EXISTS block_count_today INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE bot_param.cac_state ADD COLUMN IF NOT EXISTS metrics_json JSONB NOT NULL DEFAULT '{}'::jsonb",
+    ):
+        cur.execute(ddl)
+
+
+def ensure_cac_decision_log_schema(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_param.cac_decision_log (
+            id                 BIGSERIAL PRIMARY KEY,
+            ts                 TIMESTAMPTZ,
+            account_login      BIGINT,
+            bot                TEXT,
+            symbol             TEXT,
+            gate               TEXT,
+            action             TEXT,
+            kz_state           TEXT,
+            reason             TEXT,
+            saved_pl_snapshot  NUMERIC,
+            cfg_ver            BIGINT,
+            event_key          TEXT,
+            position_id        TEXT,
+            profit             NUMERIC,
+            payload_json       JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+        """
+    )
+    for ddl in (
+        "ALTER TABLE bot_param.cac_decision_log ADD COLUMN IF NOT EXISTS event_key TEXT",
+        "ALTER TABLE bot_param.cac_decision_log ADD COLUMN IF NOT EXISTS position_id TEXT",
+        "ALTER TABLE bot_param.cac_decision_log ADD COLUMN IF NOT EXISTS profit NUMERIC",
+        "ALTER TABLE bot_param.cac_decision_log ADD COLUMN IF NOT EXISTS payload_json JSONB NOT NULL DEFAULT '{}'::jsonb",
+    ):
+        cur.execute(ddl)
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_cac_decision_log_event_key
+            ON bot_param.cac_decision_log (event_key)
+            WHERE event_key IS NOT NULL
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_cac_decision_log_lookup
+            ON bot_param.cac_decision_log (account_login, bot, action, ts DESC)
+        """
+    )
+
+
+def ensure_cac_kz_state_schema(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_param.cac_kz_state (
+            env                    TEXT NOT NULL DEFAULT 'prod',
+            account_login          BIGINT NOT NULL,
+            source_id              TEXT NOT NULL,
+            state                  TEXT NOT NULL DEFAULT 'MEASURE',
+            since_ts               TIMESTAMPTZ,
+            since_ts_epoch         BIGINT,
+            last_transition_ts     TIMESTAMPTZ,
+            last_transition_epoch  BIGINT,
+            probe_until_ts         TIMESTAMPTZ,
+            probe_until_epoch      BIGINT,
+            last_probe_ts          TIMESTAMPTZ,
+            last_probe_epoch       BIGINT,
+            scan_cursor_ts         TIMESTAMPTZ,
+            scan_cursor_epoch      BIGINT,
+            ledger_json            TEXT NOT NULL DEFAULT '[]',
+            updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (env, account_login, source_id)
+        )
+        """
+    )
+    for ddl in (
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS since_ts_epoch BIGINT",
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS last_transition_ts TIMESTAMPTZ",
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS last_transition_epoch BIGINT",
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS probe_until_ts TIMESTAMPTZ",
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS probe_until_epoch BIGINT",
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS last_probe_ts TIMESTAMPTZ",
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS last_probe_epoch BIGINT",
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS scan_cursor_ts TIMESTAMPTZ",
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS scan_cursor_epoch BIGINT",
+        "ALTER TABLE bot_param.cac_kz_state ADD COLUMN IF NOT EXISTS ledger_json TEXT NOT NULL DEFAULT '[]'",
+    ):
+        cur.execute(ddl)
+
+
+def ensure_cac_state_schema_once(cur):
+    global CAC_STATE_SCHEMA_READY, CAC_STATE_SCHEMA_CHECKED
+    if CAC_STATE_SCHEMA_READY:
+        return
+    with CAC_SCHEMA_LOCK:
+        if CAC_STATE_SCHEMA_READY:
+            return
+        ensure_cac_state_schema(cur)
+        CAC_STATE_SCHEMA_READY = True
+        CAC_STATE_SCHEMA_CHECKED = True
+
+
+def ensure_cac_decision_log_schema_once(cur):
+    global CAC_DECISION_SCHEMA_READY
+    if CAC_DECISION_SCHEMA_READY:
+        return
+    with CAC_SCHEMA_LOCK:
+        if CAC_DECISION_SCHEMA_READY:
+            return
+        ensure_cac_decision_log_schema(cur)
+        CAC_DECISION_SCHEMA_READY = True
+
+
+def ensure_cac_kz_state_schema_once(cur):
+    global CAC_KZ_PERSIST_SCHEMA_READY
+    if CAC_KZ_PERSIST_SCHEMA_READY:
+        return
+    with CAC_SCHEMA_LOCK:
+        if CAC_KZ_PERSIST_SCHEMA_READY:
+            return
+        ensure_cac_kz_state_schema(cur)
+        CAC_KZ_PERSIST_SCHEMA_READY = True
+
+
+def cac_state_table_available(cur):
+    global CAC_STATE_SCHEMA_READY, CAC_STATE_SCHEMA_CHECKED
+    if CAC_STATE_SCHEMA_READY:
+        return True
+    with CAC_SCHEMA_LOCK:
+        if CAC_STATE_SCHEMA_READY:
+            return True
+        if not CAC_STATE_SCHEMA_CHECKED:
+            CAC_STATE_SCHEMA_READY = table_exists(cur, "bot_param", "cac_state")
+            CAC_STATE_SCHEMA_CHECKED = True
+        return CAC_STATE_SCHEMA_READY
 
 
 def normalize_rm_state_scope(scope):
@@ -1201,6 +1432,616 @@ def load_effective_rm_state(cur, env, account_login, bot_kind):
         "reason": " | ".join([row.get("reason") or "" for row in active_states if row.get("reason")]),
     }
     return account_state, bot_state, effective
+
+
+def normalize_cac_source_id(source_id):
+    value = (source_id or "").strip().lower()
+    if value not in CAC_KZ_PHASE_SOURCE_IDS:
+        raise ValueError("source_id must be one of CAC KZ phase bots")
+    return value
+
+
+def normalize_cac_mode(mode):
+    value = (mode or "AUTO").strip().upper()
+    if value not in {"OFF", "SHADOW", "ENFORCE", "AUTO"}:
+        raise ValueError("CAC mode must be OFF, SHADOW, ENFORCE, or AUTO")
+    return value
+
+
+def normalize_cac_bot_state(bot_state):
+    value = (bot_state or "MEASURE").strip().upper()
+    if value not in {"OFF", "DISABLED", "MEASURE", "ACTIVE", "PROBE"}:
+        raise ValueError("CAC bot_state must be OFF, DISABLED, MEASURE, ACTIVE, or PROBE")
+    return value
+
+
+def cac_norm_symbol(symbol):
+    return (symbol or "").strip().upper()
+
+
+def cac_symbol_has_prefix(symbol, tokens):
+    sym = cac_norm_symbol(symbol)
+    return any(sym.startswith(token) for token in tokens)
+
+
+def cac_nth_sunday_day(year, month, nth):
+    first = date(year, month, 1)
+    first_sunday = 1 + ((6 - first.weekday()) % 7)
+    return first_sunday + 7 * (nth - 1)
+
+
+def cac_is_us_dst(utc_dt):
+    if utc_dt.month < 3 or utc_dt.month > 11:
+        return False
+    if 3 < utc_dt.month < 11:
+        return True
+    if utc_dt.month == 3:
+        return utc_dt.day >= cac_nth_sunday_day(utc_dt.year, 3, 2)
+    return utc_dt.day < cac_nth_sunday_day(utc_dt.year, 11, 1)
+
+
+def cac_ny_open_minute_utc(utc_dt):
+    return 13 * 60 + 30 if cac_is_us_dst(utc_dt) else 14 * 60 + 30
+
+
+def cac_classify_single_open(minute_of_day, open_minute, primary_min, secondary_min):
+    delta = minute_of_day - open_minute
+    if delta < 0:
+        delta += 1440
+    if delta < primary_min:
+        return "PRIMARY"
+    if delta < primary_min + secondary_min:
+        return "SECONDARY"
+    return "OUTSIDE_KZ"
+
+
+def cac_classify_dual_open(minute_of_day, open_a, open_b, primary_min, secondary_min):
+    a, b = sorted((open_a, open_b))
+    state_a = cac_classify_single_open(minute_of_day, a, primary_min, secondary_min)
+    if state_a in {"PRIMARY", "SECONDARY"}:
+        return state_a
+    state_b = cac_classify_single_open(minute_of_day, b, primary_min, secondary_min)
+    if state_b in {"PRIMARY", "SECONDARY"}:
+        return state_b
+    end_a = a + primary_min + secondary_min
+    if end_a <= minute_of_day < b:
+        return "BETWEEN_KZ"
+    return "OUTSIDE_KZ"
+
+
+def cac_classify_symbol_utc(symbol, utc_dt, primary_min=90, secondary_min=90):
+    if utc_dt.tzinfo is not None:
+        utc_dt = utc_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    sym = cac_norm_symbol(symbol)
+    minute = utc_dt.hour * 60 + utc_dt.minute
+    primary = max(1, int(primary_min or 90))
+    secondary = max(1, int(secondary_min or 90))
+    london = 7 * 60
+    tokyo = 0
+    au = 23 * 60
+    china = 1 * 60 + 30
+    ny = cac_ny_open_minute_utc(utc_dt)
+
+    if cac_symbol_has_prefix(sym, ("US30", "US500", "USTEC", "US2000")):
+        return cac_classify_single_open(minute, ny, primary, secondary)
+    if cac_symbol_has_prefix(sym, (
+        "DE40", "UK100", "F40", "IT40", "ES35", "STOXX50", "EURUSD", "EURGBP",
+        "GBPUSD", "EURAUD", "USDCHF", "USDSEK", "USDCAD", "NZDUSD", "AUDUSD",
+    )):
+        return cac_classify_single_open(minute, london, primary, secondary)
+    if cac_symbol_has_prefix(sym, ("XAUUSD", "XAGUSD", "XBRUSD", "XTIUSD")):
+        return cac_classify_dual_open(minute, london, ny, primary, secondary)
+    if cac_symbol_has_prefix(sym, ("JP225", "USDJPY", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY")):
+        return cac_classify_dual_open(minute, tokyo, london, primary, secondary)
+    if cac_symbol_has_prefix(sym, ("AUS200",)):
+        return cac_classify_single_open(minute, au, primary, secondary)
+    if cac_symbol_has_prefix(sym, ("CHINA50", "HK50", "USDCNH")):
+        return cac_classify_single_open(minute, china, primary, secondary)
+    if cac_symbol_has_prefix(sym, ("USDSGD", "USDHKD", "EURHKD")):
+        return cac_classify_single_open(minute, tokyo, primary, secondary)
+    return "UNCLASSIFIED"
+
+
+def cac_trading_days_between(start_dt, end_dt):
+    if not start_dt or not end_dt or end_dt <= start_dt:
+        return 0
+    start_day = start_dt.astimezone(timezone.utc).date() if start_dt.tzinfo else start_dt.date()
+    end_day = end_dt.astimezone(timezone.utc).date() if end_dt.tzinfo else end_dt.date()
+    days = 0
+    cur_day = start_day
+    while cur_day <= end_day:
+        if cur_day.weekday() < 5:
+            days += 1
+        cur_day += timedelta(days=1)
+    return days
+
+
+def cac_utc_aware(value):
+    if not value:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def cac_transition_allowed(row, now_utc, min_dwell_days):
+    if not row:
+        return True
+    last = cac_utc_aware(row.get("last_transition_at") or row.get("state_since"))
+    if not last:
+        return True
+    return now_utc - last >= timedelta(days=max(0, int(min_dwell_days or 0)))
+
+
+def cac_payload_cfg(item: BotRuntimeCacStateItem):
+    return {
+        "primary_min": max(1, int(item.primary_min or 90)),
+        "secondary_min": max(1, int(item.secondary_min or 90)),
+        "auto_min_days": max(1, int(item.auto_min_days or 7)),
+        "auto_min_trades": max(1, int(item.auto_min_trades or 20)),
+        "auto_promote_abs": max(0.0, float(item.auto_promote_abs or 0.0)),
+        "auto_max_win_share": min(1.0, max(0.0, float(item.auto_max_win_share if item.auto_max_win_share is not None else 0.45))),
+        "probe_every_days": max(1, int(item.probe_every_days or 28)),
+        "probe_days": max(1, int(item.probe_days or 7)),
+        "min_dwell_days": max(0, int(item.min_dwell_days or 0)),
+        "max_blocks_per_day": max(1, int(item.max_blocks_per_day or 40)),
+        "demote_drop_abs": max(0.0, float(item.demote_drop_abs or 0.0)),
+    }
+
+
+def cac_metric_passes_criterion_a(metrics, cfg):
+    trades = int(metrics.get("trades") or 0)
+    saved_pl = float(metrics.get("saved_pl") or 0.0)
+    win_share = float(metrics.get("win_share") or 0.0)
+    obs_days = int(metrics.get("obs_days") or 0)
+    return (
+        obs_days >= cfg["auto_min_days"]
+        and trades >= cfg["auto_min_trades"]
+        and saved_pl >= cfg["auto_promote_abs"]
+        and win_share < cfg["auto_max_win_share"]
+    )
+
+
+def cac_metric_reason(metrics, cfg):
+    return (
+        f"trades={int(metrics.get('trades') or 0)}/{cfg['auto_min_trades']} "
+        f"obs_days={int(metrics.get('obs_days') or 0)}/{cfg['auto_min_days']} "
+        f"saved_pl={float(metrics.get('saved_pl') or 0.0):.2f}/{cfg['auto_promote_abs']:.2f} "
+        f"win_share={float(metrics.get('win_share') or 0.0):.2f}<{cfg['auto_max_win_share']:.2f}"
+    )
+
+
+def cac_load_existing_state(cur, env, account_login, source_id):
+    ensure_cac_state_schema_once(cur)
+    cur.execute(
+        """
+        SELECT env,
+               account_login,
+               source_id,
+               mode,
+               bot_state,
+               cfg_ver,
+               stale_sec,
+               server_utc_offset,
+               blocked,
+               payload_json,
+               reason,
+               state_since,
+               last_transition_at,
+               probe_until,
+               last_probe_at,
+               block_count_date,
+               block_count_today,
+               metrics_json,
+               updated_by,
+               updated_source,
+               updated_at
+          FROM bot_param.cac_state
+         WHERE env = %s
+           AND account_login = %s
+           AND source_id = %s
+        """,
+        (env, int(account_login), source_id),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def cac_insert_transition_log(cur, account_login, source_id, action, reason, cfg_ver, metrics=None):
+    ensure_cac_decision_log_schema_once(cur)
+    now_utc = datetime.now(timezone.utc)
+    event_key = f"TR|{int(account_login)}|{source_id}|{action}|{int(now_utc.timestamp())}"
+    cur.execute(
+        """
+        INSERT INTO bot_param.cac_decision_log (
+            ts, account_login, bot, symbol, gate, action, kz_state, reason,
+            saved_pl_snapshot, cfg_ver, event_key, payload_json
+        )
+        VALUES (%s, %s, %s, '', 'KZ', %s, '', %s, %s, %s, %s, %s)
+        ON CONFLICT (event_key) DO NOTHING
+        """,
+        (
+            now_utc,
+            int(account_login),
+            source_id,
+            action,
+            reason,
+            Decimal(str((metrics or {}).get("saved_pl") or 0)),
+            int(cfg_ver or 0),
+            event_key,
+            Json(metrics or {}),
+        ),
+    )
+
+
+def cac_load_positions_for_shadow(cur, account_login, source_ids, lookback_days):
+    since = datetime.now() - timedelta(days=max(1, int(lookback_days or 28)) + 2)
+    cur.execute(
+        """
+        SELECT lower(coalesce(nullif(source_id::text, ''), 'unknown')) AS source_id,
+               coalesce(sym::text, '') AS symbol,
+               NULLIF(time_open::text, '')::timestamp AS opened_at,
+               coalesce(position::text, '') AS position_id,
+               NULLIF(profit::text, '')::numeric AS profit
+          FROM finexpert.cust_positions
+         WHERE account_login::text = %s
+           AND lower(coalesce(nullif(source_id::text, ''), 'unknown')) = ANY(%s)
+           AND NULLIF(time_open::text, '') IS NOT NULL
+           AND NULLIF(profit::text, '') IS NOT NULL
+           AND NULLIF(time_open::text, '')::timestamp >= %s
+        """,
+        (str(int(account_login)), list(source_ids), since),
+    )
+    return [dict(row) for row in cur.fetchall()]
+
+
+def cac_insert_would_block_from_positions(cur, account_login, items, existing_rows):
+    ensure_cac_decision_log_schema_once(cur)
+    by_source = {normalize_cac_source_id(item.source_id): item for item in items}
+    rows = []
+    for pos in existing_rows:
+        source_id = (pos.get("source_id") or "").strip().lower()
+        item = by_source.get(source_id)
+        if not item:
+            continue
+        symbol = cac_norm_symbol(pos.get("symbol"))
+        opened_at = pos.get("opened_at")
+        if not symbol or not opened_at:
+            continue
+        offset = int(item.server_utc_offset or 0)
+        opened_utc = opened_at - timedelta(hours=offset)
+        state = cac_classify_symbol_utc(symbol, opened_utc, item.primary_min, item.secondary_min)
+        if state not in CAC_KZ_BLOCK_STATES:
+            continue
+        profit = Decimal(str(pos.get("profit") or 0))
+        position_id = str(pos.get("position_id") or "")
+        opened_key = opened_at.isoformat(sep=" ", timespec="seconds")
+        event_key = f"WB|{int(account_login)}|{source_id}|{symbol}|{opened_key}|{position_id}"
+        saved = -profit
+        rows.append(
+            (
+                opened_utc.replace(tzinfo=timezone.utc),
+                int(account_login),
+                source_id,
+                symbol,
+                "WOULD_BLOCK",
+                state,
+                "shadow position opened in CAC would-block zone",
+                saved,
+                int(item.cfg_ver or 0),
+                event_key,
+                position_id,
+                profit,
+                Json({"opened_server": opened_key, "server_utc_offset": offset}),
+            )
+        )
+    if not rows:
+        return 0
+    execute_values(
+        cur,
+        """
+        INSERT INTO bot_param.cac_decision_log (
+            ts, account_login, bot, symbol, gate, action, kz_state, reason,
+            saved_pl_snapshot, cfg_ver, event_key, position_id, profit, payload_json
+        )
+        VALUES %s
+        ON CONFLICT (event_key) DO NOTHING
+        """,
+        rows,
+        page_size=500,
+    )
+    return len(rows)
+
+
+def cac_load_metrics(cur, account_login, source_id, state_since, lookback_days, cfg):
+    ensure_cac_decision_log_schema_once(cur)
+    now_utc = datetime.now(timezone.utc)
+    since = state_since or (now_utc - timedelta(days=max(1, int(lookback_days or 28))))
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    cur.execute(
+        """
+        SELECT count(*) AS trades,
+               coalesce(sum(profit), 0) AS profit_sum,
+               coalesce(sum(saved_pl_snapshot), 0) AS saved_pl,
+               count(*) FILTER (WHERE profit > 0) AS wins,
+               count(*) FILTER (WHERE profit < 0) AS losses
+          FROM bot_param.cac_decision_log
+         WHERE account_login = %s
+           AND lower(bot) = %s
+           AND action = 'WOULD_BLOCK'
+           AND ts::timestamptz >= %s
+        """,
+        (int(account_login), source_id, since),
+    )
+    row = dict(cur.fetchone() or {})
+    trades = int(row.get("trades") or 0)
+    wins = int(row.get("wins") or 0)
+    saved_pl = float(row.get("saved_pl") or 0.0)
+    metrics = {
+        "trades": trades,
+        "wins": wins,
+        "losses": int(row.get("losses") or 0),
+        "saved_pl": round(saved_pl, 2),
+        "profit_sum": round(float(row.get("profit_sum") or 0.0), 2),
+        "win_share": round((wins / trades) if trades else 0.0, 4),
+        "obs_days": cac_trading_days_between(since, now_utc),
+    }
+    return metrics
+
+
+def cac_load_block_count_today(cur, account_login, source_id):
+    ensure_cac_decision_log_schema_once(cur)
+    cur.execute(
+        """
+        SELECT count(*) AS blocks
+          FROM bot_param.cac_decision_log
+         WHERE account_login = %s
+           AND lower(bot) = %s
+           AND action = 'BLOCKED'
+           AND ts::timestamptz >= date_trunc('day', now())
+        """,
+        (int(account_login), source_id),
+    )
+    row = dict(cur.fetchone() or {})
+    return int(row.get("blocks") or 0)
+
+
+def cac_load_weekly_pl(cur, account_login, source_id):
+    cur.execute(
+        """
+        SELECT coalesce(sum(NULLIF(profit::text, '')::numeric), 0) AS profit
+          FROM finexpert.cust_positions
+         WHERE account_login::text = %s
+           AND lower(coalesce(nullif(source_id::text, ''), 'unknown')) = %s
+           AND NULLIF(profit::text, '') IS NOT NULL
+           AND NULLIF(time_close::text, '') IS NOT NULL
+           AND NULLIF(time_close::text, '')::timestamp >= (now() AT TIME ZONE 'UTC') - interval '7 days'
+        """,
+        (str(int(account_login)), source_id),
+    )
+    row = dict(cur.fetchone() or {})
+    return float(row.get("profit") or 0.0)
+
+
+def cac_updated_at_epoch(row):
+    updated_at = row.get("updated_at") if row else None
+    if isinstance(updated_at, datetime):
+        return int(updated_at.timestamp())
+    return 0
+
+
+def cac_state_row_dict(row):
+    if not row:
+        return None
+    result = dict(row)
+    blocked = result.get("blocked")
+    if blocked is None:
+        blocked = []
+    result["blocked"] = blocked
+    if result.get("metrics_json") is None:
+        result["metrics_json"] = {}
+    result["updated_at_epoch"] = cac_updated_at_epoch(result)
+    return result
+
+
+def upsert_cac_state(cur, env, account_login, item: BotRuntimeCacStateItem, updated_by):
+    ensure_cac_state_schema_once(cur)
+    source_id = normalize_cac_source_id(item.source_id)
+    mode = normalize_cac_mode(item.mode)
+    stale_sec = max(30, int(item.stale_sec or 300))
+    incoming_state = normalize_cac_bot_state(item.bot_state)
+    cfg = cac_payload_cfg(item)
+    now_utc = datetime.now(timezone.utc)
+    metrics = dict(item.metrics or {})
+    metrics["criterion_a"] = cac_metric_passes_criterion_a(metrics, cfg)
+
+    bot_state = incoming_state
+    blocked = item.blocked or []
+    reason = (item.reason or "").strip()
+    state_since = datetime.fromtimestamp(int(item.state_since_epoch), tz=timezone.utc) if item.state_since_epoch else now_utc
+    last_transition_at = datetime.fromtimestamp(int(item.last_transition_epoch), tz=timezone.utc) if item.last_transition_epoch else None
+    probe_until = datetime.fromtimestamp(int(item.probe_until_epoch), tz=timezone.utc) if item.probe_until_epoch else None
+    last_probe_at = datetime.fromtimestamp(int(item.last_probe_epoch), tz=timezone.utc) if item.last_probe_epoch else None
+    block_count_today = int(metrics.get("block_count_today") or 0)
+
+    if mode == "OFF":
+        bot_state = "OFF"
+        blocked = []
+        reason = "CAC_KZ_Mode=OFF"
+    elif incoming_state == "DISABLED":
+        bot_state = "DISABLED"
+        blocked = []
+        reason = "source disabled by CAC_KZ_Bots"
+    elif mode == "SHADOW":
+        bot_state = "MEASURE"
+        reason = "CAC_KZ_Mode=SHADOW " + cac_metric_reason(metrics, cfg)
+    elif mode == "ENFORCE":
+        bot_state = "ACTIVE"
+        blocked = item.would_blocked or item.blocked or []
+        reason = "CAC_KZ_Mode=ENFORCE"
+    elif mode == "AUTO":
+        if bot_state == "ACTIVE":
+            blocked = item.blocked or item.would_blocked or []
+        else:
+            blocked = []
+        if not reason:
+            reason = f"AUTO {bot_state} " + cac_metric_reason(metrics, cfg)
+
+    payload = {
+        "source_id": source_id,
+        "mode": mode,
+        "bot_state": bot_state,
+        "cfg_ver": int(item.cfg_ver or 0),
+        "stale_sec": stale_sec,
+        "server_utc_offset": item.server_utc_offset,
+        "blocked": blocked,
+        "would_blocked": item.would_blocked or [],
+        "auto": cfg,
+        "metrics": metrics,
+        "reason": reason,
+    }
+    cur.execute(
+        """
+        INSERT INTO bot_param.cac_state (
+            env, account_login, source_id, mode, bot_state, cfg_ver, stale_sec,
+            server_utc_offset, blocked, payload_json, reason, state_since,
+            last_transition_at, probe_until, last_probe_at, block_count_date,
+            block_count_today, metrics_json, updated_by, updated_source, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                (now() AT TIME ZONE 'UTC')::date, %s, %s, %s, 'rm_controller', now())
+        ON CONFLICT (env, account_login, source_id)
+        DO UPDATE SET
+            mode = EXCLUDED.mode,
+            bot_state = EXCLUDED.bot_state,
+            cfg_ver = EXCLUDED.cfg_ver,
+            stale_sec = EXCLUDED.stale_sec,
+            server_utc_offset = EXCLUDED.server_utc_offset,
+            blocked = EXCLUDED.blocked,
+            payload_json = EXCLUDED.payload_json,
+            reason = EXCLUDED.reason,
+            state_since = EXCLUDED.state_since,
+            last_transition_at = EXCLUDED.last_transition_at,
+            probe_until = EXCLUDED.probe_until,
+            last_probe_at = EXCLUDED.last_probe_at,
+            block_count_date = EXCLUDED.block_count_date,
+            block_count_today = EXCLUDED.block_count_today,
+            metrics_json = EXCLUDED.metrics_json,
+            updated_by = EXCLUDED.updated_by,
+            updated_source = EXCLUDED.updated_source,
+            updated_at = now()
+        RETURNING env,
+                  account_login,
+                  source_id,
+                  mode,
+                  bot_state,
+                  cfg_ver,
+                  stale_sec,
+                  server_utc_offset,
+                  blocked,
+                  reason,
+                  state_since,
+                  last_transition_at,
+                  probe_until,
+                  last_probe_at,
+                  block_count_date,
+                  block_count_today,
+                  metrics_json,
+                  updated_by,
+                  updated_source,
+                  updated_at
+        """,
+        (
+            env,
+            int(account_login),
+            source_id,
+            mode,
+            bot_state,
+            int(item.cfg_ver or 0),
+            stale_sec,
+            item.server_utc_offset,
+            Json(blocked),
+            Json(payload),
+            reason or None,
+            state_since,
+            last_transition_at,
+            probe_until,
+            last_probe_at,
+            block_count_today,
+            Json(metrics),
+            updated_by,
+        ),
+    )
+    return cac_state_row_dict(cur.fetchone())
+
+
+def load_cac_state_for_source(cur, env, account_login, source_id):
+    value = (source_id or "").strip().lower()
+    if value not in CAC_KZ_PHASE_SOURCE_IDS:
+        return {
+            "ver": 0,
+            "source_id": value,
+            "mode": "AUTO",
+            "bot_state": "UNMANAGED",
+            "stale_sec": 300,
+            "updated_at_epoch": 0,
+            "blocked": [],
+        }
+    if not cac_state_table_available(cur):
+        return {
+            "ver": 0,
+            "source_id": value,
+            "mode": "AUTO",
+            "bot_state": "MEASURE",
+            "stale_sec": 300,
+            "updated_at_epoch": 0,
+            "blocked": [],
+        }
+    cur.execute(
+        """
+        SELECT env,
+               account_login,
+               source_id,
+               mode,
+               bot_state,
+               cfg_ver,
+	               stale_sec,
+	               server_utc_offset,
+	               blocked,
+	               reason,
+	               metrics_json,
+	               updated_at
+          FROM bot_param.cac_state
+         WHERE env = %s
+           AND account_login = %s
+           AND source_id = %s
+        """,
+        (env, int(account_login), value),
+    )
+    row = cac_state_row_dict(cur.fetchone())
+    if not row:
+        return {
+            "ver": 0,
+            "source_id": value,
+            "mode": "AUTO",
+            "bot_state": "MEASURE",
+            "stale_sec": 300,
+            "updated_at_epoch": 0,
+            "blocked": [],
+        }
+    return {
+        "ver": int(row.get("cfg_ver") or 0),
+        "source_id": row.get("source_id"),
+        "mode": row.get("mode"),
+        "bot_state": row.get("bot_state"),
+        "stale_sec": int(row.get("stale_sec") or 300),
+        "server_utc_offset": row.get("server_utc_offset"),
+        "updated_at_epoch": int(row.get("updated_at_epoch") or 0),
+        "reason": row.get("reason"),
+        "metrics": row.get("metrics_json") or {},
+        "blocked": row.get("blocked") or [],
+    }
 
 
 def bot_runtime_load_changed_params(cur, env, account_login, bot_kind, bot_id, old_version_no, new_version_no, active_config_id):
@@ -6096,6 +6937,38 @@ async def bot_runtime_rm_state_update(req: BotRuntimeRmStateUpdateRequest, reque
         conn.close()
 
 
+@app.post("/bot-runtime/cac-state/update")
+async def bot_runtime_cac_state_update(req: BotRuntimeCacStateUpdateRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    try:
+        env, account_login, bot_kind, bot_id, source_id, instance_id = normalize_runtime_identity(req)
+        if bot_kind != RM_CONTROLLER_BOT or bot_id != RM_CONTROLLER_BOT_ID:
+            raise ValueError("only rm_controller can update CAC state")
+        if not req.states:
+            raise ValueError("states must be non-empty")
+    except ValueError as exc:
+        return bot_runtime_json_error(400, str(exc))
+
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            rows = [upsert_cac_state(cur, env, account_login, item, instance_id) for item in req.states]
+            bot_runtime_touch(cur, env, account_login, instance_id, "last_command_check_at")
+        conn.commit()
+        return {"ok": True, "cac_state": rows, "count": len(rows), "version": CODE_VERSION}
+    except (InvalidOperation, ValueError) as exc:
+        conn.rollback()
+        return bot_runtime_json_error(400, str(exc))
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
 @app.post("/bot-runtime/rm-state")
 async def bot_runtime_rm_state(req: BotRuntimeBaseRequest, request: Request):
     auth = require_bot_runtime_api(request)
@@ -6111,6 +6984,7 @@ async def bot_runtime_rm_state(req: BotRuntimeBaseRequest, request: Request):
     try:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             account_state, bot_state, effective = load_effective_rm_state(cur, env, account_login, bot_kind)
+            cac_state = load_cac_state_for_source(cur, env, account_login, source_id)
             bot_runtime_touch(cur, env, account_login, instance_id, "last_command_check_at")
         conn.commit()
         return {
@@ -6124,6 +6998,7 @@ async def bot_runtime_rm_state(req: BotRuntimeBaseRequest, request: Request):
             "account_state": account_state,
             "bot_state": bot_state,
             "effective_state": effective,
+            "cac": cac_state,
             "version": CODE_VERSION,
         }
     except Exception as exc:
@@ -6524,6 +7399,12 @@ async def db_write(req: DbWriteRequest, request: Request):
     conn = psycopg2.connect(db_url, sslmode="require")
     conn.autocommit = False
     try:
+        if schema == "bot_param" and table == "cac_kz_state":
+            with conn.cursor() as cur:
+                ensure_cac_kz_state_schema_once(cur)
+        if schema == "bot_param" and table == "cac_decision_log":
+            with conn.cursor() as cur:
+                ensure_cac_decision_log_schema_once(cur)
         ensure_table_for_rows(conn, schema, table, columns, rows[0])
         sql = f"INSERT INTO {schema}.{table} ({', '.join(columns)}) VALUES %s"
         values = [[r.get(c) for c in columns] for r in rows]
