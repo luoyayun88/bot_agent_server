@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-CODE_VERSION = "v1.11"
+CODE_VERSION = "v1.13"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -172,6 +172,7 @@ class BotRuntimeParamValue(BaseModel):
 class BotRuntimeResolveOnInitRequest(BotRuntimeBaseRequest):
     program_defaults: List[BotRuntimeParamValue] = []
     input_values: List[BotRuntimeParamValue] = []
+    selection_schema_version: Optional[int] = None
 
 
 class BotRuntimeFinishRequest(BaseModel):
@@ -806,6 +807,91 @@ def runtime_param_map(items):
         value = "" if item.value is None else str(item.value).strip()
         out[input_param] = value
     return out
+
+
+def n456_selection_param_names(bot_kind, schema_version):
+    if schema_version == 1:
+        return {
+            "UseTF_" + tf for tf in ("M1", "M2", "M3", "M5", "M10", "M15", "M30", "H1")
+        } | {
+            "InpGroupTradeTFs" + group
+            for group in ("FX", "FXJPY", "Commodities", "CommoditiesOil", "Indices", "IndicesOther")
+        }
+    names = {"InpMarketMode", "InpSelectedSymbols"} | {
+        "InpTrade_" + tf
+        for tf in ("M1", "M2", "M3", "M5", "M10", "M15", "M20", "M30", "H1", "H2", "H4", "H6", "H8", "H12", "D1")
+    }
+    if bot_kind == "n6":
+        names.add("InpUseH1DirectionFilter")
+    return names
+
+
+def n456_is_selection_param(name):
+    return (
+        name in ("InpMarketMode", "InpSelectedSymbols", "InpUseH1DirectionFilter")
+        or name.startswith(("InpTrade_", "UseTF_", "InpGroupTradeTFs"))
+    )
+
+
+def n456_selection_schema_error(bot_kind, caller_schema, catalog, program_defaults, input_values):
+    """Reject incompatible N456 builds/catalogs before the resolver can write."""
+    if bot_kind not in ("n4", "n5", "n6"):
+        return None
+    caller_schema = 1 if caller_schema in (None, 0, 1) else caller_schema
+    if caller_schema not in (1, 2):
+        return f"Unsupported N456 selection schema {caller_schema}; supported versions are 1 and 2"
+
+    catalog_names = [(item.get("input_param") or "").strip() for item in catalog]
+    selection_names = [name for name in catalog_names if n456_is_selection_param(name)]
+    has_new_selection = any(
+        name in ("InpMarketMode", "InpSelectedSymbols", "InpUseH1DirectionFilter") or name.startswith("InpTrade_")
+        for name in selection_names
+    )
+    catalog_schema = 2 if has_new_selection else 1
+    expected = n456_selection_param_names(bot_kind, catalog_schema)
+    if set(selection_names) != expected or len(selection_names) != len(expected):
+        missing = ",".join(sorted(expected - set(selection_names))) or "none"
+        unexpected = ",".join(sorted(set(selection_names) - expected)) or "none"
+        return f"Incomplete or mixed N456 selection catalog for {bot_kind}: missing={missing}; unexpected={unexpected}"
+    if caller_schema != catalog_schema:
+        return (
+            f"N456 selection schema mismatch for {bot_kind}: EA={caller_schema}, catalog={catalog_schema}. "
+            "Install the matching EA and migrate the catalog/configuration together; no configuration was changed."
+        )
+    for label, values in (("program_defaults", program_defaults), ("input_values", input_values)):
+        actual = {name for name in values if n456_is_selection_param(name)}
+        if actual != expected:
+            missing = ",".join(sorted(expected - actual)) or "none"
+            unexpected = ",".join(sorted(actual - expected)) or "none"
+            return f"N456 {label} does not match selection schema {caller_schema}: missing={missing}; unexpected={unexpected}"
+    return None
+
+
+def n456_selection_config_error(bot_kind, caller_schema, catalog, config):
+    """A new catalog must not silently bootstrap new selectors into an old config."""
+    if bot_kind not in ("n4", "n5", "n6") or caller_schema != 2:
+        return None
+    required = n456_selection_param_names(bot_kind, 2)
+    missing = [
+        item["input_param"] for item in catalog
+        if item["input_param"] in required and json_path_get(config, item["param_path"]) is None
+    ]
+    old_common = config.get("common") or {}
+    old_groups = config.get("group_execution") or {}
+    old_inputs = config.get("inputs") or {}
+    has_old_selection = (
+        isinstance(old_common, dict) and any(name.startswith("UseTF_") for name in old_common)
+    ) or (isinstance(old_groups, dict) and "trade_tfs" in old_groups) or (
+        isinstance(old_inputs, dict)
+        and any(name.startswith(("UseTF_", "InpGroupTradeTFs", "Active_", "TradeTFs_")) for name in old_inputs)
+    )
+    if missing or has_old_selection:
+        return (
+            f"N456 active configuration for {bot_kind} has not been migrated to selection schema 2 "
+            f"(missing={','.join(sorted(missing)) or 'none'}, legacy_selection={has_old_selection}). "
+            "Publish the prepared seed before restarting the new EA; no configuration was changed."
+        )
+    return None
 
 
 def json_path_get(config, path):
@@ -2114,15 +2200,17 @@ RM_CONTROL_ACTION_COMMANDS = {
     "resume": "resume",
     "rm_daystart": "rm_daystart",
     "rm_reset": "rm_reset",
+    "rm_ratchet_rearm": "rm ratchet rearm",
 }
 RM_CONTROL_COMMAND_DESCRIPTIONS = {
     "status": "Show account RM state, active account stop, per-bot stops and runtime heartbeat.",
     "config": "Show current RM limits and owner configuration.",
     "stop_account": "Stop trading on the selected account until the selected period expires or resume is sent.",
     "pause_account": "Pause new trading on the selected account without flattening open positions.",
-    "resume": "Clear current account stop and keep today's baseline.",
+    "resume": "Clear current account stop and keep today's baseline. Does not rearm profit protection (T5).",
     "rm_daystart": "Clear current account stop and restore today's day-start baseline.",
-    "rm_reset": "Rearm RM from current balance/equity.",
+    "rm_reset": "Reset account RM from current balance/equity. Does not rearm profit protection (T5).",
+    "rm_ratchet_rearm": "Start a new profit-protection (T5) cycle with the applied settings. Keeps today's baseline and current account/bot stops. Does not resume trading. Requires RM Controller 2.02 or newer.",
     "stop_bots": "Hard stop for selected bot families: FLATTEN_AND_HALT. Blocks new entries and tells bots to flatten/close open positions.",
     "pause_bots": "Soft pause for selected bot families: HALT_ONLY. Blocks new entries, but keeps open positions running. No flatten.",
     "resume_bots": "Clear stops for selected bot families.",
@@ -2516,7 +2604,39 @@ def rm_controller_choices(input_param):
     return []
 
 
+def ensure_rm_ratchet_rearm_supported(cur, account):
+    # Older controllers acknowledge unknown commands without executing them.
+    # Check the most recent controller heartbeat before queueing this new action.
+    cur.execute(
+        """
+        SELECT status,
+               runtime_json->>'rm_version' AS rm_version,
+               last_seen_at >= now() - interval '2 minutes' AS heartbeat_fresh
+          FROM bot_param.bot_runtime_status
+         WHERE env = 'prod'
+           AND account_login = %s
+           AND bot_kind = 'rm_controller'
+           AND bot_id = 'rm_controller'
+         ORDER BY last_seen_at DESC
+         LIMIT 1
+        """,
+        (account,),
+    )
+    row = cur.fetchone()
+    if not row or not row["heartbeat_fresh"] or row["status"] != "running":
+        raise ValueError(f"account {account}: wait for a fresh RM Controller heartbeat before rearming T5")
+    version = str(row["rm_version"] or "").strip()
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", version)
+    if not match or tuple(int(part or 0) for part in match.groups()) < (2, 2, 0):
+        raise ValueError(
+            f"account {account}: T5 rearm requires RM Controller 2.02 or newer "
+            f"(reported: {version or 'unknown'}). Update the controller and wait for its heartbeat."
+        )
+
+
 def insert_rm_control_command(cur, account, actor, command_text, reason, action):
+    if action == "rm_ratchet_rearm":
+        ensure_rm_ratchet_rearm_supported(cur, account)
     payload = {
         "command": command_text,
         "actor": actor,
@@ -3110,6 +3230,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
               <option value="resume">Resume account</option>
               <option value="rm_daystart">RM daystart</option>
               <option value="rm_reset">RM reset</option>
+              <option value="rm_ratchet_rearm">Rearm profit protection (T5)</option>
               <option value="stop_bots">Stop selected bots - close positions</option>
               <option value="pause_bots">Pause selected bots - keep positions</option>
               <option value="resume_bots">Resume selected bots</option>
@@ -3221,9 +3342,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       config: 'Show current RM limits and owner configuration.',
       stop_account: 'Stop trading on the selected account for the selected period.',
       pause_account: 'Pause new trading on the selected account without flattening open positions.',
-      resume: "Clear current account stop and keep today's baseline.",
+      resume: "Clear current account stop and keep today's baseline. Does not rearm profit protection (T5).",
       rm_daystart: "Clear current account stop and restore today's day-start baseline.",
-      rm_reset: 'Rearm RM from current balance/equity.',
+      rm_reset: 'Reset account RM from current balance/equity. Does not rearm profit protection (T5).',
+      rm_ratchet_rearm: "Start a new profit-protection (T5) cycle with the applied settings. Keeps today's baseline and current account/bot stops. Does not resume trading. Requires RM Controller 2.02 or newer.",
       stop_bots: 'Hard stop for selected bot families: FLATTEN_AND_HALT.\nBlocks new entries and tells bots to flatten/close open positions for the selected period.',
       pause_bots: 'Soft pause for selected bot families: HALT_ONLY.\nBlocks new entries for the selected period, but keeps open positions running. No flatten.',
       resume_bots: 'Clear stops for selected bot families.'
@@ -3532,7 +3654,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         config: 'config',
         resume: 'resume',
         rm_daystart: 'rm_daystart',
-        rm_reset: 'rm_reset'
+        rm_reset: 'rm_reset',
+        rm_ratchet_rearm: 'rm ratchet rearm'
       }[action] || action;
     }
 
@@ -6778,9 +6901,23 @@ async def bot_runtime_config_resolve_on_init(req: BotRuntimeResolveOnInitRequest
                 conn.rollback()
                 return bot_runtime_json_error(404, f"param catalog not found for bot_kind={bot_kind}")
 
+            schema_error = n456_selection_schema_error(
+                bot_kind, req.selection_schema_version, catalog, program_defaults, input_values
+            )
+            if schema_error:
+                conn.rollback()
+                return bot_runtime_json_error(409, schema_error)
+
             current = load_runtime_current_config(cur, env, account_login, bot_kind, bot_id)
             old_version_no = req.applied_version_no
             current_config = dict(current["config_json"] or {}) if current else {}
+            if current:
+                schema_error = n456_selection_config_error(
+                    bot_kind, req.selection_schema_version, catalog, current_config
+                )
+                if schema_error:
+                    conn.rollback()
+                    return bot_runtime_json_error(409, schema_error)
             effective_config = json.loads(json.dumps(current_config, separators=(",", ":"), ensure_ascii=False)) if current_config else {}
             changed_params = []
             has_db_config = current is not None
@@ -7431,4 +7568,3 @@ async def neuro_refresh(req: NeuroRefreshRequest):
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
-
