@@ -8,6 +8,8 @@ from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta, date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from analytics.config_market_tf_validation import validate_market_tf_config, is_market_tf_param, terminal_market_tf_list_error
+from analytics.config_market_tf_status import configuration_application_status
 
 try:
     import psycopg2
@@ -23,7 +25,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-CODE_VERSION = "v1.13"
+CODE_VERSION = "v1.14"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -1008,7 +1010,142 @@ def load_runtime_current_config(cur, env, account_login, bot_kind, bot_id):
     return dict(row) if row else None
 
 
+def validate_config_market_tf_publication(bot, config):
+    """Validate exactly what will reach MQL, including inactive nonempty lists."""
+    result = validate_market_tf_config(bot, config)
+    errors = list(result["errors"])
+    inputs = (config.get("inputs") or {}) if isinstance(config, dict) else {}
+    for field in result["fields"]:
+        name = field["input_param"]
+        if name.endswith(("Whitelist", "Stoplist")):
+            message = terminal_market_tf_list_error(str(inputs.get(name, "")))
+            if message:
+                errors.append({"input_param": name, "message": message})
+    if errors:
+        raise ValueError("; ".join(f"{item['input_param']}: {item['message']}" for item in errors))
+    return result
+
+
+def config_ui_target_accounts(req):
+    accounts = [int(req.account_login)]
+    values = list(req.copy_to_account_logins or [])
+    if req.copy_to_account_login is not None:
+        values.append(req.copy_to_account_login)
+    for value in values:
+        account = int(value)
+        if account == accounts[0]:
+            raise ValueError("target account must differ from source account")
+        if account not in accounts:
+            accounts.append(account)
+    if len(accounts) > 100:
+        raise ValueError("too many target accounts")
+    return sorted(accounts)
+
+
+def config_ui_prepare_market_tf(cur, req, bot, accounts, lock=False):
+    """Resolve authorized editor rows, then validate each complete candidate.
+
+    The caller checks account permissions. No versions, commands, or editor
+    values are written. Lock current pointers in account order for save so
+    validation cannot race another form publication.
+    """
+    if len(req.changes) > 100:
+        raise ValueError("too many changes")
+    row_ids = [int(change.row_id) for change in req.changes]
+    if len(row_ids) != len(set(row_ids)):
+        raise ValueError("duplicate parameter rows")
+    cur.execute(
+        """
+        SELECT e.row_id, e.input_param, pc.param_path, pc.value_type
+          FROM bot_param.bot_config_user_editor e
+          JOIN bot_param.bot_config_param_catalog pc
+            ON pc.bot_kind = e.bot
+           AND COALESCE(pc.input_param_name, pc.param_key) = e.input_param
+           AND COALESCE(pc.user_editable, true) = true
+         WHERE e.account_login = %s AND e.bot = %s AND e.row_id = ANY(%s)
+        """,
+        (req.account_login, bot, row_ids),
+    )
+    rows = {int(row["row_id"]): dict(row) for row in cur.fetchall()}
+    values, names = {}, set()
+    for change in req.changes:
+        row = rows.get(int(change.row_id))
+        if row is None or not row.get("param_path"):
+            raise ValueError(f"row {change.row_id}: editable source row not found")
+        if row["input_param"] in names:
+            raise ValueError("duplicate parameter names")
+        names.add(row["input_param"])
+        value = str(change.value or "").strip()
+        if not value:
+            raise ValueError(f"{row['input_param']}: value is empty")
+        values[int(change.row_id)] = value
+    results = []
+    for account in accounts:
+        query = """
+            SELECT c.bot_id, c.active_version_no, c.config_hash, v.config_json
+              FROM bot_param.bot_config_current c
+              JOIN bot_param.bot_config_version v ON v.config_version_id = c.active_config_id
+             WHERE c.env = 'prod' AND c.account_login = %s AND c.bot_kind = %s
+             ORDER BY c.bot_id
+        """
+        if lock:
+            query += " FOR UPDATE OF c"
+        cur.execute(query, (account, bot))
+        currents = [dict(row) for row in cur.fetchall()]
+        if len(currents) != 1:
+            raise ValueError(f"account {account}: expected one current configuration for {bot}")
+        current = currents[0]
+        saved = current["config_json"]
+        if not isinstance(saved, dict) or ("inputs" in saved and not isinstance(saved["inputs"], dict)):
+            raise ValueError(f"account {account}: saved configuration and inputs must be JSON objects")
+        candidate = json.loads(json.dumps(saved))
+        for row_id, row in rows.items():
+            value = values[row_id] if is_market_tf_param(row["input_param"]) else coerce_config_json_value(values[row_id], row["value_type"])
+            json_path_set(candidate, row["param_path"], value)
+        result = validate_market_tf_config(bot, candidate)
+        # Normalize submitted fields only. Do not activate an old malformed
+        # saved whitelist as a side effect of changing an unrelated parameter.
+        normalized_values = dict(values)
+        for row_id, row in rows.items():
+            if is_market_tf_param(row["input_param"]):
+                normalized = json_path_get(result["config"], row["param_path"])
+                if normalized is not None:
+                    normalized_values[row_id] = normalize_runtime_param_value(normalized, row["value_type"])
+                    json_path_set(candidate, row["param_path"], normalized)
+        for field in result["fields"]:
+            name = field["input_param"]
+            message = terminal_market_tf_list_error(str((candidate.get("inputs") or {}).get(name, ""))) if name.endswith(("Whitelist", "Stoplist")) else None
+            if name not in names and message:
+                message = "Saved list: " + message
+                field["valid"] = False
+                field["error"] = message
+                result["errors"].append({"input_param": name, "message": message})
+        result["valid"] = not result["errors"]
+        results.append({
+            "account_login": account, "bot": bot, "bot_id": current["bot_id"],
+            "valid": result["valid"], "fields": result["fields"],
+            "errors": result["errors"], "warnings": result["warnings"],
+            "values": normalized_values,
+        })
+    return results
+
+
+def config_ui_validation_response(results):
+    return {"ok": True, "valid": all(item["valid"] for item in results),
+            "accounts": [{key: value for key, value in item.items() if key != "values"} for item in results]}
+
+
+def config_ui_require_valid_market_tf(results):
+    errors = [f"account {item['account_login']} / {error['input_param']}: {error['message']}"
+              for item in results for error in item["errors"]]
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
 def insert_runtime_config_version(cur, env, account_login, bot_kind, bot_id, config, config_hash, reason, source):
+    # The caller hashes and returns this exact document. Never normalize it here
+    # behind the caller's back; input normalization belongs before hashing.
+    validate_config_market_tf_publication(bot_kind, config)
     cur.execute(
         """
         SELECT COALESCE(MAX(version_no), 0) + 1
@@ -3004,6 +3141,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     .profit-negative { background: #c73535; color: #fff; }
     .footer { position: sticky; bottom: 0; z-index: 15; margin-top: 12px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: rgba(245, 247, 250, .96); border: 1px solid var(--border); border-radius: 8px; }
     .changed-count { color: var(--muted); font-size: 14px; }
+    .config-feedback { margin-top: 6px; font-size: 12px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); }
+    .config-feedback.error, .dmtf-feedback.error { color: var(--danger); }
+    .dmtf-feedback { margin-top: 6px; font-size: 12px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; color: #147a3d; }
+    .new-value-input[aria-invalid="true"] { border-color: var(--danger); }
     @media (max-width: 1100px) {
       .params-table th:first-child, .params-table td.group { display: none; }
       .params-table tr.group-break td:nth-child(2) { box-shadow: inset 4px 0 0 #3d7cae; }
@@ -3148,7 +3289,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       </section>
 
       <section class="footer">
-        <div id="changedCount" class="changed-count">0 changed rows</div>
+        <div>
+          <div id="changedCount" class="changed-count">0 changed rows</div>
+          <div id="configValidation" class="config-feedback" role="status" aria-live="polite"></div>
+          <div id="configApplication" class="config-feedback" role="status" aria-live="polite"></div>
+        </div>
         <button id="saveBtn" type="button" disabled>Save changes</button>
       </section>
     </section>
@@ -3354,6 +3499,14 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     let currentCatalogRows = [];
     let paramsLoadSeq = 0;
     let analyticsLoaded = false;
+    let configValidationSeq = 0;
+    let configValidationTimer = null;
+    let configValidationKey = '';
+    let configValidationPending = false;
+    let configValidationValid = true;
+    let configSaving = false;
+    let configApplicationSeq = 0;
+    let configApplicationTimer = null;
     const CATALOG_VALUE_TYPES = ['bool', 'int', 'numeric', 'text', 'json'];
 
     const els = {
@@ -3405,6 +3558,8 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       status: document.getElementById('status'),
       paramsBody: document.getElementById('paramsBody'),
       changedCount: document.getElementById('changedCount'),
+      configValidation: document.getElementById('configValidation'),
+      configApplication: document.getElementById('configApplication'),
       saveBtn: document.getElementById('saveBtn'),
       catalogSearchInput: document.getElementById('catalogSearchInput'),
       paramsConfigBody: document.getElementById('paramsConfigBody'),
@@ -3512,6 +3667,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         input.value = String(row.account_login);
         input.dataset.hasConfig = row.has_bot_config ? '1' : '0';
         input.disabled = !row.has_bot_config;
+        input.addEventListener('change', updateChangedCount);
 
         const text = document.createElement('span');
         text.textContent = row.has_bot_config ? row.account_label : row.account_label + ' (no config for this bot)';
@@ -3759,12 +3915,14 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
 
     async function loadBots() {
       const account = els.accountSelect.value;
+      resetConfigFeedback();
       fillSelect(els.botSelect, [], 'bot', 'display_name', '');
       setConsulTabVisible(false);
       els.consulBody.innerHTML = '';
       if (!account) return;
       setStatus('Loading bots...');
       const data = await api('/config-ui/api/bots?account_login=' + encodeURIComponent(account));
+      if (account !== els.accountSelect.value) return;
       currentBotRows = data.bots || [];
       fillSelect(els.botSelect, currentBotRows, 'bot', 'display_name', '');
       fillRmBotList(currentBotRows);
@@ -3789,9 +3947,11 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       setTargetAccountListEnabled(false);
       if (!account || !bot) return;
       const data = await api('/config-ui/api/copy-target-accounts?source_account_login=' + encodeURIComponent(account) + '&bot=' + encodeURIComponent(bot));
+      if (account !== els.accountSelect.value || bot !== els.botSelect.value) return;
       fillTargetAccountList(data.accounts || []);
       const enabledTargets = Array.from(els.targetAccountList.querySelectorAll('input[type="checkbox"]')).some(input => input.dataset.hasConfig === '1');
       setTargetAccountListEnabled(els.copyToggle.checked && enabledTargets);
+      updateChangedCount();
     }
 
     async function getChoices(bot, inputParam) {
@@ -4129,12 +4289,15 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       return select;
     }
 
-    async function loadParams() {
+    async function loadParams(options = {}) {
       const account = els.accountSelect.value;
       const bot = els.botSelect.value;
       const loadSeq = ++paramsLoadSeq;
+      resetConfigFeedback();
       els.paramsBody.innerHTML = '';
+      updateChangedCount();
       if (!account || !bot) return;
+      if (options.refreshApplication !== false) startConfigApplicationPolling();
       setStatus('Loading parameters...');
       const data = await api('/config-ui/api/params?account_login=' + encodeURIComponent(account) + '&bot=' + encodeURIComponent(bot));
       if (loadSeq !== paramsLoadSeq || account !== els.accountSelect.value || bot !== els.botSelect.value) return;
@@ -4180,6 +4343,15 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         newTd.className = 'new-value';
         newTd.appendChild(await buildValueControl(row));
         if (loadSeq !== paramsLoadSeq || account !== els.accountSelect.value || bot !== els.botSelect.value) return;
+        if (isMarketTfParam(row.input_param)) {
+          const feedback = document.createElement('div');
+          feedback.className = 'dmtf-feedback';
+          feedback.dataset.inputParam = row.input_param;
+          feedback.id = 'dmtf-feedback-' + row.row_id;
+          feedback.setAttribute('aria-live', 'polite');
+          newTd.firstChild.setAttribute('aria-describedby', feedback.id);
+          newTd.appendChild(feedback);
+        }
         tr.appendChild(newTd);
 
         const reasonTd = document.createElement('td');
@@ -4500,17 +4672,210 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     function getSelectedTargetAccounts() {
       if (!els.copyToggle.checked) return [];
       return Array.from(els.targetAccountList.querySelectorAll('input[type="checkbox"]:checked'))
-        .filter(input => !input.disabled && input.value)
+        .filter(input => input.dataset.hasConfig === '1' && input.value)
         .map(input => Number(input.value));
     }
 
+    function isMarketTfParam(inputParam) {
+      return /^Inp(?:N[123])?MarketTF/.test(inputParam || '');
+    }
+
+    function configSavePayload() {
+      return {
+        account_login: Number(els.accountSelect.value),
+        bot: els.botSelect.value,
+        copy_to_account_logins: getSelectedTargetAccounts(),
+        changes: getChangedRows()
+      };
+    }
+
+    function resetConfigFeedback() {
+      clearTimeout(configValidationTimer);
+      clearTimeout(configApplicationTimer);
+      configValidationSeq++;
+      configApplicationSeq++;
+      configValidationKey = '';
+      configValidationPending = false;
+      configValidationValid = true;
+      els.configValidation.textContent = '';
+      els.configApplication.textContent = '';
+    }
+
+    async function configCheckApi(path, options = {}) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      try {
+        return await api(path, {...options, signal: controller.signal});
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    function renderConfigValidation(data) {
+      const messages = new Map();
+      const invalid = new Set();
+      const summary = [];
+      for (const account of data.accounts || []) {
+        const prefix = String(account.account_login) + ': ';
+        for (const field of account.fields || []) {
+          const lines = messages.get(field.input_param) || [];
+          if (field.valid === false) {
+            lines.push(prefix + (field.error || 'Invalid value'));
+            invalid.add(field.input_param);
+          } else {
+            if (/(?:Whitelist|Stoplist)$/.test(field.input_param) && field.symbol_count != null && field.pair_count != null) {
+              lines.push(prefix + field.symbol_count + ' instruments, ' + field.pair_count + ' symbol/timeframe pairs');
+            }
+            if (field.normalized != null) lines.push('Normalized: ' + (field.normalized === '' ? '(empty)' : String(field.normalized)));
+          }
+          for (const warning of field.warnings || []) lines.push(prefix + warning);
+          messages.set(field.input_param, lines);
+        }
+        for (const error of account.errors || []) {
+          const message = prefix + (error.input_param ? error.input_param + ': ' : '') + error.message;
+          summary.push(message);
+          if (error.input_param) {
+            invalid.add(error.input_param);
+            const lines = messages.get(error.input_param) || [];
+            if (!lines.some(line => line.includes(error.message))) lines.push(prefix + error.message);
+            messages.set(error.input_param, lines);
+          }
+        }
+        for (const warning of account.warnings || []) summary.push(prefix + warning);
+      }
+      for (const feedback of els.paramsBody.querySelectorAll('.dmtf-feedback')) {
+        feedback.textContent = (messages.get(feedback.dataset.inputParam) || []).join('\n');
+        feedback.className = invalid.has(feedback.dataset.inputParam) ? 'dmtf-feedback error' : 'dmtf-feedback';
+      }
+      for (const control of els.paramsBody.querySelectorAll('.new-value-input')) {
+        control.setAttribute('aria-invalid', invalid.has(control.dataset.inputParam) ? 'true' : 'false');
+      }
+      els.configValidation.textContent = (data.valid ? 'Configuration checked for all selected accounts.' : 'Fix the configuration before saving.') + (summary.length ? '\n' + summary.join('\n') : '');
+      els.configValidation.className = data.valid ? 'config-feedback' : 'config-feedback error';
+    }
+
+    async function validateConfigPayload(payload) {
+      clearTimeout(configValidationTimer);
+      const seq = ++configValidationSeq;
+      const key = JSON.stringify(payload);
+      configValidationKey = key;
+      configValidationPending = true;
+      els.configValidation.textContent = 'Checking configuration...';
+      els.configValidation.className = 'config-feedback';
+      updateChangedCount();
+      try {
+        const data = await configCheckApi('/config-ui/api/validate', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: key
+        });
+        if (seq !== configValidationSeq || key !== JSON.stringify(configSavePayload())) return false;
+        configValidationValid = data.valid === true;
+        renderConfigValidation(data);
+        return configValidationValid;
+      } catch (exc) {
+        if (seq === configValidationSeq && key === JSON.stringify(configSavePayload())) {
+          configValidationValid = false;
+          els.configValidation.textContent = 'Validation failed: ' + exc.message + '. Edit a value to retry.';
+          els.configValidation.className = 'config-feedback error';
+        }
+        return false;
+      } finally {
+        if (seq === configValidationSeq) {
+          configValidationPending = false;
+          updateChangedCount();
+        }
+      }
+    }
+
     function updateChangedCount() {
-      const count = getChangedRows().length;
+      const payload = configSavePayload();
+      const count = payload.changes.length;
+      const key = count ? JSON.stringify(payload) : '';
+      if (key !== configValidationKey) {
+        clearTimeout(configValidationTimer);
+        configValidationSeq++;
+        configValidationKey = key;
+        configValidationPending = count > 0;
+        configValidationValid = count === 0;
+        for (const feedback of els.paramsBody.querySelectorAll('.dmtf-feedback')) feedback.textContent = '';
+        for (const control of els.paramsBody.querySelectorAll('.new-value-input')) control.setAttribute('aria-invalid', 'false');
+        els.configValidation.textContent = count ? 'Checking configuration...' : '';
+        els.configValidation.className = 'config-feedback';
+        if (count) configValidationTimer = setTimeout(() => validateConfigPayload(payload), 400);
+      }
       els.changedCount.textContent = count + (count === 1 ? ' changed row' : ' changed rows');
-      els.saveBtn.disabled = count === 0;
+      els.saveBtn.disabled = count === 0 || configSaving || configValidationPending || !configValidationValid;
+    }
+
+    function configPolicyText(summary) {
+      return typeof summary === 'string' ? summary : (summary ? JSON.stringify(summary) : 'policy unknown');
+    }
+
+    function missingConfigApplications(rows, publications) {
+      return publications.filter(item => !rows.some(row => String(item.account_login) === String(row.account_login) && item.bot === row.bot && (!item.bot_id || item.bot_id === row.bot_id)));
+    }
+
+    function renderConfigApplications(rows, publications) {
+      const lines = [];
+      for (const row of rows) {
+        const publication = publications.find(item => String(item.account_login) === String(row.account_login) && item.bot === row.bot && (!item.bot_id || item.bot_id === row.bot_id));
+        const prefix = row.account_login + ' / ' + row.bot + (row.bot_id && row.bot_id !== row.bot ? ' / ' + row.bot_id : '') + ': ';
+        const published = row.published_version_no == null ? '?' : row.published_version_no;
+        const applied = row.applied_version_no == null ? 'unknown' : row.applied_version_no;
+        let message;
+        if (row.state === 'applied') message = 'Applied by bot: version ' + applied + '. ' + configPolicyText(row.applied_policy_summary);
+        else if (row.state === 'rejected') message = 'Rejected version ' + published + ': ' + (row.last_error || 'see bot error');
+        else if (row.state === 'error') message = 'Bot error: ' + (row.runtime_error || row.last_error || 'bot is not ready') + '. Published version ' + published + '.';
+        else if (row.state === 'stale') message = 'No fresh bot response. Published version ' + published + '.';
+        else message = 'Saved version ' + published + '; waiting for bot confirmation.';
+        if (row.state !== 'applied') message += ' Last confirmed version ' + applied + ': ' + configPolicyText(row.applied_policy_summary);
+        if (publication && publication.version_no != null && (Number(publication.version_no) !== Number(published) || (row.published_config_hash && publication.config_hash !== row.published_config_hash))) message = 'Saved version ' + publication.version_no + '; current publication changed. ' + message;
+        lines.push(prefix + message);
+      }
+      const missing = missingConfigApplications(rows, publications);
+      for (const item of missing) lines.push(item.account_login + ' / ' + item.bot + ': No bot application status available; ' + (item.version_no == null ? 'configuration' : 'saved version ' + item.version_no) + ' has not been confirmed.');
+      els.configApplication.textContent = lines.length ? lines.join('\n') : 'No configuration application status available.';
+      els.configApplication.className = missing.length || rows.some(row => ['rejected', 'stale', 'error'].includes(row.state)) ? 'config-feedback error' : 'config-feedback';
+    }
+
+    function startConfigApplicationPolling(publications = []) {
+      clearTimeout(configApplicationTimer);
+      const seq = ++configApplicationSeq;
+      const selectedAccount = els.accountSelect.value;
+      const selectedBot = els.botSelect.value;
+      if (!selectedAccount || !selectedBot) return;
+      const targets = publications.length ? publications : [{account_login: selectedAccount, bot: selectedBot}];
+      const unique = Array.from(new Map(targets.map(item => [item.account_login + '|' + item.bot, item])).values());
+      const deadline = Date.now() + 60000;
+      els.configApplication.textContent = publications.length ? 'Saved; waiting for bot confirmation...' : 'Checking bot application status...';
+      els.configApplication.className = 'config-feedback';
+      const isCurrent = () => seq === configApplicationSeq && selectedAccount === els.accountSelect.value && selectedBot === els.botSelect.value;
+      const poll = async () => {
+        if (!isCurrent()) return;
+        if (Date.now() >= deadline) {
+          els.configApplication.textContent += '\nConfirmation not received within 60 seconds. Reload parameters to check again.';
+          return;
+        }
+        try {
+          const results = await Promise.all(unique.map(item => configCheckApi('/config-ui/api/config-application?account_login=' + encodeURIComponent(item.account_login) + '&bot=' + encodeURIComponent(item.bot))));
+          if (!isCurrent()) return;
+          const rows = results.flatMap(result => result.accounts || []);
+          renderConfigApplications(rows, targets);
+          if (missingConfigApplications(rows, targets).length || rows.some(row => row.state === 'pending' || row.state === 'stale')) {
+            if (Date.now() < deadline) configApplicationTimer = setTimeout(poll, 3000);
+            else els.configApplication.textContent += '\nConfirmation not received within 60 seconds. Reload parameters to check again.';
+          }
+        } catch (exc) {
+          if (!isCurrent()) return;
+          clearTimeout(configApplicationTimer);
+          els.configApplication.textContent = 'Could not check bot application: ' + exc.message + '. Reload parameters to retry.';
+          els.configApplication.className = 'config-feedback error';
+        }
+      };
+      poll();
     }
 
     async function saveChanges() {
+      if (configSaving) return;
       const changes = getChangedRows();
       if (!changes.length) return;
       const targetAccounts = getSelectedTargetAccounts();
@@ -4518,8 +4883,14 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         setStatus('Choose at least one available target account or turn off Apply same values', true);
         return;
       }
+      configSaving = true;
       els.saveBtn.disabled = true;
-      setStatus('Saving...');
+      const lockedControls = [els.accountSelect, els.botSelect, els.copyToggle,
+        ...els.paramsBody.querySelectorAll('.new-value-input, .reason-input, .prev-value-input'),
+        ...els.targetAccountList.querySelectorAll('input[type="checkbox"]')]
+        .map(control => ({control, disabled: control.disabled}));
+      // Prevent changing the reviewed payload while validation/publication is in progress.
+      for (const item of lockedControls) item.control.disabled = true;
       const payload = {
         account_login: Number(els.accountSelect.value),
         bot: els.botSelect.value,
@@ -4527,22 +4898,35 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         changes
       };
       try {
+        if (!await validateConfigPayload(payload)) return;
+        if (JSON.stringify(payload) !== JSON.stringify(configSavePayload())) return;
+        setStatus('Saving...');
         const data = await api('/config-ui/api/save', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify(payload)
         });
-        setStatus('Saved ' + (data.applied_count || 0) + ' row updates');
-        await loadParams();
+        const savedMessage = 'Saved ' + (data.applied_count || 0) + ' row updates; bot application is checked separately below.';
+        let reloadError = '';
+        try {
+          await loadParams({refreshApplication: false});
+        } catch (exc) {
+          reloadError = ' Could not reload parameters: ' + exc.message;
+        }
+        startConfigApplicationPolling(data.publications || []);
+        setStatus(savedMessage + reloadError, !!reloadError);
       } catch (exc) {
         setStatus(exc.message, true);
       } finally {
+        for (const item of lockedControls) item.control.disabled = item.disabled;
+        configSaving = false;
         updateChangedCount();
       }
     }
 
     els.accountSelect.addEventListener('change', async () => { syncRmCurrentAccount(); await loadBots(); });
     els.botSelect.addEventListener('change', async () => {
+      resetConfigFeedback();
       await loadCopyTargets();
       await loadParams();
       if (!els.paramsConfigPanel.hidden) await loadParamCatalog();
@@ -4557,9 +4941,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     els.groupFilter.addEventListener('change', applyFilters);
     els.searchInput.addEventListener('input', applyFilters);
     els.catalogSearchInput.addEventListener('input', applyCatalogFilter);
-    els.copyToggle.addEventListener('change', loadCopyTargets);
+    els.copyToggle.addEventListener('change', () => {
+      updateChangedCount();
+      loadCopyTargets().catch(exc => setStatus(exc.message, true));
+    });
     els.adminModeToggle.addEventListener('change', updateAdminModeUi);
     els.saveBtn.addEventListener('click', saveChanges);
+    window.addEventListener('pagehide', resetConfigFeedback);
     els.paramsTab.addEventListener('click', () => switchFormTab('params'));
     els.paramsConfigTab.addEventListener('click', () => switchFormTab('catalog'));
     els.consulTab.addEventListener('click', () => switchFormTab('consul'));
@@ -6271,6 +6659,56 @@ async def config_ui_runtime_status(request: Request, account_login: Optional[Lis
         conn.close()
 
 
+@app.get("/config-ui/api/config-application")
+async def config_ui_config_application(request: Request, bot: str, account_login: List[int] = Query(...)):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    bot = (bot or "").strip().lower()
+    accounts = sorted(set(int(account) for account in account_login))
+    if not bot or not accounts or len(accounts) > 100:
+        return config_ui_json_error(400, "bot and 1..100 accounts are required")
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            for account in accounts:
+                if not ensure_actor_account_access(cur, actor, account, can_apply=False):
+                    return config_ui_json_error(403, f"account {account} is not available")
+            cur.execute(
+                """
+                SELECT statement_timestamp() AS observed_at,
+                       c.account_login, c.bot_kind AS bot, c.bot_id,
+                       c.active_version_no AS published_version_no,
+                       c.config_hash AS published_config_hash,
+                       c.updated_at AS published_at, v.config_json AS published_config,
+                       r.applied_version_no, r.applied_config_hash, r.last_seen_at,
+                       r.last_config_check_at, r.last_error, r.runtime_json,
+                       r.status AS runtime_status, av.config_json AS applied_config
+                  FROM bot_param.bot_config_current c
+                  JOIN bot_param.bot_config_version v ON v.config_version_id = c.active_config_id
+                  LEFT JOIN LATERAL (
+                      SELECT s.* FROM bot_param.bot_runtime_status s
+                       WHERE s.env = c.env AND s.account_login = c.account_login
+                         AND s.bot_kind = c.bot_kind AND s.bot_id = c.bot_id
+                       ORDER BY s.last_seen_at DESC NULLS LAST LIMIT 1
+                  ) r ON true
+                  LEFT JOIN bot_param.bot_config_version av
+                    ON av.env = c.env AND av.account_login = c.account_login
+                   AND av.bot_kind = c.bot_kind AND av.bot_id = c.bot_id
+                   AND av.version_no = r.applied_version_no AND av.config_hash = r.applied_config_hash
+                 WHERE c.env = 'prod' AND c.account_login = ANY(%s) AND c.bot_kind = %s
+                 ORDER BY c.account_login, c.bot_id
+                """,
+                (accounts, bot),
+            )
+            statuses = [configuration_application_status(dict(row)) for row in cur.fetchall()]
+        return {"ok": True, "accounts": statuses, "version": CODE_VERSION}
+    except Exception as exc:
+        return config_ui_json_error(400, first_error_line(exc))
+    finally:
+        conn.close()
+
+
 @app.get("/config-ui/api/rm-state")
 async def config_ui_rm_state(request: Request, account_login: Optional[List[int]] = Query(None)):
     _, actor, auth = require_config_ui_api(request)
@@ -6467,13 +6905,19 @@ async def config_ui_recommendation_approve(recommendation_id: int, req: Recommen
                  WHERE e.account_login = %s
                    AND e.bot = %s
                    AND e.input_param = %s
-                 FOR UPDATE OF e
                 """,
                 (account_login, bot, input_param),
             )
             editor_row = cur.fetchone()
             if not editor_row:
                 raise ValueError(f"config editor row not found for {bot}.{input_param}")
+            validation_req = ConfigUiSaveRequest(
+                account_login=account_login, bot=bot,
+                changes=[ConfigUiChange(row_id=int(editor_row["row_id"]), value=recommended_value)],
+            )
+            prepared = config_ui_prepare_market_tf(cur, validation_req, bot, [account_login], lock=True)
+            config_ui_require_valid_market_tf(prepared)
+            recommended_value = prepared[0]["values"][int(editor_row["row_id"])]
             new_choice, new_value = resolve_new_value_columns(cur, bot, input_param, recommended_value)
             reason = clean_optional_text(req.reason) or clean_optional_text(rec.get("reason")) or f"recommendation #{recommendation_id}"
             cur.execute(
@@ -6555,6 +6999,30 @@ async def config_ui_recommendation_reject(recommendation_id: int, req: Recommend
         conn.close()
 
 
+@app.post("/config-ui/api/validate")
+async def config_ui_validate(req: ConfigUiSaveRequest, request: Request):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    bot = (req.bot or "").strip().lower()
+    if not bot:
+        return config_ui_json_error(400, "bot is required")
+    conn = config_ui_conn()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            accounts = config_ui_target_accounts(req)
+            for account in accounts:
+                if not ensure_actor_account_access(cur, actor, account, can_apply=True):
+                    return config_ui_json_error(403, f"account {account} is not available for apply")
+            result = config_ui_prepare_market_tf(cur, req, bot, accounts)
+        return config_ui_validation_response(result)
+    except Exception as exc:
+        return config_ui_json_error(400, first_error_line(exc))
+    finally:
+        conn.rollback()
+        conn.close()
+
+
 @app.post("/config-ui/api/save")
 async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
     _, actor, auth = require_config_ui_api(request)
@@ -6572,13 +7040,8 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
     conn.autocommit = False
     try:
         applied = []
-        target_accounts = []
-        if req.copy_to_account_login is not None:
-            target_accounts.append(int(req.copy_to_account_login))
-        for account in (req.copy_to_account_logins or []):
-            account = int(account)
-            if account not in target_accounts:
-                target_accounts.append(account)
+        accounts = config_ui_target_accounts(req)
+        target_accounts = [account for account in accounts if account != req.account_login]
 
         with conn.cursor(cursor_factory=DictCursor) as cur:
             set_actor(cur, actor)
@@ -6590,8 +7053,11 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
                 if not ensure_actor_account_access(cur, actor, target_account, can_apply=True):
                     return config_ui_json_error(403, f"target account {target_account} is not available for apply")
 
+            prepared = config_ui_prepare_market_tf(cur, req, bot, accounts, lock=True)
+            config_ui_require_valid_market_tf(prepared)
+            prepared_by_account = {item["account_login"]: item for item in prepared}
             for change in req.changes:
-                value = (change.value or "").strip()
+                value = prepared_by_account[req.account_login]["values"][int(change.row_id)]
                 if not value:
                     raise ValueError(f"row {change.row_id}: value is empty")
                 reason = (change.reason or "").strip() or None
@@ -6650,6 +7116,8 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
                         raise ValueError(
                             f"row {change.row_id}: target row not found for account {target_account}"
                         )
+                    target_value = prepared_by_account[target_account]["values"][int(change.row_id)]
+                    target_choice, target_text = resolve_new_value_columns(cur, bot, source["input_param"], target_value)
                     cur.execute(
                         """
                         UPDATE bot_param.bot_config_user_editor
@@ -6659,18 +7127,32 @@ async def config_ui_save(req: ConfigUiSaveRequest, request: Request):
                          WHERE row_id = %s
                          RETURNING row_id, account_login, bot, input_param, current_value
                         """,
-                        (new_choice, new_value, reason, target["row_id"]),
+                        (target_choice, target_text, reason, target["row_id"]),
                     )
                     if "targets" not in applied[-1]:
                         applied[-1]["targets"] = []
                     applied[-1]["targets"].append(dict(cur.fetchone()))
 
+            # Capture target versions inside the transaction while the current
+            # rows remain locked. A later save must not change this receipt.
+            cur.execute(
+                """
+                SELECT account_login, bot_kind AS bot, bot_id,
+                       active_version_no AS version_no, config_hash
+                  FROM bot_param.bot_config_current
+                 WHERE env = 'prod' AND account_login = ANY(%s) AND bot_kind = %s
+                 ORDER BY account_login, bot_id
+                """,
+                (accounts, bot),
+            )
+            publications = [dict(row) for row in cur.fetchall()]
         conn.commit()
         return {
             "ok": True,
             "actor": actor,
             "applied": applied,
             "applied_count": sum(1 + len(row.get("targets", [])) for row in applied),
+            "publications": publications,
             "version": CODE_VERSION,
         }
     except ValueError as exc:
@@ -6910,6 +7392,9 @@ async def bot_runtime_config_resolve_on_init(req: BotRuntimeResolveOnInitRequest
 
             current = load_runtime_current_config(cur, env, account_login, bot_kind, bot_id)
             old_version_no = req.applied_version_no
+            if current and (not isinstance(current["config_json"], dict) or
+                            ("inputs" in current["config_json"] and not isinstance(current["config_json"]["inputs"], dict))):
+                raise ValueError("Saved configuration and inputs must be JSON objects")
             current_config = dict(current["config_json"] or {}) if current else {}
             if current:
                 schema_error = n456_selection_config_error(
@@ -6957,7 +7442,7 @@ async def bot_runtime_config_resolve_on_init(req: BotRuntimeResolveOnInitRequest
                     json_path_set(
                         effective_config,
                         param_path,
-                        coerce_config_json_value(effective_value_text, value_type),
+                        effective_value_text if is_market_tf_param(input_param) else coerce_config_json_value(effective_value_text, value_type),
                     )
                 elif db_value is not None:
                     json_path_set(effective_config, param_path, db_value)
@@ -6967,15 +7452,16 @@ async def bot_runtime_config_resolve_on_init(req: BotRuntimeResolveOnInitRequest
                     json_path_set(
                         effective_config,
                         param_path,
-                        coerce_config_json_value(default_value, value_type),
+                        default_value if is_market_tf_param(input_param) else coerce_config_json_value(default_value, value_type),
                     )
                 elif input_provided and not has_db_config:
                     json_path_set(
                         effective_config,
                         param_path,
-                        coerce_config_json_value(input_value, value_type),
+                        input_value if is_market_tf_param(input_param) else coerce_config_json_value(input_value, value_type),
                     )
 
+            validate_config_market_tf_publication(bot_kind, effective_config)
             effective_hash = config_json_hash(effective_config)
             wrote_version = False
             active_version_no = int(current["active_version_no"]) if current else 0
