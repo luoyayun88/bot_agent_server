@@ -10,6 +10,12 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from analytics.config_market_tf_validation import validate_market_tf_config, is_market_tf_param, terminal_market_tf_list_error
 from analytics.config_market_tf_status import configuration_application_status
+from analytics.account_lot_scale import (
+    advance_profile as account_scale_advance,
+    canonical_requested_k as account_scale_canonical_k,
+    new_profile as account_scale_new_profile,
+    validate_request as account_scale_validate_request,
+)
 
 try:
     import psycopg2
@@ -21,7 +27,7 @@ except Exception as _pg_exc:  # Allow app to start without psycopg2
     DictCursor = None
     Json = None
     _PSYCOPG2_IMPORT_ERROR = _pg_exc
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI()
 
@@ -164,6 +170,30 @@ class BotRuntimeBaseRequest(BaseModel):
     instance_id: str
     applied_version_no: Optional[int] = None
     command_id: Optional[int] = None
+    account_scale: Optional[Dict[str, Any]] = None
+
+
+class BotRuntimeAccountScaleRequest(BaseModel):
+    env: str = "prod"
+    account_login: int
+    account_server: str
+    bot_kind: str
+    bot_id: str
+    source_id: str
+    scale_instance_id: str
+    runtime_instance_id: Optional[str] = None
+    protocol_version: int = 1
+    server_day: int
+    seconds_in_day: int
+    active_revision: int = 0
+    candidate_revision: int = 0
+    prepared_revision: int = 0
+    owner_applied_revision: int = 0
+    paused: bool = False
+    flat: bool = False
+    connected: bool = False
+    runtime_ready: bool = False
+    requested_k: Optional[float] = Field(default=None, ge=1, le=100, allow_inf_nan=False)
 
 
 class BotRuntimeParamValue(BaseModel):
@@ -549,6 +579,7 @@ def config_ui_analytics_source_fallback(source_id):
         "pivot": "n10",
         "kcbb": "n11",
         "fib": "n12",
+        "gap": "n13",
         "bot123": "bot123",
     }.get(sid)
 
@@ -1023,6 +1054,9 @@ def validate_config_market_tf_publication(bot, config):
                 errors.append({"input_param": name, "message": message})
     if errors:
         raise ValueError("; ".join(f"{item['input_param']}: {item['message']}" for item in errors))
+    if bot == "rm_controller":
+        from analytics.account_lot_scale import validate_scale_config
+        validate_scale_config(bot, config)
     return result
 
 
@@ -1221,8 +1255,8 @@ RM_STATE_SCOPES = {"account", "bot"}
 RM_STATE_ACTIONS = {"halt_only", "flatten_and_halt"}
 RM_STATE_RESET_MODES = {"manual", "next_day", "next_week", "defined_date"}
 RM_STATE_DECISIONS = {"continue", "halt_only", "flatten_and_halt"}
-CAC_KZ_PHASE_SOURCE_IDS = {"m50", "s2", "m10", "dj", "inbr", "smbrk", "pivot", "kcbb", "fib", "bot123"}
-CAC_KZ_SOURCE_ORDER = ["m50", "s2", "m10", "dj", "inbr", "smbrk", "pivot", "kcbb", "fib", "bot123"]
+CAC_KZ_PHASE_SOURCE_IDS = {"m50", "s2", "m10", "dj", "inbr", "smbrk", "pivot", "kcbb", "fib", "bot123", "gap"}
+CAC_KZ_SOURCE_ORDER = ["m50", "s2", "m10", "dj", "inbr", "smbrk", "pivot", "kcbb", "fib", "bot123", "gap"]
 CAC_KZ_PROBE_STAGGER_DAYS = {
     "pivot": 0,
     "inbr": 7,
@@ -7273,6 +7307,122 @@ async def bot_runtime_recommendation_next_notification(req: BotRuntimeBaseReques
         conn.close()
 
 
+def bot_runtime_account_scale_in_transaction(cur, payload):
+    """Serialize one account/server profile; DDL is exclusively a migration.
+
+    Commands and normal EA settings are untouched. Persist both the state
+    transition and this instance's heartbeat in the caller's transaction.
+    """
+    data = account_scale_validate_request(payload)
+    scope = (data["env"], data["account_login"], data["account_server"])
+    initial = account_scale_new_profile(*scope)
+    cur.execute(
+        """INSERT INTO bot_param.account_lot_scale_profile
+             (env, account_login, account_server, profile_json)
+           VALUES (%s, %s, %s, %s::jsonb)
+           ON CONFLICT (env, account_login, account_server) DO NOTHING""",
+        (*scope, json.dumps(initial, allow_nan=False)),
+    )
+    cur.execute(
+        """SELECT profile_json FROM bot_param.account_lot_scale_profile
+           WHERE env=%s AND account_login=%s AND account_server=%s FOR UPDATE""", scope,
+    )
+    profile_row = cur.fetchone()
+    if not profile_row:
+        raise ValueError("account-scale profile could not be locked")
+    profile = dict(profile_row["profile_json"])
+    cur.execute("SELECT extract(epoch FROM clock_timestamp()) AS now_epoch")
+    now = float(cur.fetchone()["now_epoch"])
+    cur.execute(
+        """SELECT instance_json, extract(epoch FROM last_seen_at) AS seen_epoch
+           FROM bot_param.account_lot_scale_instance
+           WHERE env=%s AND account_login=%s AND account_server=%s
+           ORDER BY scale_instance_id""", scope,
+    )
+    peers = [{**dict(row["instance_json"]), "last_seen_at": float(row["seen_epoch"])} for row in cur.fetchall()]
+    cur.execute(
+        """SELECT bot_kind, bot_id FROM bot_param.bot_config_current
+           WHERE env=%s AND account_login=%s ORDER BY bot_kind, bot_id""", scope[:2],
+    )
+    manifest = [dict(row) for row in cur.fetchall()]
+    cur.execute(
+        """SELECT bot_kind, bot_id, source_id, instance_id, status,
+                  extract(epoch FROM last_seen_at) AS last_seen_at
+           FROM bot_param.bot_runtime_status
+           WHERE env=%s AND account_login=%s
+             AND last_seen_at >= clock_timestamp() - interval '60 seconds'
+             AND (COALESCE(runtime_json #>> '{account_scale,account_server}', runtime_json->>'account_server') IS NULL
+                  OR COALESCE(runtime_json #>> '{account_scale,account_server}', runtime_json->>'account_server')=%s)
+           ORDER BY instance_id""", scope,
+    )
+    statuses = [dict(row) for row in cur.fetchall()]
+    saved = load_runtime_current_config(cur, scope[0], scope[1], "rm_controller", "rm_controller")
+    saved_k = account_scale_canonical_k(saved["config_json"]) if saved else None
+    updated, snapshot = account_scale_advance(profile, peers, manifest, statuses, data, now, saved_k)
+    cur.execute(
+        """INSERT INTO bot_param.account_lot_scale_instance
+              (env, account_login, account_server, scale_instance_id, instance_json, last_seen_at)
+           VALUES (%s, %s, %s, %s, %s::jsonb, to_timestamp(%s))
+           ON CONFLICT (env, account_login, account_server, scale_instance_id)
+           DO UPDATE SET instance_json=EXCLUDED.instance_json, last_seen_at=EXCLUDED.last_seen_at""",
+        (*scope, data["scale_instance_id"], json.dumps(data, allow_nan=False), now),
+    )
+    cur.execute(
+        """UPDATE bot_param.account_lot_scale_profile
+           SET profile_json=%s::jsonb, updated_at=clock_timestamp()
+           WHERE env=%s AND account_login=%s AND account_server=%s""",
+        (json.dumps(updated, allow_nan=False), *scope),
+    )
+    return snapshot
+
+
+def bot_runtime_optional_account_scale(cur, req):
+    metadata = getattr(req, "account_scale", None)
+    if metadata is None:
+        return None
+    # Failures must not affect existing command leases/config resolution. Old
+    # servers ignore the optional request field, and no additional HTTP poll is
+    # necessary for trading EAs on a compatible server.
+    cur.execute("SAVEPOINT runtime_account_scale")
+    try:
+        payload = dict(metadata)
+        payload.update(env=req.env, account_login=req.account_login, bot_kind=req.bot_kind,
+                       bot_id=req.bot_id, source_id=req.source_id or req.bot_id,
+                       runtime_instance_id=req.instance_id)
+        parsed = BotRuntimeAccountScaleRequest(**payload)
+        data = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed.dict()
+        snapshot = bot_runtime_account_scale_in_transaction(cur, data)
+        cur.execute("RELEASE SAVEPOINT runtime_account_scale")
+        return snapshot
+    except Exception as exc:
+        cur.execute("ROLLBACK TO SAVEPOINT runtime_account_scale")
+        cur.execute("RELEASE SAVEPOINT runtime_account_scale")
+        return {"ok": False, "protocol_version": 1, "error": first_error_line(exc)}
+
+
+@app.post("/bot-runtime/account-scale")
+async def bot_runtime_account_scale(req: BotRuntimeAccountScaleRequest, request: Request):
+    auth = require_bot_runtime_api(request)
+    if auth:
+        return auth
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        data = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            snapshot = bot_runtime_account_scale_in_transaction(cur, data)
+        conn.commit()
+        return snapshot
+    except ValueError as exc:
+        conn.rollback()
+        return bot_runtime_json_error(400, str(exc))
+    except Exception as exc:
+        conn.rollback()
+        return bot_runtime_json_error(503, first_error_line(exc))
+    finally:
+        conn.close()
+
+
 @app.post("/bot-runtime/config/current")
 async def bot_runtime_config_current(req: BotRuntimeBaseRequest, request: Request):
     auth = require_bot_runtime_api(request)
@@ -7319,6 +7469,7 @@ async def bot_runtime_config_current(req: BotRuntimeBaseRequest, request: Reques
                    AND pc.input_param_name IS NOT NULL
                    AND pc.param_path IS NOT NULL
                    AND COALESCE(pc.user_editable, true) = true
+                   AND v.config_json #>> string_to_array(pc.param_path, '.') IS NOT NULL
                  ORDER BY pc.sort_order, pc.input_param_name
                 """,
                 (current["active_config_id"],),
@@ -7336,6 +7487,9 @@ async def bot_runtime_config_current(req: BotRuntimeBaseRequest, request: Reques
                 current["active_config_id"],
             )
             bot_runtime_touch(cur, env, account_login, instance_id, "last_config_check_at")
+            scale_response = None
+            if getattr(req, "account_scale", None) is not None:
+                scale_response = bot_runtime_optional_account_scale(cur, req)
         conn.commit()
         return {
             "ok": True,
@@ -7350,6 +7504,7 @@ async def bot_runtime_config_current(req: BotRuntimeBaseRequest, request: Reques
             "config_hash": current["config_hash"],
             "params": params,
             "changed_params": changed_params,
+            **({"account_scale": scale_response} if scale_response is not None else {}),
             "version": CODE_VERSION,
         }
     except Exception as exc:
@@ -7424,6 +7579,11 @@ async def bot_runtime_config_resolve_on_init(req: BotRuntimeResolveOnInitRequest
                         normalize_runtime_param_value(input_value, value_type)
                         != normalize_runtime_param_value(default_value, value_type)
                     )
+                if bot_kind == "rm_controller" and input_param == "lotsizeKoeff" and db_value is not None:
+                    # This new account setting is canonical. A stale local RM
+                    # template must not republish it at restart; every existing
+                    # parameter keeps its previous input-override precedence.
+                    is_override = False
 
                 if is_override:
                     effective_value_text = input_value
@@ -7485,6 +7645,9 @@ async def bot_runtime_config_resolve_on_init(req: BotRuntimeResolveOnInitRequest
             response_hash = effective_hash if wrote_version else (current_hash or effective_hash)
 
             bot_runtime_touch(cur, env, account_login, instance_id, "last_config_check_at")
+            scale_response = None
+            if getattr(req, "account_scale", None) is not None:
+                scale_response = bot_runtime_optional_account_scale(cur, req)
 
         conn.commit()
         return {
@@ -7502,6 +7665,7 @@ async def bot_runtime_config_resolve_on_init(req: BotRuntimeResolveOnInitRequest
             "wrote_version": wrote_version,
             "params": runtime_params_from_config(catalog, effective_config),
             "changed_params": changed_params,
+            **({"account_scale": scale_response} if scale_response is not None else {}),
             "version": CODE_VERSION,
         }
     except (InvalidOperation, ValueError) as exc:
@@ -7750,6 +7914,9 @@ async def bot_runtime_command_next(req: BotRuntimeBaseRequest, request: Request)
             )
             row = cur.fetchone()
             bot_runtime_touch(cur, env, account_login, instance_id, "last_command_check_at")
+            scale_response = None
+            if getattr(req, "account_scale", None) is not None:
+                scale_response = bot_runtime_optional_account_scale(cur, req)
         conn.commit()
         return {
             "ok": True,
@@ -7760,6 +7927,7 @@ async def bot_runtime_command_next(req: BotRuntimeBaseRequest, request: Request)
             "source_id": source_id,
             "instance_id": instance_id,
             "command": dict(row) if row else None,
+            **({"account_scale": scale_response} if scale_response is not None else {}),
             "version": CODE_VERSION,
         }
     except Exception as exc:
