@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI()
 
-CODE_VERSION = "v1.14"
+CODE_VERSION = "v1.15"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -1076,6 +1076,85 @@ def config_ui_target_accounts(req):
     return sorted(accounts)
 
 
+def config_ui_account_scale_capability(cur, account_login):
+    """Read fresh native capability; the initial UNITY snapshot needs no DDL."""
+    account = int(account_login)
+    cur.execute(
+        """
+        SELECT account_login, status, applied_version_no, last_error, runtime_json,
+               last_seen_at >= now() - interval '60 seconds' AS heartbeat_fresh
+          FROM bot_param.bot_runtime_status
+         WHERE env = 'prod' AND account_login = %s
+           AND bot_kind = 'rm_controller' AND bot_id = 'rm_controller'
+           AND last_seen_at >= now() - interval '60 seconds'
+         ORDER BY last_seen_at DESC
+        """,
+        (account,),
+    )
+    peers = [dict(row) for row in cur.fetchall()]
+    result = {"supported": False, "account_server": None, "requested_k": None,
+              "reason": "wait for a fresh compatible RM Controller heartbeat"}
+    if not peers:
+        return result
+    from analytics.account_lot_scale import form_peer_compatibility_error, validate_k
+    servers = set()
+    for row in peers:
+        error = form_peer_compatibility_error(row)
+        if error:
+            result["reason"] = error
+            return result
+        scale = row["runtime_json"]["account_scale"]
+        server = str(scale.get("account_server") or "").strip()
+        requested_k = validate_k(scale.get("requested_k", 1))
+        servers.add(server)
+        if result["requested_k"] is None:
+            result["requested_k"] = requested_k
+    if len(servers) != 1:
+        result["reason"] = "fresh RM Controllers report different account servers"
+        return result
+    result.update(supported=True, account_server=servers.pop(), reason="")
+    return result
+
+
+def config_ui_account_scale_display_k(cur, account_login, capability):
+    """A virtual editor default never publishes or changes a config version."""
+    from analytics.account_lot_scale import validate_k
+    cur.execute("SELECT to_regclass('bot_param.account_lot_scale_profile') IS NOT NULL", ())
+    if cur.fetchone()[0]:
+        cur.execute(
+            """
+            SELECT profile_json
+              FROM bot_param.account_lot_scale_profile
+             WHERE env = 'prod' AND account_login = %s AND account_server = %s
+            """,
+            (int(account_login), capability["account_server"]),
+        )
+        row = cur.fetchone()
+        profile = row["profile_json"] if row and hasattr(row, "keys") else row[0] if row else None
+        if (isinstance(profile, dict) and profile.get("requested_k") is not None
+                and profile.get("requested_initialized") is not False):
+            return normalize_runtime_param_value(validate_k(profile["requested_k"]), "numeric")
+    return normalize_runtime_param_value(validate_k(capability.get("requested_k") or 1), "numeric")
+
+
+def config_ui_account_scale_rows(cur, account_login, bot, rows, editor=False):
+    """The global catalog may exist while an older account cannot parse K."""
+    if bot != "rm_controller":
+        return rows
+    def is_scale(row):
+        return (row.get("input_param") or row.get("input_param_name") or row.get("param_key")) == "lotsizeKoeff"
+    if not any(is_scale(row) for row in rows):
+        return rows
+    capability = config_ui_account_scale_capability(cur, account_login)
+    if not capability["supported"]:
+        return [row for row in rows if not is_scale(row)]
+    for row in rows:
+        if editor and is_scale(row) and (row.get("current_value") is None or not str(row["current_value"]).strip()):
+            row["current_value"] = config_ui_account_scale_display_k(cur, account_login, capability)
+            row["current_value_virtual"] = True
+    return rows
+
+
 def config_ui_prepare_market_tf(cur, req, bot, accounts, lock=False):
     """Resolve authorized editor rows, then validate each complete candidate.
 
@@ -1134,7 +1213,10 @@ def config_ui_prepare_market_tf(cur, req, bot, accounts, lock=False):
             raise ValueError(f"account {account}: saved configuration and inputs must be JSON objects")
         candidate = json.loads(json.dumps(saved))
         for row_id, row in rows.items():
-            value = values[row_id] if is_market_tf_param(row["input_param"]) else coerce_config_json_value(values[row_id], row["value_type"])
+            # Validate the raw K below, including NaN/Infinity that Decimal
+            # coercion cannot safely convert to a JSON number.
+            value = values[row_id] if (is_market_tf_param(row["input_param"])
+                                      or (bot == "rm_controller" and row["input_param"] == "lotsizeKoeff")) else coerce_config_json_value(values[row_id], row["value_type"])
             json_path_set(candidate, row["param_path"], value)
         result = validate_market_tf_config(bot, candidate)
         # Normalize submitted fields only. Do not activate an old malformed
@@ -1154,6 +1236,25 @@ def config_ui_prepare_market_tf(cur, req, bot, accounts, lock=False):
                 field["valid"] = False
                 field["error"] = message
                 result["errors"].append({"input_param": name, "message": message})
+        if bot == "rm_controller":
+            from analytics.account_lot_scale import canonical_requested_k
+            message = None
+            try:
+                requested_k = canonical_requested_k(candidate)
+                if "lotsizeKoeff" in names:
+                    capability = config_ui_account_scale_capability(cur, account)
+                    if not capability["supported"]:
+                        message = capability["reason"]
+                    else:
+                        for row_id, row in rows.items():
+                            if row["input_param"] == "lotsizeKoeff":
+                                normalized_values[row_id] = normalize_runtime_param_value(requested_k, "numeric")
+            except ValueError as exc:
+                message = str(exc)
+            if "lotsizeKoeff" in names or message:
+                result["fields"].append({"input_param": "lotsizeKoeff", "valid": not message, "error": message})
+            if message:
+                result["errors"].append({"input_param": "lotsizeKoeff", "message": message})
         result["valid"] = not result["errors"]
         results.append({
             "account_login": account, "bot": bot, "bot_id": current["bot_id"],
@@ -2401,6 +2502,7 @@ RM_CONTROL_INPUT_PARAMS = {
     "RM_ResetMode": "reset",
     "RM_OwnerHeartbeatSec": "int",
     "RM_ManualResetNow": "bool",
+    "lotsizeKoeff": "double",
 }
 RM_CONTROLLER_PARAM_DEFS = [
     ("Account RM Owner", "RM_UseProfitTargetPct", "Use account profit target as percent from baseline.", "bool"),
@@ -2417,6 +2519,7 @@ RM_CONTROLLER_PARAM_DEFS = [
     ("Account RM Owner", "RM_ResetMode", "Automatic reset mode for normal RM stops.", "reset"),
     ("Account RM Owner", "RM_OwnerHeartbeatSec", "Maximum owner heartbeat age in seconds.", "int"),
     ("Account RM Owner", "RM_ManualResetNow", "One-shot manual reset request for triggered RM state.", "bool"),
+    ("Account lot scale", "lotsizeKoeff", "Requested account lot and budget scale (1..100); coordinated activation on a later server day.", "double"),
 ]
 RM_CONTROLLER_DEFAULT_VALUES = {
     "RM_UseProfitTargetPct": "false",
@@ -2433,10 +2536,11 @@ RM_CONTROLLER_DEFAULT_VALUES = {
     "RM_ResetMode": "RM_RESET_NEXT_DAY",
     "RM_OwnerHeartbeatSec": "30",
     "RM_ManualResetNow": "false",
+    "lotsizeKoeff": "1",
 }
 
 
-def rm_controller_config_json(account_login):
+def rm_controller_config_json(account_login, include_scale=False):
     config = {
         "schema_version": 1,
         "env": "prod",
@@ -2449,6 +2553,10 @@ def rm_controller_config_json(account_login):
         "allow_new_entries": True,
     }
     for key, value in RM_CONTROLLER_DEFAULT_VALUES.items():
+        # Existing bootstrap callers include older EAs. Migration owns K's
+        # catalog row; merely visiting the form must never emit a new input.
+        if key == "lotsizeKoeff" and not include_scale:
+            continue
         value_type = RM_CONTROL_INPUT_PARAMS.get(key)
         if value_type == "bool":
             config[key] = normalize_rm_bool_value(value, key) == "true"
@@ -2502,6 +2610,8 @@ def ensure_rm_controller_catalog(cur):
         )
 
     for sort_order, (section_name, input_param, desc, value_type) in enumerate(RM_CONTROLLER_PARAM_DEFS, start=1):
+        if input_param == "lotsizeKoeff":
+            continue
         allowed_values = [choice["allowed_value"] for choice in rm_controller_choices(input_param)] or None
         cur.execute(
             """
@@ -2555,6 +2665,8 @@ def ensure_rm_controller_catalog(cur):
             )
 
     for input_param, value_type in RM_CONTROL_INPUT_PARAMS.items():
+        if input_param == "lotsizeKoeff":
+            continue
         for sort_order, choice in enumerate(rm_controller_choices(input_param), start=1):
             cur.execute(
                 """
@@ -6162,6 +6274,7 @@ async def config_ui_params(request: Request, account_login: int, bot: str):
                 (actor, account_login, bot),
             )
             rows = [dict(row) for row in cur.fetchall()]
+            rows = config_ui_account_scale_rows(cur, account_login, bot, rows, editor=True)
         return {"ok": True, "params": rows, "version": CODE_VERSION}
     except Exception as exc:
         return config_ui_json_error(500, first_error_line(exc))
@@ -6219,6 +6332,7 @@ async def config_ui_param_catalog(request: Request, account_login: int, bot: str
                 (bot,),
             )
             rows = [dict(row) for row in cur.fetchall()]
+            rows = config_ui_account_scale_rows(cur, account_login, bot, rows)
             for row in rows:
                 for numeric_field in ("min_numeric", "max_numeric"):
                     if row.get(numeric_field) is not None:
