@@ -1329,7 +1329,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI()
 
-CODE_VERSION = "v1.17"
+CODE_VERSION = "v1.18"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -4826,7 +4826,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
               <option value="rm_daystart">RM daystart</option>
               <option value="rm_reset">RM reset</option>
               <option value="rm_ratchet_rearm">Rearm profit protection (T5)</option>
-              <option value="account_scale_retry">Повторить смену коэффициента лота</option>
+              <option value="account_scale_retry">Retry lot coefficient change</option>
               <option value="stop_bots">Stop selected bots - close positions</option>
               <option value="pause_bots">Pause selected bots - keep positions</option>
               <option value="resume_bots">Resume selected bots</option>
@@ -4942,7 +4942,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       rm_daystart: "Clear current account stop and restore today's day-start baseline.",
       rm_reset: 'Reset account RM from current balance/equity. Does not rearm profit protection (T5).',
       rm_ratchet_rearm: "Start a new profit-protection (T5) cycle with the applied settings. Keeps today's baseline and current account/bot stops. Does not resume trading. Requires RM Controller 2.02 or newer.",
-      account_scale_retry: 'Открыть окно на 120 секунд для согласованной смены сохранённого коэффициента. Счёт должен быть без позиций и отложенных ордеров, все действующие боты должны подтвердить готовность. Выберите один счёт.',
+      account_scale_retry: 'Open a 120-second window to apply the saved lot coefficient. Requires no open positions or pending orders and confirmation from every active bot. Select one account.',
       stop_bots: 'Hard stop for selected bot families: FLATTEN_AND_HALT.\nBlocks new entries and tells bots to flatten/close open positions for the selected period.',
       pause_bots: 'Soft pause for selected bot families: HALT_ONLY.\nBlocks new entries for the selected period, but keeps open positions running. No flatten.',
       resume_bots: 'Clear stops for selected bot families.'
@@ -5311,20 +5311,20 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     }
 
     function updateRmScaleRetryUi(accounts, refresh = false) {
-      els.rmSendBtn.textContent = 'Открыть окно смены коэффициента';
+      els.rmSendBtn.textContent = 'Open coefficient change window';
       els.rmSendBtn.disabled = true;
       if (accounts.length !== 1) {
         rmScaleRetryPreviewSeq++;
         rmScaleRetryPreview = null;
-        els.rmCommandPreview.textContent = 'Для повтора смены коэффициента выберите ровно один счёт.';
+        els.rmCommandPreview.textContent = 'Select exactly one account to retry the coefficient change.';
         return;
       }
       const account = String(accounts[0]);
       const pending = rmScaleRetryRequests.get(account);
       if (pending) {
         els.rmCommandPreview.textContent = '/' + account + ': K ' + pending.active_k + ' → ' + pending.payload.expected_k +
-          '\nОтвет на предыдущую отправку не получен. Повтор проверит тот же запрос и не продлит его окно.';
-        els.rmSendBtn.textContent = 'Проверить ранее отправленный запрос';
+          '\nThe previous response was not received. Retry checks the same request without extending its window.';
+        els.rmSendBtn.textContent = 'Check previous request';
         els.rmSendBtn.disabled = rmScaleRetrySending;
         return;
       }
@@ -5333,7 +5333,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         return;
       }
       if (rmScaleRetryPreview.loading) {
-        els.rmCommandPreview.textContent = '/' + account + ': проверка готовности к смене коэффициента…';
+        els.rmCommandPreview.textContent = '/' + account + ': checking readiness for coefficient change...';
         return;
       }
       if (rmScaleRetryPreview.error) {
@@ -5345,7 +5345,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         return;
       }
       els.rmCommandPreview.textContent = '/' + account + ': K ' + rmScaleRetryPreview.active_k + ' → ' + rmScaleRetryPreview.requested_k +
-        '\nПосле отправки: до 120 секунд на подтверждение всех ботов. При невыполнении условий коэффициент не изменится.';
+        '\nAfter sending: up to 120 seconds for all bots to confirm. The coefficient stays unchanged if the conditions are not met.';
       els.rmSendBtn.disabled = rmScaleRetrySending;
     }
 
@@ -5355,13 +5355,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       updateRmScaleRetryUi([account]);
       try {
         const data = await api('/config-ui/api/account-scale-retry?account_login=' + encodeURIComponent(account));
-        if (data.eligible !== true) throw new Error(data.block_reason || 'Повтор пока недоступен. Обновите статус.');
+        if (data.eligible !== true) throw new Error(data.block_reason || 'Retry is currently unavailable. Refresh status.');
         if (Number(data.account_login) !== Number(account) || typeof data.account_server !== 'string' || !data.account_server ||
             !Number.isFinite(data.active_k) || !Number.isFinite(data.requested_k) || data.active_k === data.requested_k ||
             !Number.isInteger(data.active_revision) || data.active_revision <= 0 ||
             !Number.isInteger(data.candidate_revision) || data.candidate_revision <= 0 ||
             typeof data.candidate_hash !== 'string' || !data.candidate_hash) {
-          throw new Error('Сервер не подтвердил ожидающую смену коэффициента. Обновите статус.');
+          throw new Error('Server did not confirm a pending coefficient change. Refresh status.');
         }
         if (seq !== rmScaleRetryPreviewSeq) return null;
         rmScaleRetryPreview = data;
@@ -5379,7 +5379,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     function rmScaleRetryRequestId() {
       if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
       if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function') {
-        throw new Error('Браузер не поддерживает безопасную отправку запроса. Откройте форму в современном браузере.');
+        throw new Error('Your browser cannot send this request securely. Use an up-to-date browser.');
       }
       const bytes = crypto.getRandomValues(new Uint8Array(16));
       bytes[6] = (bytes[6] & 15) | 64;
@@ -5390,14 +5390,14 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
 
     async function sendRmScaleRetry(payload) {
       if (payload.account_logins.length !== 1) {
-        setStatus('Для повтора смены коэффициента выберите ровно один счёт.', true);
+        setStatus('Select exactly one account to retry the coefficient change.', true);
         return;
       }
       if (rmScaleRetrySending) return;
       const account = String(payload.account_logins[0]);
       rmScaleRetrySending = true;
       els.rmSendBtn.disabled = true;
-      setStatus('Проверка запроса на смену коэффициента…');
+      setStatus('Checking coefficient change request...');
       try {
         let pending = rmScaleRetryRequests.get(account);
         if (!pending) {
@@ -5405,7 +5405,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
           if (!preview || preview.loading || String(preview.account_login) !== account) preview = await loadRmScaleRetryPreview(account);
           if (!preview || preview.error || preview.result) {
             throw new Error(preview && preview.error || rmScaleRetryPreview && rmScaleRetryPreview.error ||
-              'Обновите статус перед новым повтором смены коэффициента.');
+              'Refresh status before starting another coefficient change retry.');
           }
           pending = {active_k: preview.active_k, payload: {...payload,
             request_id: rmScaleRetryRequestId(), account_server: preview.account_server,
@@ -5418,21 +5418,21 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
           method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(pending.payload)
         });
         if (!data.retry || data.retry.request_id !== pending.payload.request_id || !Number.isFinite(data.retry.expires_at_epoch)) {
-          throw new Error('Не получено подтверждение запроса. Повторная отправка проверит тот же запрос.');
+          throw new Error('Request confirmation was not received. Resending will check the same request.');
         }
         rmScaleRetryRequests.delete(account);
         const remaining = Math.max(0, Math.ceil(data.retry.expires_at_epoch - Date.now() / 1000));
         let message;
         if (data.retry.status === 'completed') {
-          message = 'Смена коэффициента на K=' + data.retry.requested_k + ' завершена.';
+          message = 'Coefficient change to K=' + data.retry.requested_k + ' completed.';
         } else if (data.retry.status === 'committed') {
-          message = 'Переход к K=' + data.retry.requested_k + ' зафиксирован. Ожидаются подтверждения ботов.';
+          message = 'Change to K=' + data.retry.requested_k + ' committed. Waiting for bot confirmations.';
         } else if (data.retry.status === 'cancelled') {
-          message = 'Повтор смены коэффициента отменён. Обновите статус для проверки условий.';
+          message = 'Coefficient change retry cancelled. Refresh status to check readiness.';
         } else {
           message = remaining > 0 && data.retry.status !== 'expired'
-            ? 'Запрос принят: K ' + data.retry.active_k + ' → ' + data.retry.requested_k + '. На согласование осталось ' + remaining + ' с.'
-            : 'Окно ранее отправленного запроса завершено. Обновите статус для проверки результата.';
+            ? 'Request accepted: K ' + data.retry.active_k + ' → ' + data.retry.requested_k + '. ' + remaining + ' s left for confirmation.'
+            : 'The previous request window has expired. Refresh status to check the result.';
         }
         rmScaleRetryPreview = {account_login: account, result: message};
         setStatus(message);
