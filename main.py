@@ -734,6 +734,7 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "PROTOCOL_VERSION = 1\n"
         "HEARTBEAT_TTL_SEC = 60\n"
         "ACTIVATION_WINDOW_SEC = 120\n"
+        "RETRY_WINDOW_SEC = 120\n"
         "MIN_K = 1.0\n"
         "MAX_K = 100.0  # Syntax bound, not a claim that K=100 is safe for an account.\n"
         "SOURCE_BY_KIND = {\n"
@@ -911,11 +912,30 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    return \"\"\n"
         "\n"
         "\n"
+        "def retired_instance_snapshot(profile: dict) -> dict:\n"
+        "    \"\"\"Revoke an explicitly retired caller without changing the shared profile.\n"
+        "\n"
+        "    A valid zero-TTL snapshot also revokes legacy unity permission. An error or\n"
+        "    an unknown state would leave that permission intact in existing EAs.\n"
+        "    \"\"\"\n"
+        "    return {\n"
+        "        \"ok\": True, \"protocol_version\": PROTOCOL_VERSION,\n"
+        "        \"active_k\": profile[\"active_k\"], \"requested_k\": profile[\"requested_k\"],\n"
+        "        \"revision\": profile[\"revision\"],\n"
+        "        \"candidate_revision\": profile[\"candidate_revision\"],\n"
+        "        \"candidate_k\": profile[\"candidate_k\"],\n"
+        "        \"candidate_hash\": profile[\"candidate_hash\"],\n"
+        "        \"profile_day\": profile[\"profile_day\"], \"state\": profile[\"state\"],\n"
+        "        \"requires_lease\": True, \"allow_entries\": False,\n"
+        "        \"expires_in_sec\": 0, \"reason\": \"instance_retired\",\n"
+        "    }\n"
+        "\n"
+        "\n"
         "def participant_set(profile: dict, peers: list[dict], manifest: list[dict], runtime_statuses: list[dict], now: float) -> tuple[list[dict], str]:\n"
         "    \"\"\"Require registered configs, enrolled EAs and fresh legacy heartbeats.\n"
         "\n"
-        "    Stale enrolled trading instances are never silently retired. A future\n"
-        "    explicit retirement workflow can remove them after exposure reconciliation.\n"
+        "    Stale enrolled trading instances are never silently retired. The explicit\n"
+        "    operator workflow archives verified replacements before removing enrollment.\n"
         "    An expired former RM owner is excluded by the fencing lease.\n"
         "    \"\"\"\n"
         "    owner_id = profile.get(\"owner_instance_id\", \"\")\n"
@@ -939,6 +959,15 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        if kind not in SOURCE_BY_KIND or row.get(\"source_id\") != SOURCE_BY_KIND[kind]:\n"
         "            return chosen, f\"unknown_live_source:{kind}/{row.get('source_id', '')}\"\n"
         "        if (kind, bot, row.get(\"instance_id\")) not in linked:\n"
+        "            return chosen, f\"unregistered_live_instance:{row.get('instance_id', '')}\"\n"
+        "        scale_id = row.get(\"scale_instance_id\")\n"
+        "        if scale_id and not any(\n"
+        "            peer.get(\"scale_instance_id\") == scale_id\n"
+        "            and _identity(peer) == (kind, bot)\n"
+        "            and peer.get(\"runtime_instance_id\") == row.get(\"instance_id\")\n"
+        "            for peer in chosen\n"
+        "        ):\n"
+        "            # Reused runtime IDs must not hide a retired chart that reappears.\n"
         "            return chosen, f\"unregistered_live_instance:{row.get('instance_id', '')}\"\n"
         "    return chosen, \"\"\n"
         "\n"
@@ -986,6 +1015,87 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    if owner.get(\"owner_applied_revision\") != profile[\"revision\"]:\n"
         "        return \"owner_budgets_not_applied\", expires\n"
         "    return \"\", expires\n"
+        "\n"
+        "\n"
+        "def grant_retry(profile: dict, peers: list[dict], manifest: list[dict], runtime_statuses: list[dict],\n"
+        "                now: float, *, request_id: str, actor: str, scope: tuple,\n"
+        "                saved_requested_k) -> tuple[dict, dict]:\n"
+        "    \"\"\"Explicitly authorize one prepared, flat intraday attempt; never activate K.\n"
+        "\n"
+        "    The authenticated API owns permission checks and durable request-id history.\n"
+        "    This helper is pure and stores only the current immutable grant receipt.\n"
+        "    \"\"\"\n"
+        "    if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 128:\n"
+        "        raise ValueError(\"retry request_id is required and must be at most 128 characters\")\n"
+        "    if not isinstance(actor, str) or not actor.strip() or len(actor) > 256:\n"
+        "        raise ValueError(\"retry actor is required and must be at most 256 characters\")\n"
+        "    if (not isinstance(scope, (tuple, list)) or len(scope) != 3\n"
+        "            or not isinstance(scope[0], str) or not scope[0]\n"
+        "            or type(scope[1]) is not int or scope[1] <= 0\n"
+        "            or not isinstance(scope[2], str) or not scope[2]):\n"
+        "        raise ValueError(\"retry requires an exact environment/account/server scope\")\n"
+        "    if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now <= 0:\n"
+        "        raise ValueError(\"retry requires a valid database clock\")\n"
+        "    result = copy.deepcopy(profile)\n"
+        "    existing = result.get(\"retry_grant\")\n"
+        "    if isinstance(existing, dict):\n"
+        "        if existing.get(\"request_id\") == request_id:\n"
+        "            if existing.get(\"actor\") != actor or existing.get(\"scope\") != list(scope):\n"
+        "                raise ValueError(\"retry request_id belongs to another actor or scope\")\n"
+        "            return result, copy.deepcopy(existing)\n"
+        "        if existing.get(\"status\") in {\"pending\", \"in_progress\", \"committed\"}:\n"
+        "            raise ValueError(\"another retry is already pending or awaiting acknowledgement\")\n"
+        "    if result.get(\"state\") != \"WAITING\" or result.get(\"required_instance_ids\") != []:\n"
+        "        raise ValueError(\"retry requires a WAITING profile without an active transition\")\n"
+        "    candidate = result.get(\"candidate_revision\", 0)\n"
+        "    desired = validate_k(saved_requested_k)\n"
+        "    if (type(candidate) is not int or candidate <= 0 or candidate == result.get(\"revision\")\n"
+        "            or desired == result.get(\"active_k\") or desired != result.get(\"requested_k\")\n"
+        "            or desired != result.get(\"candidate_k\")):\n"
+        "        raise ValueError(\"retry requires the saved pending coefficient and immutable candidate\")\n"
+        "    expected_hash = revision_hash(tuple(scope), candidate, desired)\n"
+        "    candidate_rows = [row for row in result.get(\"revisions\", []) if row.get(\"revision\") == candidate]\n"
+        "    if (result.get(\"candidate_hash\") != expected_hash or len(candidate_rows) != 1\n"
+        "            or candidate_rows[0].get(\"hash\") != expected_hash or candidate_rows[0].get(\"k\") != desired\n"
+        "            or candidate_rows[0].get(\"committed\") is not False):\n"
+        "        raise ValueError(\"retry candidate revision/hash is inconsistent or already committed\")\n"
+        "    participants, problem = _ready_reason(result, peers, manifest, runtime_statuses, now,\n"
+        "                                          prepared=True, applied=True)\n"
+        "    if problem:\n"
+        "        raise ValueError(\"retry unavailable: \" + problem)\n"
+        "    problem, _ = _active_owner_permission(result, peers, now)\n"
+        "    if problem:\n"
+        "        raise ValueError(\"retry unavailable: \" + problem)\n"
+        "    for participant in participants:\n"
+        "        if tuple(participant.get(key) for key in (\"env\", \"account_login\", \"account_server\")) != tuple(scope):\n"
+        "            raise ValueError(\"retry participant scope mismatch\")\n"
+        "    grant = {\"request_id\": request_id, \"actor\": actor, \"scope\": list(scope),\n"
+        "             \"status\": \"pending\", \"created_at_epoch\": now, \"expires_at_epoch\": now + RETRY_WINDOW_SEC,\n"
+        "             \"status_changed_at_epoch\": now, \"server_day\": result[\"profile_day\"],\n"
+        "             \"owner_instance_id\": result[\"owner_instance_id\"], \"active_revision\": result[\"revision\"],\n"
+        "             \"candidate_revision\": candidate, \"candidate_hash\": expected_hash, \"candidate_k\": desired}\n"
+        "    result[\"retry_grant\"] = grant\n"
+        "    return result, copy.deepcopy(grant)\n"
+        "\n"
+        "\n"
+        "def _retry_status(profile: dict, status: str, now: float, reason: str = \"\") -> None:\n"
+        "    grant = profile[\"retry_grant\"]\n"
+        "    grant.update(status=status, status_changed_at_epoch=now)\n"
+        "    if reason:\n"
+        "        grant[\"reason\"] = reason\n"
+        "\n"
+        "\n"
+        "def _retry_binding_reason(profile: dict, scope: tuple, saved_requested_k) -> str:\n"
+        "    grant = profile[\"retry_grant\"]\n"
+        "    checks = ((grant.get(\"scope\") == list(scope), \"scope_changed\"),\n"
+        "              (grant.get(\"server_day\") == profile.get(\"profile_day\"), \"server_day_changed\"),\n"
+        "              (grant.get(\"owner_instance_id\") == profile.get(\"owner_instance_id\"), \"owner_changed\"),\n"
+        "              (grant.get(\"active_revision\") == profile.get(\"revision\"), \"active_revision_changed\"),\n"
+        "              (grant.get(\"candidate_revision\") == profile.get(\"candidate_revision\"), \"candidate_changed\"),\n"
+        "              (grant.get(\"candidate_hash\") == profile.get(\"candidate_hash\"), \"candidate_hash_changed\"),\n"
+        "              (grant.get(\"candidate_k\") == profile.get(\"candidate_k\") == profile.get(\"requested_k\"), \"coefficient_changed\"),\n"
+        "              (saved_requested_k is not None and validate_k(saved_requested_k) == grant.get(\"candidate_k\"), \"saved_coefficient_changed\"))\n"
+        "    return next((reason for valid, reason in checks if not valid), \"\")\n"
         "\n"
         "\n"
         "def advance_profile(profile: dict, peers: list[dict], manifest: list[dict], runtime_statuses: list[dict],\n"
@@ -1043,6 +1153,33 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "            result.update(candidate_revision=candidate, candidate_k=desired, candidate_hash=digest,\n"
         "                          candidate_created_day=result[\"profile_day\"], state=\"WAITING\", required_instance_ids=[])\n"
         "            result[\"revisions\"].append({\"revision\": candidate, \"k\": desired, \"hash\": digest, \"committed\": False})\n"
+        "    retry_open = False\n"
+        "    retry_abort = \"\"\n"
+        "    grant = result.get(\"retry_grant\")\n"
+        "    if isinstance(grant, dict) and grant.get(\"status\") in {\"pending\", \"in_progress\"}:\n"
+        "        problem = _retry_binding_reason(result, scope, saved_requested_k)\n"
+        "        created, expires = grant.get(\"created_at_epoch\"), grant.get(\"expires_at_epoch\")\n"
+        "        valid_window = (type(created) in (int, float) and type(expires) in (int, float)\n"
+        "                        and math.isfinite(created) and math.isfinite(expires)\n"
+        "                        and created <= now and 0 < expires - created <= RETRY_WINDOW_SEC)\n"
+        "        expired = valid_window and now >= expires\n"
+        "        if problem or not valid_window or expired:\n"
+        "            retry_abort = \"retry_\" + (problem or (\"expired\" if expired else \"invalid_window\"))\n"
+        "            _retry_status(result, \"expired\" if expired and not problem else \"cancelled\", now, retry_abort)\n"
+        "            if result[\"state\"] == \"PAUSING\":\n"
+        "                result.update(state=\"WAITING\", required_instance_ids=[])\n"
+        "        else:\n"
+        "            retry_open = True\n"
+        "            # A follower can report exposure before the next owner poll. Cancel\n"
+        "            # that attempt immediately, even while its pause has not started.\n"
+        "            _, problem = _ready_reason(result, all_peers, manifest, runtime_statuses, now,\n"
+        "                                        prepared=True, applied=True)\n"
+        "            if problem.startswith(\"exposure_or_request_in_flight:\"):\n"
+        "                retry_open = False\n"
+        "                retry_abort = problem\n"
+        "                _retry_status(result, \"cancelled\", now, problem)\n"
+        "                if result[\"state\"] == \"PAUSING\":\n"
+        "                    result.update(state=\"WAITING\", required_instance_ids=[])\n"
         "    reason = \"neutral_unity\" if not result[\"ever_nonunity\"] else \"active_profile\"\n"
         "    if fenced:\n"
         "        reason = \"owner_fenced\"\n"
@@ -1052,19 +1189,27 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        _, problem = _ready_reason(result, all_peers, manifest, runtime_statuses, now, applied=True)\n"
         "        if not problem and owner_request:\n"
         "            result.update(state=\"WAITING\", candidate_revision=0, candidate_k=result[\"active_k\"], candidate_hash=\"\", required_instance_ids=[])\n"
+        "            if isinstance(grant, dict) and grant.get(\"status\") == \"committed\":\n"
+        "                _retry_status(result, \"completed\", now)\n"
         "        else:\n"
         "            reason = problem or \"waiting_for_owner_release\"\n"
+        "    elif retry_abort:\n"
+        "        reason = retry_abort\n"
         "    elif result[\"candidate_revision\"]:\n"
         "        day = result[\"profile_day\"]\n"
         "        if result[\"state\"] == \"PAUSING\":\n"
         "            owner_peer = next((peer for peer in all_peers if peer.get(\"scale_instance_id\") == result[\"owner_instance_id\"]), {})\n"
         "            seconds = owner_peer.get(\"seconds_in_day\", 86400)\n"
-        "            if owner_request and seconds >= ACTIVATION_WINDOW_SEC:\n"
+        "            if not retry_open and owner_request and seconds >= ACTIVATION_WINDOW_SEC:\n"
         "                result.update(state=\"WAITING\", deferred_day=day, required_instance_ids=[])\n"
         "                reason = \"activation_window_closed\"\n"
         "            else:\n"
-        "                participants, problem = _ready_reason(result, all_peers, manifest, runtime_statuses, now, prepared=True, paused=True)\n"
+        "                participants, problem = _ready_reason(result, all_peers, manifest, runtime_statuses, now,\n"
+        "                                                      prepared=True, paused=True, applied=retry_open)\n"
         "                reason = problem or \"waiting_for_owner_commit\"\n"
+        "                if retry_open and problem.startswith(\"exposure_or_request_in_flight:\"):\n"
+        "                    _retry_status(result, \"cancelled\", now, problem)\n"
+        "                    result.update(state=\"WAITING\", required_instance_ids=[])\n"
         "                if not problem and owner_request:\n"
         "                    result.update(active_k=result[\"candidate_k\"], revision=result[\"candidate_revision\"], state=\"COMMITTED\",\n"
         "                                  ever_nonunity=result[\"ever_nonunity\"] or result[\"candidate_k\"] != 1.0)\n"
@@ -1072,25 +1217,33 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "                    for item in result[\"revisions\"]:\n"
         "                        if item[\"revision\"] == result[\"revision\"]:\n"
         "                            item[\"committed\"] = True\n"
+        "                    if retry_open:\n"
+        "                        _retry_status(result, \"committed\", now)\n"
         "                    reason = \"waiting_for_active_revision_ack\"\n"
-        "        elif day <= result[\"candidate_created_day\"]:\n"
+        "        elif not retry_open and day <= result[\"candidate_created_day\"]:\n"
         "            reason = \"waiting_for_next_server_day\"\n"
-        "        elif result[\"deferred_day\"] == day:\n"
+        "        elif not retry_open and result[\"deferred_day\"] == day:\n"
         "            reason = \"deferred_for_server_day\"\n"
-        "        elif owner_request and req[\"seconds_in_day\"] >= ACTIVATION_WINDOW_SEC:\n"
+        "        elif not retry_open and owner_request and req[\"seconds_in_day\"] >= ACTIVATION_WINDOW_SEC:\n"
         "            result[\"deferred_day\"] = day\n"
         "            reason = \"activation_window_closed\"\n"
         "        elif owner_request:\n"
-        "            participants, problem = _ready_reason(result, all_peers, manifest, runtime_statuses, now, prepared=True)\n"
+        "            participants, problem = _ready_reason(result, all_peers, manifest, runtime_statuses, now,\n"
+        "                                                  prepared=True, applied=retry_open)\n"
         "            if problem:\n"
         "                # Peers poll at different intervals. Give clock/readiness ACKs\n"
         "                # the rest of this window, but exposure blocks the whole day.\n"
         "                if problem.startswith(\"exposure_or_request_in_flight:\"):\n"
-        "                    result[\"deferred_day\"] = day\n"
+        "                    if retry_open:\n"
+        "                        _retry_status(result, \"cancelled\", now, problem)\n"
+        "                    else:\n"
+        "                        result[\"deferred_day\"] = day\n"
         "                reason = problem\n"
         "            else:\n"
         "                result.update(state=\"PAUSING\", attempt_day=day,\n"
         "                              required_instance_ids=sorted(peer[\"scale_instance_id\"] for peer in participants))\n"
+        "                if retry_open:\n"
+        "                    _retry_status(result, \"in_progress\", now)\n"
         "                reason = \"waiting_for_pause_ack\"\n"
         "        else:\n"
         "            reason = \"waiting_for_owner\"\n"
@@ -1119,6 +1272,8 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        \"allow_entries\": bool(allow), \"expires_in_sec\": expires,\n"
         "        \"reason\": reason,\n"
         "    }\n"
+        "    if isinstance(result.get(\"retry_grant\"), dict):\n"
+        "        response[\"retry_grant\"] = copy.deepcopy(result[\"retry_grant\"])\n"
         "    return result, response\n"
     ),
 }
@@ -1154,7 +1309,9 @@ from _opt_bot_api_embedded.config_market_tf_status import configuration_applicat
 from _opt_bot_api_embedded.account_lot_scale import (
     advance_profile as account_scale_advance,
     canonical_requested_k as account_scale_canonical_k,
+    grant_retry as account_scale_grant_retry,
     new_profile as account_scale_new_profile,
+    retired_instance_snapshot as account_scale_retired_snapshot,
     validate_request as account_scale_validate_request,
 )
 
@@ -1172,7 +1329,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI()
 
-CODE_VERSION = "v1.15"
+CODE_VERSION = "v1.17"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -1296,6 +1453,12 @@ class RmControlCommandRequest(BaseModel):
     duration: Optional[str] = None
     until: Optional[str] = None
     reason: Optional[str] = None
+    request_id: Optional[str] = None
+    account_server: Optional[str] = None
+    expected_active_revision: Optional[int] = None
+    expected_candidate_revision: Optional[int] = None
+    expected_candidate_hash: Optional[str] = None
+    expected_k: Optional[float] = None
 
 
 class RecommendationDecisionRequest(BaseModel):
@@ -4663,6 +4826,7 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
               <option value="rm_daystart">RM daystart</option>
               <option value="rm_reset">RM reset</option>
               <option value="rm_ratchet_rearm">Rearm profit protection (T5)</option>
+              <option value="account_scale_retry">Повторить смену коэффициента лота</option>
               <option value="stop_bots">Stop selected bots - close positions</option>
               <option value="pause_bots">Pause selected bots - keep positions</option>
               <option value="resume_bots">Resume selected bots</option>
@@ -4778,12 +4942,17 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       rm_daystart: "Clear current account stop and restore today's day-start baseline.",
       rm_reset: 'Reset account RM from current balance/equity. Does not rearm profit protection (T5).',
       rm_ratchet_rearm: "Start a new profit-protection (T5) cycle with the applied settings. Keeps today's baseline and current account/bot stops. Does not resume trading. Requires RM Controller 2.02 or newer.",
+      account_scale_retry: 'Открыть окно на 120 секунд для согласованной смены сохранённого коэффициента. Счёт должен быть без позиций и отложенных ордеров, все действующие боты должны подтвердить готовность. Выберите один счёт.',
       stop_bots: 'Hard stop for selected bot families: FLATTEN_AND_HALT.\nBlocks new entries and tells bots to flatten/close open positions for the selected period.',
       pause_bots: 'Soft pause for selected bot families: HALT_ONLY.\nBlocks new entries for the selected period, but keeps open positions running. No flatten.',
       resume_bots: 'Clear stops for selected bot families.'
     };
     let currentBotRows = [];
     let currentCatalogRows = [];
+    const rmScaleRetryRequests = new Map();
+    let rmScaleRetryPreview = null;
+    let rmScaleRetryPreviewSeq = 0;
+    let rmScaleRetrySending = false;
     let paramsLoadSeq = 0;
     let analyticsLoaded = false;
     let configValidationSeq = 0;
@@ -5114,6 +5283,13 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       els.rmUntilField.style.display = needsUntil ? '' : 'none';
       els.rmCommandDescription.textContent = RM_COMMAND_DESCRIPTIONS[action] || '';
 
+      if (action === 'account_scale_retry') {
+        updateRmScaleRetryUi(checkedValues(els.rmAccountList));
+        return;
+      }
+      els.rmSendBtn.textContent = 'Send RM command';
+      els.rmSendBtn.disabled = false;
+
       const accounts = checkedValues(els.rmAccountList);
       if (!accounts.length) {
         els.rmCommandPreview.textContent = 'No account selected';
@@ -5132,6 +5308,142 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
         until: rmUntilValue(),
         reason: 'config-ui ' + CONFIG_ACTOR
       };
+    }
+
+    function updateRmScaleRetryUi(accounts, refresh = false) {
+      els.rmSendBtn.textContent = 'Открыть окно смены коэффициента';
+      els.rmSendBtn.disabled = true;
+      if (accounts.length !== 1) {
+        rmScaleRetryPreviewSeq++;
+        rmScaleRetryPreview = null;
+        els.rmCommandPreview.textContent = 'Для повтора смены коэффициента выберите ровно один счёт.';
+        return;
+      }
+      const account = String(accounts[0]);
+      const pending = rmScaleRetryRequests.get(account);
+      if (pending) {
+        els.rmCommandPreview.textContent = '/' + account + ': K ' + pending.active_k + ' → ' + pending.payload.expected_k +
+          '\nОтвет на предыдущую отправку не получен. Повтор проверит тот же запрос и не продлит его окно.';
+        els.rmSendBtn.textContent = 'Проверить ранее отправленный запрос';
+        els.rmSendBtn.disabled = rmScaleRetrySending;
+        return;
+      }
+      if (refresh || !rmScaleRetryPreview || String(rmScaleRetryPreview.account_login) !== account) {
+        loadRmScaleRetryPreview(account);
+        return;
+      }
+      if (rmScaleRetryPreview.loading) {
+        els.rmCommandPreview.textContent = '/' + account + ': проверка готовности к смене коэффициента…';
+        return;
+      }
+      if (rmScaleRetryPreview.error) {
+        els.rmCommandPreview.textContent = rmScaleRetryPreview.error;
+        return;
+      }
+      if (rmScaleRetryPreview.result) {
+        els.rmCommandPreview.textContent = rmScaleRetryPreview.result;
+        return;
+      }
+      els.rmCommandPreview.textContent = '/' + account + ': K ' + rmScaleRetryPreview.active_k + ' → ' + rmScaleRetryPreview.requested_k +
+        '\nПосле отправки: до 120 секунд на подтверждение всех ботов. При невыполнении условий коэффициент не изменится.';
+      els.rmSendBtn.disabled = rmScaleRetrySending;
+    }
+
+    async function loadRmScaleRetryPreview(account) {
+      const seq = ++rmScaleRetryPreviewSeq;
+      rmScaleRetryPreview = {account_login: account, loading: true};
+      updateRmScaleRetryUi([account]);
+      try {
+        const data = await api('/config-ui/api/account-scale-retry?account_login=' + encodeURIComponent(account));
+        if (data.eligible !== true) throw new Error(data.block_reason || 'Повтор пока недоступен. Обновите статус.');
+        if (Number(data.account_login) !== Number(account) || typeof data.account_server !== 'string' || !data.account_server ||
+            !Number.isFinite(data.active_k) || !Number.isFinite(data.requested_k) || data.active_k === data.requested_k ||
+            !Number.isInteger(data.active_revision) || data.active_revision <= 0 ||
+            !Number.isInteger(data.candidate_revision) || data.candidate_revision <= 0 ||
+            typeof data.candidate_hash !== 'string' || !data.candidate_hash) {
+          throw new Error('Сервер не подтвердил ожидающую смену коэффициента. Обновите статус.');
+        }
+        if (seq !== rmScaleRetryPreviewSeq) return null;
+        rmScaleRetryPreview = data;
+        return data;
+      } catch (exc) {
+        if (seq === rmScaleRetryPreviewSeq) rmScaleRetryPreview = {account_login: account, error: exc.message};
+        return null;
+      } finally {
+        if (seq === rmScaleRetryPreviewSeq && els.rmActionSelect.value === 'account_scale_retry') {
+          updateRmScaleRetryUi(checkedValues(els.rmAccountList));
+        }
+      }
+    }
+
+    function rmScaleRetryRequestId() {
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+      if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function') {
+        throw new Error('Браузер не поддерживает безопасную отправку запроса. Откройте форму в современном браузере.');
+      }
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      bytes[6] = (bytes[6] & 15) | 64;
+      bytes[8] = (bytes[8] & 63) | 128;
+      const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+      return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
+    }
+
+    async function sendRmScaleRetry(payload) {
+      if (payload.account_logins.length !== 1) {
+        setStatus('Для повтора смены коэффициента выберите ровно один счёт.', true);
+        return;
+      }
+      if (rmScaleRetrySending) return;
+      const account = String(payload.account_logins[0]);
+      rmScaleRetrySending = true;
+      els.rmSendBtn.disabled = true;
+      setStatus('Проверка запроса на смену коэффициента…');
+      try {
+        let pending = rmScaleRetryRequests.get(account);
+        if (!pending) {
+          let preview = rmScaleRetryPreview;
+          if (!preview || preview.loading || String(preview.account_login) !== account) preview = await loadRmScaleRetryPreview(account);
+          if (!preview || preview.error || preview.result) {
+            throw new Error(preview && preview.error || rmScaleRetryPreview && rmScaleRetryPreview.error ||
+              'Обновите статус перед новым повтором смены коэффициента.');
+          }
+          pending = {active_k: preview.active_k, payload: {...payload,
+            request_id: rmScaleRetryRequestId(), account_server: preview.account_server,
+            expected_active_revision: preview.active_revision,
+            expected_candidate_revision: preview.candidate_revision,
+            expected_candidate_hash: preview.candidate_hash, expected_k: preview.requested_k}};
+          rmScaleRetryRequests.set(account, pending);
+        }
+        const data = await api('/config-ui/api/rm-command', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(pending.payload)
+        });
+        if (!data.retry || data.retry.request_id !== pending.payload.request_id || !Number.isFinite(data.retry.expires_at_epoch)) {
+          throw new Error('Не получено подтверждение запроса. Повторная отправка проверит тот же запрос.');
+        }
+        rmScaleRetryRequests.delete(account);
+        const remaining = Math.max(0, Math.ceil(data.retry.expires_at_epoch - Date.now() / 1000));
+        let message;
+        if (data.retry.status === 'completed') {
+          message = 'Смена коэффициента на K=' + data.retry.requested_k + ' завершена.';
+        } else if (data.retry.status === 'committed') {
+          message = 'Переход к K=' + data.retry.requested_k + ' зафиксирован. Ожидаются подтверждения ботов.';
+        } else if (data.retry.status === 'cancelled') {
+          message = 'Повтор смены коэффициента отменён. Обновите статус для проверки условий.';
+        } else {
+          message = remaining > 0 && data.retry.status !== 'expired'
+            ? 'Запрос принят: K ' + data.retry.active_k + ' → ' + data.retry.requested_k + '. На согласование осталось ' + remaining + ' с.'
+            : 'Окно ранее отправленного запроса завершено. Обновите статус для проверки результата.';
+        }
+        rmScaleRetryPreview = {account_login: account, result: message};
+        setStatus(message);
+        await loadRuntimeStatus().catch(() => {});
+      } catch (exc) {
+        setStatus(exc.message, true);
+      } finally {
+        rmScaleRetrySending = false;
+        if (els.rmActionSelect.value === 'account_scale_retry') updateRmScaleRetryUi(checkedValues(els.rmAccountList));
+        else els.rmSendBtn.disabled = false;
+      }
     }
 
     function renderRuntimeStatus(rows) {
@@ -5167,6 +5479,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
       const payload = rmCommandPayload();
       if (!payload.account_logins.length) {
         setStatus('Choose at least one RM account', true);
+        return;
+      }
+      if (payload.action === 'account_scale_retry') {
+        await sendRmScaleRetry(payload);
         return;
       }
       els.rmSendBtn.disabled = true;
@@ -6256,7 +6572,10 @@ CONFIG_UI_APP_HTML = r"""<!doctype html>
     }
     els.rmUntilInput.addEventListener('input', updateRmCommandUi);
     els.rmSendBtn.addEventListener('click', sendRmCommand);
-    els.rmRefreshStatusBtn.addEventListener('click', () => loadRuntimeStatus().catch(exc => setStatus(exc.message, true)));
+    els.rmRefreshStatusBtn.addEventListener('click', () => {
+      if (els.rmActionSelect.value === 'account_scale_retry') updateRmScaleRetryUi(checkedValues(els.rmAccountList), true);
+      loadRuntimeStatus().catch(exc => setStatus(exc.message, true));
+    });
     els.consulRefreshBtn.addEventListener('click', () => loadConsulRecommendations().catch(exc => setStatus(exc.message, true)));
     els.analyticsYearInput.addEventListener('input', () => { analyticsLoaded = false; });
     els.analyticsMonthSelect.addEventListener('change', () => {
@@ -8059,6 +8378,197 @@ async def config_ui_rm_state(request: Request, account_login: Optional[List[int]
         conn.close()
 
 
+def account_scale_retry_profile(cur, account, server=None, lock=False):
+    sql = """SELECT account_server, profile_json FROM bot_param.account_lot_scale_profile
+             WHERE env='prod' AND account_login=%s"""
+    params = (int(account),)
+    if server is not None:
+        sql += " AND account_server=%s"
+        params += (server,)
+    sql += " ORDER BY account_server"
+    if lock:
+        sql += " FOR UPDATE"
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    if len(rows) != 1:
+        raise ValueError("retry requires one existing account/server profile")
+    row = rows[0]
+    return ("prod", int(account), row["account_server"]), dict(row["profile_json"])
+
+
+def account_scale_retry_context(cur, scope):
+    cur.execute(
+        """SELECT instance_json, extract(epoch FROM last_seen_at) AS seen_epoch
+           FROM bot_param.account_lot_scale_instance i
+           WHERE env=%s AND account_login=%s AND account_server=%s
+             AND NOT EXISTS (
+                 SELECT 1 FROM bot_param.account_lot_scale_retirement retired
+                 WHERE retired.env=i.env AND retired.account_login=i.account_login
+                   AND retired.account_server=i.account_server
+                   AND retired.scale_instance_id=i.scale_instance_id)
+           ORDER BY scale_instance_id""", scope,
+    )
+    peers = [{**dict(row["instance_json"]), "last_seen_at": float(row["seen_epoch"])} for row in cur.fetchall()]
+    cur.execute(
+        """SELECT bot_kind, bot_id FROM bot_param.bot_config_current
+           WHERE env=%s AND account_login=%s ORDER BY bot_kind, bot_id""", scope[:2],
+    )
+    manifest = [dict(row) for row in cur.fetchall()]
+    cur.execute(
+        """SELECT bot_kind, bot_id, source_id, instance_id, status,
+                  runtime_json #>> '{account_scale,scale_instance_id}' AS scale_instance_id,
+                  applied_version_no, applied_config_hash, last_error, runtime_json,
+                  extract(epoch FROM last_seen_at) AS last_seen_at
+           FROM bot_param.bot_runtime_status
+           WHERE env=%s AND account_login=%s
+             AND last_seen_at >= clock_timestamp() - interval '60 seconds'
+             AND (COALESCE(runtime_json #>> '{account_scale,account_server}', runtime_json->>'account_server') IS NULL
+                  OR COALESCE(runtime_json #>> '{account_scale,account_server}', runtime_json->>'account_server')=%s)
+           ORDER BY instance_id""", scope,
+    )
+    statuses = [dict(row) for row in cur.fetchall()]
+    saved = load_runtime_current_config(cur, scope[0], scope[1], "rm_controller", "rm_controller")
+    cur.execute("SELECT extract(epoch FROM clock_timestamp()) AS now_epoch")
+    now = float(cur.fetchone()["now_epoch"])
+    return {"peers": peers, "manifest": manifest, "statuses": statuses, "saved": saved, "now": now}
+
+
+def account_scale_retry_summary(cur, account, actor):
+    scope, profile = account_scale_retry_profile(cur, account)
+    context = account_scale_retry_context(cur, scope)
+    result = {"ok": True, "account_login": scope[1], "account_server": scope[2],
+              "active_k": profile["active_k"], "requested_k": profile["requested_k"],
+              "active_revision": profile["revision"], "candidate_revision": profile["candidate_revision"],
+              "candidate_hash": profile["candidate_hash"], "server_day": profile["profile_day"],
+              "state": profile["state"], "grant": profile.get("retry_grant"),
+              "eligible": False, "block_reason": None}
+    try:
+        # Same proof as POST, without persisting a request or changing the profile.
+        request_account_scale_retry(cur, account, actor, None, preview=(scope, profile, context))
+        result["eligible"] = True
+    except ValueError as exc:
+        result["block_reason"] = str(exc)
+    return result
+
+
+def account_scale_update_retry_audit(cur, scope, oldgrant, newgrant):
+    if oldgrant == newgrant or not isinstance(newgrant, dict):
+        return
+    cur.execute(
+        """UPDATE bot_param.account_lot_scale_retry_request
+           SET grant_json=%s::jsonb, updated_at=clock_timestamp()
+           WHERE env=%s AND account_login=%s AND account_server=%s AND request_id=%s""",
+        (json.dumps(newgrant, allow_nan=False), *scope, newgrant["request_id"]),
+    )
+    if cur.rowcount != 1:
+        raise ValueError("retry audit receipt is missing; transition was not persisted")
+
+
+def request_account_scale_retry(cur, account, actor, req, preview=None):
+    if preview is None:
+        request_id = getattr(req, "request_id", None)
+        server = getattr(req, "account_server", None)
+        if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 128:
+            raise ValueError("retry request_id is required and must be at most 128 characters")
+        if not isinstance(server, str) or not server.strip():
+            raise ValueError("retry requires the previewed account_server")
+        scope, profile = account_scale_retry_profile(cur, account, server, lock=True)
+        cur.execute(
+            """SELECT actor, reason, grant_json FROM bot_param.account_lot_scale_retry_request
+               WHERE env=%s AND account_login=%s AND account_server=%s AND request_id=%s""",
+            (*scope, request_id),
+        )
+        prior = cur.fetchone()
+        target = dict(prior["grant_json"]) if prior else {
+            "active_revision": profile["revision"], "candidate_revision": profile["candidate_revision"],
+            "candidate_hash": profile["candidate_hash"], "candidate_k": profile["requested_k"]}
+        if (getattr(req, "expected_active_revision", None) != target["active_revision"]
+                or getattr(req, "expected_candidate_revision", None) != target["candidate_revision"]
+                or getattr(req, "expected_candidate_hash", None) != target["candidate_hash"]
+                or getattr(req, "expected_k", None) != target["candidate_k"]):
+            raise ValueError("retry preview changed; refresh the candidate before sending a new request")
+        if prior:
+            if prior["actor"] != actor or target.get("scope") != list(scope):
+                raise ValueError("retry request_id belongs to another actor or scope")
+            return {**target, "active_k": profile["active_k"], "requested_k": target["candidate_k"]}
+        context = account_scale_retry_context(cur, scope)
+    else:
+        scope, profile, context = preview
+        request_id = "preview"
+    saved = context["saved"]
+    if not saved:
+        raise ValueError("retry requires a saved RM configuration")
+    owner = next((row for row in context["peers"]
+                  if row.get("scale_instance_id") == profile.get("owner_instance_id")), None)
+    owner_status = next((row for row in context["statuses"] if owner
+                         and row.get("bot_kind") == "rm_controller" and row.get("bot_id") == "rm_controller"
+                         and row.get("source_id") == "rm"
+                         and row.get("instance_id") == owner.get("runtime_instance_id")
+                         and (row.get("scale_instance_id") or (row.get("runtime_json") or {}).get("account_scale", {}).get("scale_instance_id")) == owner.get("scale_instance_id")), None)
+    runtime = (owner_status or {}).get("runtime_json") or {}
+    if (not owner_status or str(owner_status.get("status") or "").lower() != "running"
+            or str(owner_status.get("last_error") or "").strip()
+            or owner_status.get("applied_version_no") != saved["active_version_no"]
+            or owner_status.get("applied_config_hash") != saved["config_hash"]
+            or runtime.get("ready") is False or runtime.get("applying") is True):
+        raise ValueError("retry requires the owner to have applied the current saved RM version/hash")
+    # An expired receipt may be superseded only after polls have released PAUSING.
+    previous = profile.get("retry_grant")
+    if (isinstance(previous, dict) and previous.get("status") in {"pending", "in_progress"}
+            and profile.get("state") == "WAITING"
+            and context["now"] >= float(previous.get("expires_at_epoch", float("inf")))):
+        profile = {**profile, "retry_grant": {**previous, "status": "expired",
+                   "status_changed_at_epoch": context["now"], "reason": "retry_expired"}}
+    updated, grant = account_scale_grant_retry(
+        profile, context["peers"], context["manifest"], context["statuses"], context["now"],
+        request_id=request_id, actor=actor, scope=scope,
+        saved_requested_k=account_scale_canonical_k(saved["config_json"]),
+    )
+    if preview is not None:
+        return grant
+    if previous != profile.get("retry_grant"):
+        account_scale_update_retry_audit(cur, scope, previous, profile["retry_grant"])
+    reason = str(getattr(req, "reason", None) or "Explicit account-scale retry").strip()
+    cur.execute(
+        """INSERT INTO bot_param.account_lot_scale_retry_request
+           (env, account_login, account_server, request_id, actor, reason, grant_json)
+           VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+        (*scope, request_id, actor, reason, json.dumps(grant, allow_nan=False)),
+    )
+    cur.execute(
+        """UPDATE bot_param.account_lot_scale_profile
+           SET profile_json=%s::jsonb, updated_at=clock_timestamp()
+           WHERE env=%s AND account_login=%s AND account_server=%s""",
+        (json.dumps(updated, allow_nan=False), *scope),
+    )
+    return {**grant, "active_k": profile["active_k"], "requested_k": profile["requested_k"]}
+
+
+@app.get("/config-ui/api/account-scale-retry")
+async def config_ui_account_scale_retry(request: Request, account_login: int):
+    _, actor, auth = require_config_ui_api(request)
+    if auth:
+        return auth
+    conn = config_ui_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            set_actor(cur, actor)
+            if not ensure_actor_account_access(cur, actor, account_login, can_apply=True):
+                raise ValueError(f"account {account_login} is not available for RM control")
+            result = account_scale_retry_summary(cur, account_login, actor)
+        conn.rollback()
+        return {**result, "version": CODE_VERSION}
+    except ValueError as exc:
+        conn.rollback()
+        return config_ui_json_error(400, str(exc))
+    except Exception as exc:
+        conn.rollback()
+        return config_ui_json_error(500, first_error_line(exc))
+    finally:
+        conn.close()
+
+
 @app.post("/config-ui/api/rm-command")
 async def config_ui_rm_command(req: RmControlCommandRequest, request: Request):
     _, actor, auth = require_config_ui_api(request)
@@ -8074,6 +8584,9 @@ async def config_ui_rm_command(req: RmControlCommandRequest, request: Request):
         return config_ui_json_error(400, "choose at least one account")
     if len(account_logins) > 20:
         return config_ui_json_error(400, "too many accounts")
+    retry_action = (req.action or "").strip().lower() == "account_scale_retry"
+    if retry_action and len(account_logins) != 1:
+        return config_ui_json_error(400, "account-scale retry requires exactly one account")
 
     conn = config_ui_conn()
     conn.autocommit = False
@@ -8084,6 +8597,9 @@ async def config_ui_rm_command(req: RmControlCommandRequest, request: Request):
             for account in account_logins:
                 if not ensure_actor_account_access(cur, actor, account, can_apply=True):
                     raise ValueError(f"account {account} is not available for RM control")
+                if retry_action:
+                    retry = request_account_scale_retry(cur, account, actor, req)
+                    continue
                 command_text = build_rm_control_command(account, req)
                 commands.append(
                     insert_rm_control_command(
@@ -8096,6 +8612,8 @@ async def config_ui_rm_command(req: RmControlCommandRequest, request: Request):
                     )
                 )
         conn.commit()
+        if retry_action:
+            return {"ok": True, "retry": retry, "commands": [], "version": CODE_VERSION}
         return {"ok": True, "commands": commands, "version": CODE_VERSION}
     except ValueError as exc:
         conn.rollback()
@@ -8586,12 +9104,26 @@ def bot_runtime_account_scale_in_transaction(cur, payload):
     if not profile_row:
         raise ValueError("account-scale profile could not be locked")
     profile = dict(profile_row["profile_json"])
-    cur.execute("SELECT extract(epoch FROM clock_timestamp()) AS now_epoch")
-    now = float(cur.fetchone()["now_epoch"])
+    # Polls and retirement share this profile lock. Never re-enroll a retired ID
+    # or grant it a unity permit; keep its archived identity and proof immutable.
+    cur.execute(
+        """SELECT replacement_instance_id, retired_at
+           FROM bot_param.account_lot_scale_retirement
+           WHERE env=%s AND account_login=%s AND account_server=%s
+             AND scale_instance_id=%s""", (*scope, data["scale_instance_id"]),
+    )
+    if cur.fetchone():
+        return account_scale_retired_snapshot(profile)
     cur.execute(
         """SELECT instance_json, extract(epoch FROM last_seen_at) AS seen_epoch
-           FROM bot_param.account_lot_scale_instance
+           FROM bot_param.account_lot_scale_instance i
            WHERE env=%s AND account_login=%s AND account_server=%s
+             AND NOT EXISTS (
+                 SELECT 1 FROM bot_param.account_lot_scale_retirement retired
+                 WHERE retired.env=i.env AND retired.account_login=i.account_login
+                   AND retired.account_server=i.account_server
+                   AND retired.scale_instance_id=i.scale_instance_id
+             )
            ORDER BY scale_instance_id""", scope,
     )
     peers = [{**dict(row["instance_json"]), "last_seen_at": float(row["seen_epoch"])} for row in cur.fetchall()]
@@ -8602,6 +9134,7 @@ def bot_runtime_account_scale_in_transaction(cur, payload):
     manifest = [dict(row) for row in cur.fetchall()]
     cur.execute(
         """SELECT bot_kind, bot_id, source_id, instance_id, status,
+                  runtime_json #>> '{account_scale,scale_instance_id}' AS scale_instance_id,
                   extract(epoch FROM last_seen_at) AS last_seen_at
            FROM bot_param.bot_runtime_status
            WHERE env=%s AND account_login=%s
@@ -8613,7 +9146,14 @@ def bot_runtime_account_scale_in_transaction(cur, payload):
     statuses = [dict(row) for row in cur.fetchall()]
     saved = load_runtime_current_config(cur, scope[0], scope[1], "rm_controller", "rm_controller")
     saved_k = account_scale_canonical_k(saved["config_json"]) if saved else None
+    # Status heartbeats can be written before waiting for this profile lock.
+    # Sample time after the reads so a newer observed heartbeat is not ignored
+    # as a future timestamp by the freshness check.
+    cur.execute("SELECT extract(epoch FROM clock_timestamp()) AS now_epoch")
+    now = float(cur.fetchone()["now_epoch"])
     updated, snapshot = account_scale_advance(profile, peers, manifest, statuses, data, now, saved_k)
+    if updated.get("retry_grant") != profile.get("retry_grant"):
+        account_scale_update_retry_audit(cur, scope, profile.get("retry_grant"), updated.get("retry_grant"))
     cur.execute(
         """INSERT INTO bot_param.account_lot_scale_instance
               (env, account_login, account_server, scale_instance_id, instance_json, last_seen_at)
