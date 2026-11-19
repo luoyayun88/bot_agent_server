@@ -3400,20 +3400,24 @@ _API_EMBEDDED_MODULE_SOURCES = {
     'rm_sl_pause_service': (
         "\"\"\"Small service boundaries for the staged SL Pause rollout.\n"
         "\n"
-        "Configuration is supplied by the service environment, never by an EA request.\n"
-        "Readers perform SELECTs only; creating/migrating tables is an explicit operation.\n"
-        "There is deliberately no ENFORCE writer or automatic fallback in this stage.\n"
+        "Live writers use the existing API transport and an explicit DB\n"
+        "registration. Client-declared RM identity is not a separate credential: this\n"
+        "retains the existing API-key behavior, including installations with no configured\n"
+        "key. Registration prevents scope mistakes; it does not authenticate provenance\n"
+        "when that existing transport is unauthenticated. No request can register an\n"
+        "owner, clock or baseline. Registration and migrations remain operator actions.\n"
         "\"\"\"\n"
         "from __future__ import annotations\n"
         "\n"
         "from dataclasses import dataclass\n"
         "from datetime import datetime, timezone\n"
         "import hmac\n"
+        "import hashlib\n"
         "import json\n"
         "\n"
         "from _opt_bot_api_embedded.rm_sl_pause_clock import BrokerClockMap\n"
         "from _opt_bot_api_embedded.rm_sl_pause_reader import build_sl_pause_observation\n"
-        "from _opt_bot_api_embedded.rm_sl_pause_store import Actor, Scope, SLPauseReader\n"
+        "from _opt_bot_api_embedded.rm_sl_pause_store import Actor, Scope, SLPauseReader, SLPauseStore, BOT_KINDS, _json\n"
         "\n"
         "\n"
         "class ShadowWriterDenied(ValueError):\n"
@@ -3422,6 +3426,10 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "\n"
         "class ShadowConfigurationError(ValueError):\n"
         "    pass\n"
+        "\n"
+        "\n"
+        "class ShadowWriterNotRegistered(ShadowWriterDenied):\n"
+        "    \"\"\"No producer registration exists; an OFF controller may poll safely.\"\"\"\n"
         "\n"
         "\n"
         "@dataclass(frozen=True)\n"
@@ -3433,7 +3441,7 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "\n"
         "def configured_shadow_writer(configuration: str, *, env, broker_server, account_login,\n"
         "                             instance_id, bot_kind, bot_id, credential) -> ShadowWriter:\n"
-        "    \"\"\"Resolve an exact, operator-configured RM/account/clock tuple, default deny.\"\"\"\n"
+        "    \"\"\"Legacy offline helper. Live HTTP routes use registered_shadow_writer.\"\"\"\n"
         "    scope = Scope(env, broker_server, account_login)\n"
         "    if bot_kind != \"rm_controller\" or bot_id != \"rm_controller\":\n"
         "        raise ShadowWriterDenied(\"SL shadow writes require the configured RM controller\")\n"
@@ -3471,6 +3479,94 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    if matched is None:\n"
         "        raise ShadowWriterDenied(\"SL shadow writer is not registered for this exact account and instance\")\n"
         "    return matched\n"
+        "\n"
+        "\n"
+        "REGISTRATION_TABLES = (\"rm_sl_owner\", \"rm_sl_clock_archive\", \"rm_sl_replay_baseline\")\n"
+        "PRODUCER_TABLES = (\"rm_sl_clock_archive\", \"rm_sl_replay_baseline\", \"rm_sl_activation\",\n"
+        "    \"rm_sl_request\", \"rm_sl_outcome\", \"rm_sl_pause_state\", \"rm_sl_checkpoint\",\n"
+        "    \"rm_sl_pause_event\", \"rm_sl_checkpoint_history\", \"rm_sl_control_event\",\n"
+        "    \"rm_sl_runtime_frame\", \"rm_sl_manual_resolution\")\n"
+        "\n"
+        "\n"
+        "def registered_shadow_writer(cursor, *, env, broker_server, account_login,\n"
+        "                             instance_id, bot_kind, bot_id, lock_owner=False) -> ShadowWriter:\n"
+        "    \"\"\"Resolve server-owned registration after existing API access checks.\n"
+        "\n"
+        "    Mutations lock the account BEFORE observing its registered owner, preventing\n"
+        "    a concurrent operator handover from authorizing the former RM again. Read\n"
+        "    callers must hold a read-only REPEATABLE READ transaction. Lease freshness\n"
+        "    is deliberately not an authentication rule: an expired owner must recover\n"
+        "    through the ordinary fenced claim/CAS path, never through self-registration.\n"
+        "    \"\"\"\n"
+        "    # Local import preserves the standalone main.py helper loading order.\n"
+        "    from _opt_bot_api_embedded.rm_sl_pause_recovery import RecoveryReader, validate_baseline\n"
+        "    scope = Scope(env, broker_server, account_login)\n"
+        "    if bot_kind != \"rm_controller\" or bot_id != \"rm_controller\":\n"
+        "        raise ShadowWriterDenied(\"SL writes require the registered RM controller\")\n"
+        "    if (not isinstance(instance_id, str) or not instance_id or instance_id != instance_id.strip()\n"
+        "            or len(instance_id) > 160 or any(ord(c) < 32 or ord(c) == 127 for c in instance_id)):\n"
+        "        raise ValueError(\"invalid RM instance identity\")\n"
+        "    actor = Actor(instance_id)\n"
+        "    for table in REGISTRATION_TABLES:\n"
+        "        cursor.execute(\"SELECT to_regclass(%s) AS table_name\", (\"bot_param.\" + table,))\n"
+        "        row = cursor.fetchone()\n"
+        "        if (row.get(\"table_name\") if isinstance(row, dict) else row[0]) is None:\n"
+        "            raise ShadowConfigurationError(\"SL Pause registration migration is not installed\")\n"
+        "    if lock_owner:\n"
+        "        SLPauseStore(cursor, actor=actor, allowed_rm_instance_id=instance_id)._lock(scope)\n"
+        "    reader = RecoveryReader(cursor)\n"
+        "    owner = reader.read_owner(scope)\n"
+        "    if owner is None:\n"
+        "        # Consumers announce themselves before activation; their rows do not\n"
+        "        # imply a producer registration. Any orphan producer evidence does.\n"
+        "        for table in PRODUCER_TABLES:\n"
+        "            cursor.execute(\"SELECT to_regclass(%s) AS table_name\", (\"bot_param.\" + table,))\n"
+        "            row = cursor.fetchone()\n"
+        "            if (row.get(\"table_name\") if isinstance(row, dict) else row[0]) is not None:\n"
+        "                cursor.execute(\"SELECT 1 FROM bot_param.\" + table +\n"
+        "                    \" WHERE env=%s AND broker_server=%s AND account_login=%s LIMIT 1\", scope.params())\n"
+        "                if cursor.fetchone() is not None:\n"
+        "                    raise ShadowConfigurationError(\"SL Pause producer registration is incomplete\")\n"
+        "        raise ShadowWriterNotRegistered(\"SL Pause producer is not registered for this account\")\n"
+        "    if owner[\"owner_instance_id\"] != instance_id:\n"
+        "        raise ShadowWriterDenied(\"SL writer is not registered for this exact account and instance\")\n"
+        "    try:\n"
+        "        if type(owner[\"owner_epoch\"]) is not int or owner[\"owner_epoch\"] < 1:\n"
+        "            raise ValueError(\"invalid registered owner epoch\")\n"
+        "        baselines = [reader.read_baseline(scope, bot, \"ENFORCE\") for bot in sorted(BOT_KINDS)]\n"
+        "        if any(row is None for row in baselines):\n"
+        "            raise ValueError(\"incomplete registered baseline bundle\")\n"
+        "        versions = {row[\"baseline_json\"][\"clock_map_version\"] for row in baselines}\n"
+        "        if len(versions) != 1:\n"
+        "            raise ValueError(\"ambiguous registered clock\")\n"
+        "        version = next(iter(versions))\n"
+        "        archived = reader.read_clock(scope, version)\n"
+        "        if archived is None or hashlib.sha256(_json(archived[\"clock_json\"]).encode()).hexdigest() != archived[\"content_hash\"]:\n"
+        "            raise ValueError(\"registered clock hash mismatch\")\n"
+        "        clock = BrokerClockMap.from_config(archived[\"clock_json\"])\n"
+        "        if clock.version != version:\n"
+        "            raise ValueError(\"registered clock identity mismatch\")\n"
+        "        now_msc = int(read_database_utc_now(cursor).timestamp() * 1000)\n"
+        "        origins, evidence, policies = set(), set(), set()\n"
+        "        for bot, row in zip(sorted(BOT_KINDS), baselines):\n"
+        "            value = row[\"baseline_json\"]\n"
+        "            if hashlib.sha256(_json(value).encode()).hexdigest() != row[\"content_hash\"]:\n"
+        "                raise ValueError(\"registered baseline hash mismatch\")\n"
+        "            validate_baseline(value, bot=bot, clocks={version: clock}, database_now_msc=now_msc)\n"
+        "            state = value[\"state\"]\n"
+        "            if (row[\"through_utc_msc\"] != value[\"through_utc_msc\"] or row[\"baseline_revision\"] != 1\n"
+        "                    or any(state[key] for key in (\"current_streak\", \"last_result_utc_msc\", \"last_result_order\",\n"
+        "                        \"pause_active\", \"pause_started_utc_msc\", \"pause_until_utc_msc\", \"pause_until_broker_msc\", \"generation\"))\n"
+        "                    or value[\"last_cycle\"] is not None or state[\"series_policy\"] != value[\"requested_policy\"]):\n"
+        "                raise ValueError(\"unsupported initial registration baseline\")\n"
+        "            origins.add(value[\"through_utc_msc\"])\n"
+        "            evidence.add(value[\"evidence_id\"])\n"
+        "            policies.add(_json(value[\"requested_policy\"]))\n"
+        "        if len(origins) != 1 or len(evidence) != 1 or len(policies) != 1:\n"
+        "            raise ValueError(\"inconsistent registered baseline bundle\")\n"
+        "    except (ValueError, TypeError, KeyError, OverflowError) as exc:\n"
+        "        raise ShadowConfigurationError(\"SL Pause registered history or clock evidence is invalid\") from exc\n"
+        "    return ShadowWriter(scope, actor, clock)\n"
         "\n"
         "\n"
         "READ_TABLES = (\"rm_sl_owner\", \"rm_sl_pause_state\", \"rm_sl_checkpoint\")\n"
@@ -3532,7 +3628,8 @@ _API_EMBEDDED_MODULE_SOURCES = {
     'rm_sl_pause_bootstrap': (
         "\"\"\"Bounded, read-only recovery material for the configured SHADOW RM writer.\n"
         "\n"
-        "Authenticate with configured_shadow_writer BEFORE calling this module. The\n"
+        "Resolve the server-owned registration with registered_shadow_writer AFTER the\n"
+        "existing API access checks and BEFORE calling this module. The\n"
         "caller owns a READ ONLY REPEATABLE READ transaction and closes/rolls it back;\n"
         "these helpers neither connect nor commit, claim, renew, migrate or publish.\n"
         "\n"
@@ -3626,7 +3723,7 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "                          max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES) -> dict:\n"
         "    \"\"\"Return one complete bounded snapshot, never a trading/replay permission.\n"
         "\n"
-        "    ``writer`` must be the result of trusted configured writer authentication,\n"
+        "    ``writer`` must be the result of trusted server-owned registration resolution,\n"
         "    not a request-supplied account or clock map. No mode argument is accepted.\n"
         "    Limits are service controls, not unbounded client pagination parameters.\n"
         "\n"
@@ -5442,8 +5539,8 @@ from _opt_bot_api_embedded.rm_sl_pause_gate import consumer_gate, read_activatio
 from _opt_bot_api_embedded.rm_sl_pause_recovery import persist_manual_release
 from _opt_bot_api_embedded.rm_sl_pause_manual_resolution import invalidate_manual_event
 from _opt_bot_api_embedded.rm_sl_pause_service import (
-    configured_shadow_writer, sl_tables_available, read_sl_pause_observations,
-    ShadowWriterDenied, ShadowConfigurationError,
+    registered_shadow_writer, sl_tables_available, read_sl_pause_observations,
+    ShadowWriterDenied, ShadowWriterNotRegistered, ShadowConfigurationError,
 )
 from _opt_bot_api_embedded.account_lot_scale import (
     advance_profile as account_scale_advance,
@@ -5468,7 +5565,7 @@ from pydantic import BaseModel, Field, StrictInt
 
 app = FastAPI()
 
-CODE_VERSION = "v1.18"
+CODE_VERSION = "v1.19"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -5834,19 +5931,42 @@ class ConfigUiPooledConnection:
     def __getattr__(self, name):
         return getattr(self._conn, name)
 
+    @property
+    def autocommit(self):
+        return self._conn.autocommit
+
+    @autocommit.setter
+    def autocommit(self, value):
+        self._conn.autocommit = value
+
     def close(self):
         if self._closed:
             return
-        close_conn = False
+        close_conn = bool(self._conn.closed)
         try:
             if not self._conn.closed:
                 try:
-                    self._conn.rollback()
+                    reset_config_ui_connection(self._conn)
                 except Exception:
                     close_conn = True
         finally:
-            self._pool.putconn(self._conn, close=close_conn)
-            self._closed = True
+            try:
+                self._pool.putconn(self._conn, close=close_conn)
+            finally:
+                self._closed = True
+
+
+def reset_config_ui_connection(conn):
+    """Return a pooled session to the write-capable baseline between requests.
+
+    rollback alone ends a transaction but does not undo set_session(readonly=True,
+    isolation_level='REPEATABLE READ'). A diagnostic reader must not poison the
+    next configuration/status/SL writer that borrows this same connection.
+    """
+    if conn.closed:
+        raise RuntimeError("Config UI database connection is closed")
+    conn.rollback()
+    conn.set_session(readonly=False, autocommit=False, isolation_level="READ COMMITTED", deferrable=False)
 
 
 def config_ui_enabled():
@@ -6008,7 +6128,13 @@ def config_ui_conn():
             CONFIG_UI_DB_POOL_DSN = db_url
             CONFIG_UI_DB_POOL_LIMITS = limits
         pool = CONFIG_UI_DB_POOL
-    return ConfigUiPooledConnection(pool, pool.getconn())
+    conn = pool.getconn()
+    try:
+        reset_config_ui_connection(conn)
+    except Exception:
+        pool.putconn(conn, close=True)
+        raise
+    return ConfigUiPooledConnection(pool, conn)
 
 
 @app.on_event("shutdown")
@@ -14088,15 +14214,15 @@ async def bot_runtime_status(req: BotRuntimeStatusRequest, request: Request):
         conn.close()
 
 
-def bot_runtime_sl_shadow_writer(req, request):
+def bot_runtime_sl_writer_identity(req):
     if type(req.account_login) is not int:
         raise ValueError("SL account_login must be an integer")
     env, account_login, bot_kind, bot_id, _source_id, instance_id = normalize_runtime_identity(req)
-    return configured_shadow_writer(
-        os.getenv("RM_SL_SHADOW_WRITERS_JSON", ""), env=env, broker_server=req.broker_server,
-        account_login=account_login, instance_id=instance_id, bot_kind=bot_kind, bot_id=bot_id,
-        credential=request.headers.get("X-RM-SL-Key", ""),
-    )
+    scope = SLPauseScope(env, req.broker_server, account_login)
+    if bot_kind != "rm_controller" or bot_id != "rm_controller":
+        raise ShadowWriterDenied("SL writes require the registered RM controller")
+    return dict(env=scope.env, broker_server=scope.broker_server, account_login=scope.account_login,
+        instance_id=instance_id, bot_kind=bot_kind, bot_id=bot_id)
 
 
 @app.post("/bot-runtime/sl-pause/bootstrap")
@@ -14106,7 +14232,7 @@ async def bot_runtime_sl_pause_bootstrap(req: BotRuntimeSlPauseBootstrapRequest,
     if auth:
         return auth
     try:
-        writer = bot_runtime_sl_shadow_writer(req, request)
+        identity = bot_runtime_sl_writer_identity(req)
     except ShadowWriterDenied as exc:
         return bot_runtime_json_error(403, str(exc))
     except ShadowConfigurationError as exc:
@@ -14119,8 +14245,13 @@ async def bot_runtime_sl_pause_bootstrap(req: BotRuntimeSlPauseBootstrapRequest,
         with conn.cursor(cursor_factory=DictCursor) as cur:
             if not sl_tables_available(cur, writable=True):
                 return bot_runtime_json_error(503, "SL Pause schema migration is not installed")
+            writer = registered_shadow_writer(cur, **identity)
             recovery = read_shadow_bootstrap(cur, writer)
         return {"ok": True, "recovery": recovery, "version": CODE_VERSION}
+    except ShadowWriterDenied as exc:
+        return bot_runtime_json_error(403, str(exc))
+    except ShadowConfigurationError as exc:
+        return bot_runtime_json_error(503, str(exc))
     except ValueError as exc:
         return bot_runtime_json_error(422, str(exc))
     except Exception as exc:
@@ -14136,7 +14267,7 @@ async def bot_runtime_sl_pause_claim(req: BotRuntimeSlPauseClaimRequest, request
     if auth:
         return auth
     try:
-        writer = bot_runtime_sl_shadow_writer(req, request)
+        identity = bot_runtime_sl_writer_identity(req)
     except ShadowWriterDenied as exc:
         return bot_runtime_json_error(403, str(exc))
     except ShadowConfigurationError as exc:
@@ -14149,12 +14280,19 @@ async def bot_runtime_sl_pause_claim(req: BotRuntimeSlPauseClaimRequest, request
         with conn.cursor(cursor_factory=DictCursor) as cur:
             if not sl_tables_available(cur, writable=True):
                 return bot_runtime_json_error(503, "SL Pause schema migration is not installed")
+            writer = registered_shadow_writer(cur, **identity, lock_owner=True)
             store = SLPauseStore(cur, actor=writer.actor, allowed_rm_instance_id=writer.actor.instance_id)
             owner = store.claim_owner(writer.scope, request_id=req.request_id, expected_epoch=req.expected_epoch,
                                       now=datetime.now(timezone.utc), lease_seconds=120)
         conn.commit()
         return {"ok": True, "mode": "SHADOW", "owner": owner,
                 "clock_map_version": writer.clock.version, "version": CODE_VERSION}
+    except ShadowWriterDenied as exc:
+        conn.rollback()
+        return bot_runtime_json_error(403, str(exc))
+    except ShadowConfigurationError as exc:
+        conn.rollback()
+        return bot_runtime_json_error(503, str(exc))
     except (SLPauseConflict, SLPauseFenced) as exc:
         conn.rollback()
         return bot_runtime_json_error(409, str(exc))
@@ -14175,9 +14313,7 @@ async def bot_runtime_sl_pause_shadow_sync(req: BotRuntimeSlPauseShadowRequest, 
     if auth:
         return auth
     try:
-        writer = bot_runtime_sl_shadow_writer(req, request)
-        now = datetime.now(timezone.utc)
-        publication = validate_shadow_publication(req.publication, writer.clock, now=now)
+        identity = bot_runtime_sl_writer_identity(req)
     except ShadowWriterDenied as exc:
         return bot_runtime_json_error(403, str(exc))
     except ShadowConfigurationError as exc:
@@ -14190,10 +14326,19 @@ async def bot_runtime_sl_pause_shadow_sync(req: BotRuntimeSlPauseShadowRequest, 
         with conn.cursor(cursor_factory=DictCursor) as cur:
             if not sl_tables_available(cur, writable=True):
                 return bot_runtime_json_error(503, "SL Pause schema migration is not installed")
+            writer = registered_shadow_writer(cur, **identity, lock_owner=True)
             store = SLPauseStore(cur, actor=writer.actor, allowed_rm_instance_id=writer.actor.instance_id)
+            now = datetime.now(timezone.utc)
+            publication = validate_shadow_publication(req.publication, writer.clock, now=now)
             receipt = publish_shadow_snapshot(store, writer.scope, publication, clock=writer.clock, now=now)
         conn.commit()
         return {"ok": True, "receipt": receipt, "version": CODE_VERSION}
+    except ShadowWriterDenied as exc:
+        conn.rollback()
+        return bot_runtime_json_error(403, str(exc))
+    except ShadowConfigurationError as exc:
+        conn.rollback()
+        return bot_runtime_json_error(503, str(exc))
     except (SLPauseConflict, SLPauseFenced) as exc:
         conn.rollback()
         return bot_runtime_json_error(409, str(exc))
@@ -14212,7 +14357,7 @@ async def _bot_runtime_sl_runtime_operation(req, request, operation):
     if auth:
         return auth
     try:
-        writer = bot_runtime_sl_shadow_writer(req, request)
+        identity = bot_runtime_sl_writer_identity(req)
     except ShadowWriterDenied as exc:
         return bot_runtime_json_error(403, str(exc))
     except ShadowConfigurationError as exc:
@@ -14228,8 +14373,16 @@ async def _bot_runtime_sl_runtime_operation(req, request, operation):
         with conn.cursor(cursor_factory=DictCursor) as cur:
             if not sl_tables_available(cur, writable=True) or not runtime_schema_available(cur):
                 return bot_runtime_json_error(503, "SL Pause migrations v1 through v4 are required")
+            try:
+                writer = registered_shadow_writer(cur, **identity, lock_owner=operation != "bootstrap")
+            except ShadowWriterNotRegistered:
+                if operation != "bootstrap":
+                    raise
+                return {"ok": True, "registered": False, "reason": "NOT_REGISTERED",
+                    "scope": {key: identity[key] for key in ("env", "broker_server", "account_login")},
+                    "instance_id": identity["instance_id"], "version": CODE_VERSION}
             if operation == "bootstrap":
-                response = {"runtime": read_runtime_bootstrap(cur, writer, req.requested_mode)}
+                response = {"registered": True, "runtime": read_runtime_bootstrap(cur, writer, req.requested_mode)}
             else:
                 store = SLPauseStore(cur, actor=writer.actor, allowed_rm_instance_id=writer.actor.instance_id)
                 if operation == "sync":
@@ -14261,6 +14414,12 @@ async def _bot_runtime_sl_runtime_operation(req, request, operation):
         if operation != "bootstrap":
             conn.commit()
         return {"ok": True, **response, "version": CODE_VERSION}
+    except ShadowWriterDenied as exc:
+        conn.rollback()
+        return bot_runtime_json_error(403, str(exc))
+    except ShadowConfigurationError as exc:
+        conn.rollback()
+        return bot_runtime_json_error(503, str(exc))
     except (SLPauseConflict, SLPauseFenced) as exc:
         conn.rollback()
         return bot_runtime_json_error(409, str(exc))
