@@ -4543,6 +4543,218 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    _canonical(result, limit=max_response_bytes)\n"
         "    return result\n"
     ),
+    'rm_sl_pause_instances': (
+        "\"\"\"Durable, explicitly enrolled SL slots; restart never resets trading state.\n"
+        "\n"
+        "The account advisory lock and transaction belong to the gate/operator caller.\n"
+        "There is no automatic enrollment from an untrusted heartbeat. An operator binds\n"
+        "an existing activation inventory anchor to an exact bot configuration and slot.\n"
+        "\"\"\"\n"
+        "from datetime import timedelta\n"
+        "import json\n"
+        "import re\n"
+        "\n"
+        "from _opt_bot_api_embedded.rm_sl_pause_store import BOT_KINDS, Conflict, Fenced, SLPauseReader, _text, _stored_time\n"
+        "\n"
+        "LEASE_SECONDS = 120\n"
+        "SCHEMA_SQL = (\n"
+        "    \"\"\"CREATE TABLE IF NOT EXISTS bot_param.rm_sl_instance_slot (\n"
+        "      env TEXT NOT NULL, broker_server TEXT NOT NULL, account_login BIGINT NOT NULL,\n"
+        "      bot_kind TEXT NOT NULL, registration_instance_id TEXT NOT NULL,\n"
+        "      bot_id TEXT NOT NULL, source_id TEXT NOT NULL, logical_slot TEXT NOT NULL,\n"
+        "      binding_revision BIGINT NOT NULL CHECK(binding_revision>0),\n"
+        "      current_instance_id TEXT NOT NULL, current_run_id TEXT NOT NULL,\n"
+        "      bound_at TIMESTAMPTZ NOT NULL, evidence_id TEXT NOT NULL,\n"
+        "      PRIMARY KEY(env,broker_server,account_login,bot_kind,registration_instance_id),\n"
+        "      UNIQUE(env,broker_server,account_login,bot_kind,bot_id,source_id,logical_slot))\"\"\",\n"
+        "    \"\"\"CREATE TABLE IF NOT EXISTS bot_param.rm_sl_instance_run (\n"
+        "      env TEXT NOT NULL, broker_server TEXT NOT NULL, account_login BIGINT NOT NULL,\n"
+        "      bot_kind TEXT NOT NULL, instance_id TEXT NOT NULL, run_id TEXT NOT NULL,\n"
+        "      registration_instance_id TEXT NOT NULL, binding_revision BIGINT NOT NULL,\n"
+        "      first_seen_at TIMESTAMPTZ NOT NULL, retired_at TIMESTAMPTZ,\n"
+        "      PRIMARY KEY(env,broker_server,account_login,bot_kind,instance_id,run_id))\"\"\",\n"
+        ")\n"
+        "\n"
+        "\n"
+        "def render_schema_migration():\n"
+        "    return '-- RM-01 restart-safe instance slots (v5); additive only.\\nBEGIN;\\n' + ';\\n'.join(SCHEMA_SQL) + ';\\nCOMMIT;\\n'\n"
+        "\n"
+        "\n"
+        "def instance_schema_available(cursor):\n"
+        "    for name in ('rm_sl_instance_slot', 'rm_sl_instance_run'):\n"
+        "        cursor.execute('SELECT to_regclass(%s) AS table_name', ('bot_param.' + name,))\n"
+        "        if not SLPauseReader(cursor)._one()['table_name']:\n"
+        "            return False\n"
+        "    return True\n"
+        "\n"
+        "\n"
+        "def read_instance_bindings(cursor, scope):\n"
+        "    if not instance_schema_available(cursor):\n"
+        "        return []\n"
+        "    cursor.execute('''SELECT * FROM bot_param.rm_sl_instance_slot\n"
+        "        WHERE env=%s AND broker_server=%s AND account_login=%s\n"
+        "        ORDER BY bot_kind,registration_instance_id LIMIT 513''', scope.params())\n"
+        "    reader, rows = SLPauseReader(cursor), []\n"
+        "    while (row := reader._one()) is not None:\n"
+        "        rows.append(row)\n"
+        "    if len(rows) > 512:\n"
+        "        raise Conflict('instance slot inventory exceeds limit')\n"
+        "    return rows\n"
+        "\n"
+        "\n"
+        "def validate_slot(value):\n"
+        "    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', value):\n"
+        "        raise ValueError('logical_slot must contain 1..32 ASCII letters, digits, underscore or hyphen')\n"
+        "    return value\n"
+        "\n"
+        "\n"
+        "def _consumer(cursor, scope, bot, instance):\n"
+        "    cursor.execute('''SELECT * FROM bot_param.rm_sl_consumer\n"
+        "        WHERE env=%s AND broker_server=%s AND account_login=%s AND bot_kind=%s AND instance_id=%s''',\n"
+        "        (*scope.params(), bot, instance))\n"
+        "    return SLPauseReader(cursor)._one()\n"
+        "\n"
+        "\n"
+        "def _activation(cursor, scope):\n"
+        "    cursor.execute('SELECT * FROM bot_param.rm_sl_activation WHERE env=%s AND broker_server=%s AND account_login=%s', scope.params())\n"
+        "    return SLPauseReader(cursor)._one()\n"
+        "\n"
+        "\n"
+        "def _inventory(activation):\n"
+        "    value = activation['inventory_json']\n"
+        "    return json.loads(value) if isinstance(value, str) else value\n"
+        "\n"
+        "\n"
+        "def enroll_instance_slot(cursor, scope, *, bot_kind, registration_instance_id, bot_id, source_id,\n"
+        "                         logical_slot, expected_activation_version, evidence_id, now):\n"
+        "    \"\"\"Operator-only, additive enrollment. Caller proves configuration identity.\n"
+        "\n"
+        "    It attaches the already registered run without changing inventory, consumers,\n"
+        "    activation version, owner, series, pause, baseline or historical outcomes.\n"
+        "    \"\"\"\n"
+        "    if bot_kind not in BOT_KINDS:\n"
+        "        raise ValueError('unknown bot')\n"
+        "    for name, value in (('registration_instance_id', registration_instance_id), ('bot_id', bot_id),\n"
+        "                        ('source_id', source_id), ('evidence_id', evidence_id)):\n"
+        "        _text(value, name, 160)\n"
+        "    validate_slot(logical_slot)\n"
+        "    if not instance_schema_available(cursor):\n"
+        "        raise Conflict('instance slot schema is not installed')\n"
+        "    activation = _activation(cursor, scope)\n"
+        "    if (not activation or activation['activation_version'] != expected_activation_version\n"
+        "            or registration_instance_id not in _inventory(activation)[bot_kind]):\n"
+        "        raise Conflict('enrollment requires the current registered activation instance')\n"
+        "    existing = read_instance_bindings(cursor, scope)\n"
+        "    if any(r['bot_kind'] == bot_kind and\n"
+        "           (r['registration_instance_id'] == registration_instance_id or\n"
+        "            (r['bot_id'], r['source_id'], r['logical_slot']) == (bot_id, source_id, logical_slot)) for r in existing):\n"
+        "        raise Conflict('slot is already enrolled; enrollment never replaces a binding')\n"
+        "    consumer = _consumer(cursor, scope, bot_kind, registration_instance_id)\n"
+        "    if not consumer:\n"
+        "        raise Conflict('registered consumer evidence is missing')\n"
+        "    cursor.execute('''INSERT INTO bot_param.rm_sl_instance_slot\n"
+        "        (env,broker_server,account_login,bot_kind,registration_instance_id,bot_id,source_id,logical_slot,\n"
+        "         binding_revision,current_instance_id,current_run_id,bound_at,evidence_id)\n"
+        "        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s,%s)''',\n"
+        "        (*scope.params(), bot_kind, registration_instance_id, bot_id, source_id, logical_slot,\n"
+        "         registration_instance_id, consumer['run_id'], _stored_time(consumer['last_seen_at']), evidence_id))\n"
+        "    cursor.execute('''INSERT INTO bot_param.rm_sl_instance_run\n"
+        "        (env,broker_server,account_login,bot_kind,instance_id,run_id,registration_instance_id,binding_revision,first_seen_at)\n"
+        "        VALUES(%s,%s,%s,%s,%s,%s,%s,1,%s)''',\n"
+        "        (*scope.params(), bot_kind, registration_instance_id, consumer['run_id'], registration_instance_id, now))\n"
+        "\n"
+        "\n"
+        "def read_instance_run(cursor, scope, bot, instance, run=None):\n"
+        "    sql = '''SELECT * FROM bot_param.rm_sl_instance_run\n"
+        "        WHERE env=%s AND broker_server=%s AND account_login=%s AND bot_kind=%s AND instance_id=%s'''\n"
+        "    params = (*scope.params(), bot, instance)\n"
+        "    if run is not None:\n"
+        "        sql += ' AND run_id=%s'\n"
+        "        params += (run,)\n"
+        "    cursor.execute(sql + ' ORDER BY binding_revision DESC LIMIT 1', params)\n"
+        "    return SLPauseReader(cursor)._one()\n"
+        "\n"
+        "\n"
+        "def claim_instance_slot(cursor, scope, bot, instance, payload, now):\n"
+        "    \"\"\"Account lock held: fence duplicates, then atomically retire/claim a run.\"\"\"\n"
+        "    logical_slot = payload.get('logical_slot')\n"
+        "    bindings = read_instance_bindings(cursor, scope)\n"
+        "    if not bindings and logical_slot is None:\n"
+        "        return None\n"
+        "    if logical_slot is not None:\n"
+        "        validate_slot(logical_slot)\n"
+        "        if not instance_schema_available(cursor):\n"
+        "            raise Conflict('instance slot schema is not installed')\n"
+        "        bot_id = _text(payload.get('bot_id'), 'bot_id', 160)\n"
+        "        source_id = _text(payload.get('source_id'), 'source_id', 160)\n"
+        "        binding = next((r for r in bindings if r['bot_kind'] == bot and\n"
+        "            (r['bot_id'], r['source_id'], r['logical_slot']) == (bot_id, source_id, logical_slot)), None)\n"
+        "        if not binding:\n"
+        "            # A new binary on a not-yet-enrolled scope keeps explicit inventory.\n"
+        "            # It cannot automatically acquire another slot or enroll an instance.\n"
+        "            if any(r['bot_kind'] == bot and (r['current_instance_id'] == instance or\n"
+        "                   r['registration_instance_id'] == instance) for r in bindings):\n"
+        "                raise Fenced('instance slot identity does not match the enrolled configuration')\n"
+        "            if instance_schema_available(cursor) and read_instance_run(cursor, scope, bot, instance):\n"
+        "                raise Fenced('instance belongs to a different or retired slot')\n"
+        "            return None\n"
+        "    else:\n"
+        "        binding = next((r for r in bindings if r['bot_kind'] == bot and r['current_instance_id'] == instance), None)\n"
+        "        if not binding:\n"
+        "            if bindings and read_instance_run(cursor, scope, bot, instance):\n"
+        "                raise Fenced('retired SL instance cannot return')\n"
+        "            return None\n"
+        "        if binding['current_run_id'] != payload['run_id']:\n"
+        "            raise Fenced('enrolled slot restart requires a slot-aware client')\n"
+        "    if (binding['current_instance_id'], binding['current_run_id']) == (instance, payload['run_id']):\n"
+        "        return binding\n"
+        "    activation = _activation(cursor, scope)\n"
+        "    if not activation or binding['registration_instance_id'] not in _inventory(activation)[bot]:\n"
+        "        raise Fenced('slot is no longer in the activation inventory')\n"
+        "    if instance != binding['registration_instance_id'] and instance in _inventory(activation)[bot]:\n"
+        "        raise Fenced('candidate instance is another activation registration anchor')\n"
+        "    seen = read_instance_run(cursor, scope, bot, instance, payload['run_id'])\n"
+        "    if seen:\n"
+        "        raise Fenced('retired SL run cannot return')\n"
+        "    if instance != binding['current_instance_id'] and read_instance_run(cursor, scope, bot, instance):\n"
+        "        raise Fenced('retired SL instance cannot claim with another run')\n"
+        "    previous = _consumer(cursor, scope, bot, binding['current_instance_id'])\n"
+        "    if not previous or previous['run_id'] != binding['current_run_id']:\n"
+        "        raise Conflict('bound consumer identity is inconsistent; reconciliation required')\n"
+        "    if _stored_time(previous['last_seen_at']) + timedelta(seconds=LEASE_SECONDS) > now:\n"
+        "        raise Conflict('a different run still owns this logical slot; wait for its lease')\n"
+        "    if previous['changes_overflow'] or previous['confirmed_client_sequence'] < previous['client_sequence']:\n"
+        "        raise Conflict('previous run has unreconciled history notifications')\n"
+        "    # Claims never erase a pre-existing new instance's unconfirmed notifications.\n"
+        "    candidate = _consumer(cursor, scope, bot, instance)\n"
+        "    if candidate and instance != binding['current_instance_id']:\n"
+        "        if candidate['run_id'] != payload['run_id']:\n"
+        "            if _stored_time(candidate['last_seen_at']) + timedelta(seconds=LEASE_SECONDS) > now:\n"
+        "                raise Conflict('a different run still owns the candidate instance')\n"
+        "            if candidate['changes_overflow'] or candidate['confirmed_client_sequence'] < candidate['client_sequence']:\n"
+        "                raise Conflict('candidate instance has unreconciled prior-run notifications')\n"
+        "    revision = binding['binding_revision'] + 1\n"
+        "    cursor.execute('''UPDATE bot_param.rm_sl_instance_run SET retired_at=%s\n"
+        "        WHERE env=%s AND broker_server=%s AND account_login=%s AND bot_kind=%s AND instance_id=%s AND run_id=%s AND retired_at IS NULL''',\n"
+        "        (now, *scope.params(), bot, binding['current_instance_id'], binding['current_run_id']))\n"
+        "    cursor.execute('''INSERT INTO bot_param.rm_sl_instance_run\n"
+        "        (env,broker_server,account_login,bot_kind,instance_id,run_id,registration_instance_id,binding_revision,first_seen_at)\n"
+        "        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)''',\n"
+        "        (*scope.params(), bot, instance, payload['run_id'], binding['registration_instance_id'], revision, now))\n"
+        "    cursor.execute('''UPDATE bot_param.rm_sl_instance_slot SET binding_revision=%s,\n"
+        "        current_instance_id=%s,current_run_id=%s,bound_at=%s\n"
+        "        WHERE env=%s AND broker_server=%s AND account_login=%s AND bot_kind=%s AND registration_instance_id=%s''',\n"
+        "        (revision, instance, payload['run_id'], now, *scope.params(), bot, binding['registration_instance_id']))\n"
+        "    return dict(binding, binding_revision=revision, current_instance_id=instance, current_run_id=payload['run_id'], bound_at=now, claimed=True)\n"
+        "\n"
+        "\n"
+        "def effective_inventory(inventory, bindings):\n"
+        "    \"\"\"Activation stores stable anchors; ACKs belong to the current bound run.\"\"\"\n"
+        "    by_anchor = {(r['bot_kind'], r['registration_instance_id']): r for r in bindings}\n"
+        "    return {bot: [by_anchor[(bot, instance)]['current_instance_id']\n"
+        "                  if (bot, instance) in by_anchor else instance for instance in instances]\n"
+        "            for bot, instances in inventory.items()}\n"
+    ),
     'rm_sl_pause_gate': (
         "\"\"\"Durable activation, consumer barriers and read-only gate projection for RM-01.\n"
         "\n"
@@ -4558,6 +4770,8 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "from _opt_bot_api_embedded.rm_sl_pause_clock import utc_milliseconds\n"
         "from _opt_bot_api_embedded.rm_sl_pause_store import BOT_KINDS, Conflict, Scope, SLPauseReader, _integer, _text, _stored_time\n"
         "from _opt_bot_api_embedded.rm_sl_pause_service import read_database_utc_now\n"
+        "from _opt_bot_api_embedded.rm_sl_pause_instances import (read_instance_bindings, read_instance_run,\n"
+        "    claim_instance_slot, effective_inventory, instance_schema_available)\n"
         "\n"
         "\n"
         "SCHEMA_SQL = (\n"
@@ -4624,7 +4838,12 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "\n"
         "\n"
         "def read_consumers(cursor, scope):\n"
-        "    cursor.execute(\"SELECT * FROM bot_param.rm_sl_consumer WHERE env=%s AND broker_server=%s AND account_login=%s ORDER BY bot_kind,instance_id LIMIT 513\", scope.params())\n"
+        "    retired_filter = ''' AND NOT EXISTS (SELECT 1 FROM bot_param.rm_sl_instance_run r\n"
+        "        WHERE r.env=c.env AND r.broker_server=c.broker_server AND r.account_login=c.account_login\n"
+        "        AND r.bot_kind=c.bot_kind AND r.instance_id=c.instance_id AND r.run_id=c.run_id\n"
+        "        AND r.retired_at IS NOT NULL AND c.confirmed_client_sequence>=c.client_sequence AND c.changes_overflow=false)''' if instance_schema_available(cursor) else ''\n"
+        "    cursor.execute('''SELECT c.* FROM bot_param.rm_sl_consumer c WHERE c.env=%s AND c.broker_server=%s AND c.account_login=%s'''\n"
+        "                   + retired_filter + ' ORDER BY c.bot_kind,c.instance_id LIMIT 513', scope.params())\n"
         "    reader, result = SLPauseReader(cursor), []\n"
         "    while (row := reader._one()) is not None:\n"
         "        result.append(row)\n"
@@ -4686,6 +4905,15 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        raise ValueError(\"invalid activation phase\")\n"
         "    now = _lock(cursor, scope)\n"
         "    old = read_activation(cursor, scope)\n"
+        "    bindings = read_instance_bindings(cursor, scope)\n"
+        "    by_current = {(r['bot_kind'], r['current_instance_id']): r for r in bindings}\n"
+        "    def current_run(row, bot, instance):\n"
+        "        binding = by_current.get((bot, instance))\n"
+        "        return bool(row and (not binding or row['run_id'] == binding['current_run_id']))\n"
+        "    def binding_history_ready(frame, selected_inventory):\n"
+        "        anchors = {(bot, instance) for bot, instances in selected_inventory.items() for instance in instances}\n"
+        "        return all(frame['processed_through_utc_msc'] > utc_milliseconds(_stored_time(r['bound_at']))\n"
+        "                   for r in bindings if (r['bot_kind'], r['registration_instance_id']) in anchors)\n"
         "    if (old[\"activation_version\"] if old else 0) != expected_version:\n"
         "        raise Conflict(\"activation version changed\")\n"
         "    if old and old[\"phase\"] in {\"ACTIVE\", \"PREPARE\"} and phase == \"SHADOW\":\n"
@@ -4698,43 +4926,44 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        frame = read_frame(cursor, scope, \"ENFORCE\")\n"
         "        owner = SLPauseReader(cursor).read_owner(scope)\n"
         "        if (not frame or not owner or not _frame_ready(frame, owner, now) or frame[\"account_issues\"]\n"
+        "                or not binding_history_ready(frame, _object(old['inventory_json']))\n"
         "                or any(not row[\"ready\"] or row[\"state\"][\"pause_active\"] for row in frame[\"streams\"])):\n"
         "            raise Conflict(\"ROLLBACK requires fresh reconciled CLEAR for every bot; finish or explicitly release active SL cycles first\")\n"
         "        consumers = {(r[\"bot_kind\"], r[\"instance_id\"]): r for r in read_consumers(cursor, scope)}\n"
-        "        for bot, instances in _object(old[\"inventory_json\"]).items():\n"
+        "        for bot, instances in effective_inventory(_object(old[\"inventory_json\"]), bindings).items():\n"
         "            for instance in instances:\n"
         "                row = consumers.get((bot, instance))\n"
-        "                if (not row or row[\"changes_overflow\"] or row[\"confirmed_client_sequence\"] < row[\"client_sequence\"]\n"
+        "                if (not current_run(row, bot, instance) or row[\"changes_overflow\"] or row[\"confirmed_client_sequence\"] < row[\"client_sequence\"]\n"
         "                        or _stored_time(row[\"last_seen_at\"]) + timedelta(seconds=30) <= now):\n"
         "                    raise Conflict(\"ROLLBACK requires fresh reconciled consumer history notifications\")\n"
         "    if phase == \"ACTIVE\":\n"
         "        if not old or old[\"phase\"] != \"PREPARE\" or _object(old[\"inventory_json\"]) != inventory:\n"
         "            raise Conflict(\"ACTIVE requires the acknowledged PREPARE inventory\")\n"
         "        consumers = {(r[\"bot_kind\"], r[\"instance_id\"]): r for r in read_consumers(cursor, scope)}\n"
-        "        for bot, instances in inventory.items():\n"
+        "        for bot, instances in effective_inventory(inventory, bindings).items():\n"
         "            for instance in instances:\n"
         "                row = consumers.get((bot, instance))\n"
-        "                if (not row or row[\"changes_overflow\"] or _stored_time(row[\"last_seen_at\"]) + timedelta(seconds=30) <= now\n"
+        "                if (not current_run(row, bot, instance) or row[\"changes_overflow\"] or _stored_time(row[\"last_seen_at\"]) + timedelta(seconds=30) <= now\n"
         "                        or row[\"applied_activation_version\"] != expected_version\n"
         "                        or row[\"confirmed_client_sequence\"] < row[\"client_sequence\"]):\n"
         "                    raise Conflict(\"every inventory instance must freshly acknowledge PREPARE and history\")\n"
         "        frame = read_frame(cursor, scope, \"ENFORCE\")\n"
         "        owner = SLPauseReader(cursor).read_owner(scope)\n"
-        "        if not frame or not owner or not _frame_ready(frame, owner, now):\n"
+        "        if not frame or not owner or not _frame_ready(frame, owner, now) or not binding_history_ready(frame, inventory):\n"
         "            raise Conflict(\"verified ENFORCE frame is not fresh\")\n"
         "        if frame[\"account_issues\"] or any(not r[\"ready\"] for r in frame[\"streams\"]):\n"
         "            raise Conflict(\"all eleven streams must reconcile before activation\")\n"
         "        versions = {r[\"bot_kind\"]: r[\"state_version\"] for r in frame[\"streams\"]}\n"
-        "        for bot, instances in inventory.items():\n"
+        "        for bot, instances in effective_inventory(inventory, bindings).items():\n"
         "            for instance in instances:\n"
         "                if consumers[(bot, instance)][\"applied_state_version\"] != versions[bot]:\n"
         "                    raise Conflict(\"every instance must acknowledge the current SL state version before activation\")\n"
         "    if old and old[\"phase\"] == \"ROLLBACK\" and phase != \"ROLLBACK\":\n"
         "        consumers = {(r[\"bot_kind\"], r[\"instance_id\"]): r for r in read_consumers(cursor, scope)}\n"
-        "        for bot, instances in _object(old[\"inventory_json\"]).items():\n"
+        "        for bot, instances in effective_inventory(_object(old[\"inventory_json\"]), bindings).items():\n"
         "            for instance in instances:\n"
         "                row = consumers.get((bot, instance))\n"
-        "                if (not row or row[\"applied_activation_version\"] != expected_version\n"
+        "                if (not current_run(row, bot, instance) or row[\"applied_activation_version\"] != expected_version\n"
         "                        or row[\"legacy_handoff_applied\"]\n"
         "                        or _stored_time(row[\"last_seen_at\"]) + timedelta(seconds=30) <= now):\n"
         "                    raise Conflict(\"all instances must acknowledge restoration of legacy SL before leaving ROLLBACK\")\n"
@@ -4764,7 +4993,10 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    now = now or read_database_utc_now(cursor)\n"
         "    stamp = utc_milliseconds(now)\n"
         "    activation = read_activation(cursor, scope)\n"
-        "    registered = bool(activation and instance in _object(activation[\"inventory_json\"])[bot])\n"
+        "    bindings = read_instance_bindings(cursor, scope)\n"
+        "    binding = next((r for r in bindings if r['bot_kind'] == bot and r['current_instance_id'] == instance), None)\n"
+        "    registered_instances = effective_inventory(_object(activation['inventory_json']), bindings)[bot] if activation else []\n"
+        "    registered = instance in registered_instances\n"
         "    selected = bool(activation and _object(activation[\"inventory_json\"])[bot])\n"
         "    phase = activation[\"phase\"] if activation else \"OFF\"\n"
         "    mode = \"ENFORCE\" if phase in {\"PREPARE\", \"ACTIVE\"} else \"SHADOW\" if phase == \"SHADOW\" else \"OFF\"\n"
@@ -4784,6 +5016,14 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    if consumer:\n"
         "        gate[\"confirmed_client_sequence\"] = consumer[\"confirmed_client_sequence\"]\n"
         "        gate[\"run_id\"] = consumer[\"run_id\"]\n"
+        "    if binding:\n"
+        "        gate.update(logical_slot=binding['logical_slot'], binding_revision=binding['binding_revision'],\n"
+        "                    registration_instance_id=binding['registration_instance_id'])\n"
+        "    elif bindings and read_instance_run(cursor, scope, bot, instance):\n"
+        "        # A retired anchor is never revived by a stale request, nor by ROLLBACK.\n"
+        "        gate.update(mode='ENFORCE', state='UNKNOWN', reason='INSTANCE_RETIRED', registered=False,\n"
+        "                    activation_ready=False, legacy_handoff=False, release_authorized=False)\n"
+        "        return gate\n"
         "    owner = SLPauseReader(cursor).read_owner(scope)\n"
         "    frame = read_frame(cursor, scope, mode) if mode != \"OFF\" else None\n"
         "    if mode == \"OFF\":\n"
@@ -4815,6 +5055,17 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        gate.update(state=\"UNKNOWN\", reason=\"INSTANCE_NOT_IN_INVENTORY\")\n"
         "    if phase == \"PREPARE\" and selected:\n"
         "        gate.update(state=\"RECONCILING\", reason=\"ACTIVATION_PREPARE\")\n"
+        "    if binding and mode == 'ENFORCE' and registered:\n"
+        "        if not consumer or consumer['run_id'] != binding['current_run_id']:\n"
+        "            gate.update(state='UNKNOWN', reason='BINDING_RUN_NOT_CONFIRMED', activation_ready=False)\n"
+        "        elif (gate['history_through_utc_msc'] <= utc_milliseconds(_stored_time(binding['bound_at']))\n"
+        "                or consumer['confirmed_client_sequence'] < consumer['client_sequence'] or consumer['changes_overflow']):\n"
+        "            gate.update(state='RECONCILING', reason='BINDING_HISTORY_AWAITS_RM')\n"
+        "        elif (consumer['applied_activation_version'] != gate['activation_version']\n"
+        "                or consumer['applied_state_version'] != gate['state_version']):\n"
+        "            gate.update(state='RECONCILING', reason='BINDING_STATE_ACK_REQUIRED')\n"
+        "        elif _stored_time(consumer['last_seen_at']) + timedelta(seconds=30) <= now:\n"
+        "            gate.update(state='UNKNOWN', reason='BINDING_CONSUMER_STALE')\n"
         "    return gate\n"
         "\n"
         "\n"
@@ -4830,14 +5081,19 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    changes, overflow = payload[\"pending_changes\"], payload[\"changes_overflow\"]\n"
         "    validate_pending_changes(changes, seq, overflow)\n"
         "    now = _lock(cursor, scope)\n"
+        "    binding = claim_instance_slot(cursor, scope, bot, instance, payload, now)\n"
         "    cursor.execute(\"SELECT * FROM bot_param.rm_sl_consumer WHERE env=%s AND broker_server=%s AND account_login=%s AND bot_kind=%s AND instance_id=%s\", (*scope.params(), bot, instance))\n"
         "    old = SLPauseReader(cursor)._one()\n"
         "    changed_run = old and old[\"run_id\"] != payload[\"run_id\"]\n"
         "    if changed_run and _stored_time(old[\"last_seen_at\"]) + timedelta(seconds=120) > now:\n"
         "        raise Conflict(\"a different run still owns this bot instance; wait for its lease\")\n"
+        "    if changed_run and (old['changes_overflow'] or old['confirmed_client_sequence'] < old['client_sequence']):\n"
+        "        raise Conflict('previous run has unreconciled history notifications')\n"
         "    if old and not changed_run and seq < old[\"client_sequence\"]:\n"
         "        raise Conflict(\"consumer sequence regressed\")\n"
         "    confirmed = old[\"confirmed_client_sequence\"] if old and not changed_run else 0\n"
+        "    if binding and binding.get('claimed'):\n"
+        "        confirmed = 0  # The replacement must cause a fresh verified RM scan.\n"
         "    cursor.execute(\"\"\"INSERT INTO bot_param.rm_sl_consumer\n"
         "        (env,broker_server,account_login,bot_kind,instance_id,run_id,client_sequence,confirmed_client_sequence,pending_changes_json,pending_changes_hash,changes_overflow,\n"
         "         applied_activation_version,applied_state_version,legacy_handoff_applied,last_seen_at)\n"
@@ -5674,6 +5930,7 @@ from _opt_bot_api_embedded.rm_sl_pause_runtime import (
     read_runtime_bootstrap, publish_runtime_frame, update_runtime_policy, runtime_schema_available,
 )
 from _opt_bot_api_embedded.rm_sl_pause_gate import consumer_gate, read_activation, read_consumers, project_gate
+from _opt_bot_api_embedded.rm_sl_pause_instances import read_instance_bindings
 from _opt_bot_api_embedded.rm_sl_pause_recovery import persist_manual_release
 from _opt_bot_api_embedded.rm_sl_pause_manual_resolution import invalidate_manual_event
 from _opt_bot_api_embedded.rm_sl_pause_service import (
@@ -5703,7 +5960,7 @@ from pydantic import BaseModel, Field, StrictInt
 
 app = FastAPI()
 
-CODE_VERSION = "v1.20"
+CODE_VERSION = "v1.21"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -5937,6 +6194,7 @@ class BotRuntimeSlPauseRuntimePolicyRequest(BotRuntimeSlPauseBootstrapRequest):
 
 
 class BotRuntimeSlPauseGateRequest(BotRuntimeSlPauseBootstrapRequest):
+    logical_slot: Optional[str] = None
     run_id: str
     client_sequence: StrictInt
     applied_activation_version: StrictInt
@@ -14602,6 +14860,7 @@ async def bot_runtime_sl_gate(req: BotRuntimeSlPauseGateRequest, request: Reques
         if bot not in {"bot123", *(f"n{i}" for i in range(4, 14))}:
             raise ValueError("gate requires a managed bot identity")
         payload = {key: getattr(req, key) for key in ("run_id", "client_sequence", "applied_activation_version", "applied_state_version", "legacy_handoff_applied", "pending_changes", "changes_overflow")}
+        payload.update(logical_slot=getattr(req, 'logical_slot', None), bot_id=_bot_id, source_id=_source_id)
     except ValueError as exc:
         return bot_runtime_json_error(400, str(exc))
     conn = config_ui_conn()
@@ -14662,18 +14921,50 @@ async def bot_runtime_entry_diagnostics(
                 (env, account_login, bot_kind),
             )
             candidates = [dict(row) for row in cur.fetchall()]
+            if len(candidates) > 500:
+                return bot_runtime_json_error(409, "diagnostic instance limit exceeded; explicit inventory selection required")
+            rows = []
+            unassigned = []
+            for row in candidates:
+                runtime = row.get("runtime_json") or {}
+                if isinstance(runtime, str):
+                    try:
+                        runtime = json.loads(runtime)
+                    except (ValueError, TypeError):
+                        runtime = {}
+                snapshot = runtime.get("entry_diagnostics") if isinstance(runtime, dict) else None
+                source_server = snapshot.get("broker_server") if isinstance(snapshot, dict) else None
+                if not source_server:
+                    # A legacy account login is not a globally unique account key.
+                    unassigned.append(row["instance_id"])
+                elif source_server == broker_server:
+                    row["broker_server"] = source_server
+                    rows.append(row)
             activation = None
             consumer_rows = []
+            bindings = []
+            registered_ids = set()
+            expected_ids = set()
             gates = []
             runtime_available = runtime_schema_available(cur)
             if runtime_available:
                 activation = read_activation(cur, sl_scope)
-                consumer_rows = read_consumers(cur, sl_scope)
+                consumer_rows = [row for row in read_consumers(cur, sl_scope) if row["bot_kind"] == bot_kind]
+                bindings = [row for row in read_instance_bindings(cur, sl_scope) if row["bot_kind"] == bot_kind]
                 if activation:
                     inventory = activation["inventory_json"]
                     if isinstance(inventory, str):
                         inventory = json.loads(inventory)
-                    gates = [project_gate(cur, sl_scope, bot_kind, instance) for instance in inventory[bot_kind]]
+                    registered_ids = set(inventory[bot_kind])
+                    by_anchor = {row["registration_instance_id"]: row for row in bindings}
+                    expected_ids = {by_anchor[anchor]["current_instance_id"] if anchor in by_anchor else anchor
+                                    for anchor in registered_ids}
+                # Observed consumers can precede runtime diagnostics or enrollment.
+                # Preserve the old anchors, but also project the actual new runs.
+                gate_ids = registered_ids | expected_ids | {row["instance_id"] for row in rows + consumer_rows}
+                if len(gate_ids) > 1024:
+                    return bot_runtime_json_error(409, "diagnostic instance limit exceeded; explicit inventory selection required")
+                gates = [project_gate(cur, sl_scope, bot_kind, instance) for instance in sorted(gate_ids)]
             sl_records, sl_available, observed_now = read_sl_pause_observations(
                 cur, sl_scope, bot_kind,
             )
@@ -14682,27 +14973,9 @@ async def bot_runtime_entry_diagnostics(
         # reader's seconds precision gives a conservative upper time bound.
         for gate in gates:
             gate["server_now_utc_msc"] = max(gate["server_now_utc_msc"], observed_now * 1000)
-            if gate["mode"] == "ENFORCE" and gate["valid_until_utc_msc"] <= (observed_now + 1) * 1000:
+            if (gate["mode"] == "ENFORCE" and gate.get("reason") != "INSTANCE_RETIRED"
+                    and gate["valid_until_utc_msc"] <= (observed_now + 1) * 1000):
                 gate.update(state="UNKNOWN", reason="GATE_OBSERVATION_EXPIRED")
-        if len(candidates) > 500:
-            return bot_runtime_json_error(409, "diagnostic instance limit exceeded; explicit inventory selection required")
-        rows = []
-        unassigned = []
-        for row in candidates:
-            runtime = row.get("runtime_json") or {}
-            if isinstance(runtime, str):
-                try:
-                    runtime = json.loads(runtime)
-                except (ValueError, TypeError):
-                    runtime = {}
-            snapshot = runtime.get("entry_diagnostics") if isinstance(runtime, dict) else None
-            source_server = snapshot.get("broker_server") if isinstance(snapshot, dict) else None
-            if not source_server:
-                # A legacy account login is not a globally unique account key.
-                unassigned.append(row["instance_id"])
-            elif source_server == broker_server:
-                row["broker_server"] = source_server
-                rows.append(row)
         expected = [{"env": env, "broker_server": broker_server, "account_login": account_login,
                      "bot_kind": bot_kind, "instance_id": gate["instance_id"]} for gate in gates]
         summary = build_bot_entry_summary(rows, bot_kind=bot_kind, now_epoch=observed_now, sl_records=sl_records,
@@ -14717,32 +14990,81 @@ async def bot_runtime_entry_diagnostics(
             "server_registered_runs": runtime_available,
         }
         observed_instances = {row["instance_id"]: row for row in rows}
-        expected_ids = {gate["instance_id"] for gate in gates}
-        complete = bool(activation and expected_ids and set(observed_instances) == expected_ids and not unassigned)
+        consumers = {row["instance_id"]: row for row in consumer_rows}
+        gates_by_id = {gate["instance_id"]: gate for gate in gates}
+        bound_current = {row["current_instance_id"]: row for row in bindings}
+        replaced_anchors = {row["registration_instance_id"]: row["current_instance_id"] for row in bindings
+                            if row["registration_instance_id"] != row["current_instance_id"]}
+        complete = bool(activation and expected_ids and not unassigned)
+        # Consumers have a stricter contact lease than runtime diagnostics. Parse
+        # only aware server timestamps; an absent or future timestamp proves nothing.
+        from datetime import datetime as DiagnosticsDatetime
+
+        def consumer_is_fresh(consumer):
+            stamp = consumer.get("last_seen_at") if consumer else None
+            try:
+                if isinstance(stamp, str):
+                    stamp = DiagnosticsDatetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                return bool(isinstance(stamp, DiagnosticsDatetime) and stamp.utcoffset() is not None
+                            and 0 <= observed_now - int(stamp.timestamp()) < 30)
+            except (ValueError, TypeError, OverflowError):
+                return False
+
         for instance in summary["instances"]:
-            gate = next((g for g in gates if g["instance_id"] == instance["instance_id"]), None)
-            consumer = next((r for r in consumer_rows if r["bot_kind"] == bot_kind and r["instance_id"] == instance["instance_id"]), None)
-            same_run = bool(consumer and instance.get("run_id") == consumer["run_id"])
-            if not same_run:
+            instance_id = instance["instance_id"]
+            gate = gates_by_id.get(instance_id)
+            consumer = consumers.get(instance_id)
+            binding = bound_current.get(instance_id)
+            consumer_fresh = consumer_is_fresh(consumer)
+            runtime_fresh = instance["health"]["contact"] == "fresh"
+            retired = instance_id in replaced_anchors or bool(gate and gate.get("reason") == "INSTANCE_RETIRED")
+            lifecycle = ("retired" if retired else "current" if runtime_fresh or consumer_fresh else
+                         "stale" if instance_id in observed_instances or consumer else "missing")
+            instance.update(lifecycle_status=lifecycle, inventory_registered=instance_id in expected_ids,
+                            consumer_contact_fresh=consumer_fresh)
+            if instance_id in replaced_anchors:
+                instance["replaced_by_instance_id"] = replaced_anchors[instance_id]
+            if binding:
+                instance.update(registration_instance_id=binding["registration_instance_id"],
+                                logical_slot=binding["logical_slot"], binding_revision=binding["binding_revision"])
+            same_run = bool(consumer and instance.get("run_id") == consumer["run_id"]
+                            and (not binding or consumer["run_id"] == binding["current_run_id"]))
+            instance["run_verified"] = same_run and consumer_fresh and not retired
+            if not retired and (instance_id not in expected_ids or not instance["run_verified"] or not runtime_fresh):
                 complete = False
-                instance["run_verified"] = False
-            else:
-                instance["run_verified"] = True
+            if retired or (instance["entry_permission"] == "allowed" and
+                           (not runtime_fresh or (gate and gate["mode"] == "ENFORCE" and not instance["run_verified"]))):
+                instance["entry_permission"] = "unknown"
             if gate:
+                gate.update(lifecycle_status=lifecycle, inventory_registered=instance_id in expected_ids)
+                if retired:
+                    gate.update(state="UNKNOWN", reason="INSTANCE_RETIRED", activation_ready=False)
+                    if instance_id in replaced_anchors:
+                        gate["replaced_by_instance_id"] = replaced_anchors[instance_id]
                 instance["sl_pause_gate"] = gate
-                if gate["mode"] == "ENFORCE":
+                if gate["mode"] == "ENFORCE" and not retired:
                     if gate["state"] == "PAUSED" or gate["reason"] == "ACTIVATION_PREPARE":
                         instance["entry_permission"] = "blocked"
                     elif (gate["state"] != "CLEAR" or not gate["activation_ready"]) and instance["entry_permission"] != "blocked":
                         instance["entry_permission"] = "unknown"
         summary["coverage"]["inventory_complete"] = complete
+        summary["coverage"].update(
+            expected_instance_ids=sorted(expected_ids),
+            current_instance_ids=sorted(item["instance_id"] for item in summary["instances"] if item["lifecycle_status"] == "current"),
+            retired_instance_ids=sorted(item["instance_id"] for item in summary["instances"] if item["lifecycle_status"] == "retired"),
+            stale_instance_ids=sorted(item["instance_id"] for item in summary["instances"] if item["lifecycle_status"] == "stale"),
+            missing_instance_ids=sorted(item["instance_id"] for item in summary["instances"] if item["lifecycle_status"] == "missing"),
+            unregistered_instance_ids=sorted(item["instance_id"] for item in summary["instances"]
+                                             if not item["inventory_registered"] and item["lifecycle_status"] != "retired"),
+        )
         summary["sl_pause_gates"] = gates
         # An incomplete inventory proves neither that every instance may enter
         # nor that every instance is stopped. Keep the observed subset explicit.
-        summary["observed_entry_permission"] = summary["entry_permission"]
+        permissions = {instance["entry_permission"] for instance in summary["instances"]
+                       if instance["lifecycle_status"] != "retired"}
+        summary["observed_entry_permission"] = next(iter(permissions)) if len(permissions) == 1 else "unknown"
         summary["entry_permission"] = "unknown"
         if complete:
-            permissions = {instance["entry_permission"] for instance in summary["instances"]}
             if len(permissions) == 1:
                 summary["entry_permission"] = next(iter(permissions))
         return {"ok": True, "diagnostics": summary, "version": CODE_VERSION}
