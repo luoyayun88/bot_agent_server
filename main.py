@@ -5030,7 +5030,12 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        gate.update(state=\"CLEAR\", reason=\"EXPLICIT_ROLLBACK\" if phase == \"ROLLBACK\" else \"NOT_ENABLED\")\n"
         "        return gate\n"
         "    if frame and owner:\n"
-        "        gate.update(owner_epoch=owner[\"owner_epoch\"], history_through_utc_msc=frame[\"processed_through_utc_msc\"],\n"
+        "        # Keep the frame's epoch with its barrier and state/checkpoint versions,\n"
+        "        # even in UNKNOWN. Clients retain these monotonic values from blocked\n"
+        "        # replies too. Relabelling an old frame with the new owner's epoch would\n"
+        "        # make the first real new frame look like a rollback of its barrier.\n"
+        "        # Only _frame_ready below can grant permission for the current owner.\n"
+        "        gate.update(owner_epoch=frame[\"owner_epoch\"], history_through_utc_msc=frame[\"processed_through_utc_msc\"],\n"
         "                    confirmed_barrier_seq=frame[\"barrier_seq\"])\n"
         "        row = next((r for r in frame[\"streams\"] if r[\"bot_kind\"] == bot), None)\n"
         "        if row:\n"
@@ -5960,7 +5965,7 @@ from pydantic import BaseModel, Field, StrictInt
 
 app = FastAPI()
 
-CODE_VERSION = "v1.21"
+CODE_VERSION = "v1.22"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
