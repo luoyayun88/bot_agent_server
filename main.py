@@ -1444,6 +1444,31 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    return result\n"
         "\n"
         "\n"
+        "def _merge_sl_gate_observation(previous, result):\n"
+        "    \"\"\"Keep delayed telemetry from replacing a newer accepted run/snapshot.\n"
+        "\n"
+        "    This orders diagnostics only, independently of the trading consumer ledger.\n"
+        "    Legacy optional JSON has no ordering claim and remains readable as unknown.\n"
+        "    \"\"\"\n"
+        "    incoming = result.get(\"sl_pause_gate\")\n"
+        "    old = previous.get(\"sl_pause_gate\")\n"
+        "    if not isinstance(incoming, Mapping) or not incoming.get(\"run_id\"):\n"
+        "        return result\n"
+        "    entry = result.get(\"entry_diagnostics\")\n"
+        "    accepted_run = entry.get(\"run_id\") if isinstance(entry, Mapping) else None\n"
+        "    preserve = bool(accepted_run and incoming[\"run_id\"] != accepted_run)\n"
+        "    if isinstance(old, Mapping) and old.get(\"run_id\") == incoming[\"run_id\"]:\n"
+        "        old_seq, sequence = old.get(\"snapshot_seq\"), incoming.get(\"snapshot_seq\")\n"
+        "        if type(old_seq) is int and type(sequence) is int and 0 < old_seq <= MAX_SEQUENCE:\n"
+        "            preserve = preserve or sequence <= old_seq\n"
+        "    if preserve:\n"
+        "        if isinstance(old, Mapping) and (not accepted_run or old.get(\"run_id\") == accepted_run):\n"
+        "            result[\"sl_pause_gate\"] = deepcopy(old)\n"
+        "        else:\n"
+        "            result.pop(\"sl_pause_gate\", None)\n"
+        "    return result\n"
+        "\n"
+        "\n"
         "def merge_runtime_diagnostics(\n"
         "    previous_runtime_json: Mapping[str, Any] | None,\n"
         "    incoming_runtime_json: Mapping[str, Any] | None,\n"
@@ -1491,7 +1516,7 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        result.pop(\"entry_diagnostics\", None)\n"
         "        if order:\n"
         "            result[ORDERING_KEY] = order\n"
-        "        return result\n"
+        "        return _merge_sl_gate_observation(previous, result)\n"
         "\n"
         "    snapshot = validate_entry_diagnostics(incoming[\"entry_diagnostics\"], now_epoch=now)\n"
         "    known_server = order.get(\"broker_server\") if order else None\n"
@@ -1530,7 +1555,7 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        result[ORDERING_KEY] = order\n"
         "        if previous_snapshot is not None and order.get(\"received_at_epoch\") is not None:\n"
         "            result[RECEIVED_AT_KEY] = order[\"received_at_epoch\"]\n"
-        "        return result\n"
+        "        return _merge_sl_gate_observation(previous, result)\n"
         "\n"
         "    result[\"entry_diagnostics\"] = snapshot\n"
         "    result[RECEIVED_AT_KEY] = now\n"
@@ -1540,7 +1565,7 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        \"evaluated_at_epoch\": snapshot[\"evaluated_at_epoch\"], \"payload_sha256\": digest,\n"
         "        \"received_at_epoch\": now, \"retired_run_ids\": sorted(retired),\n"
         "    }\n"
-        "    return result\n"
+        "    return _merge_sl_gate_observation(previous, result)\n"
         "\n"
         "\n"
         "def _snapshot_hash(snapshot: Mapping[str, Any]) -> str:\n"
@@ -1589,6 +1614,134 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        except (ValueError, TypeError):\n"
         "            return {}\n"
         "    return value if isinstance(value, Mapping) else {}\n"
+        "\n"
+        "\n"
+        "def sl_gate_client_observation(\n"
+        "    runtime_json: Any, *, now_epoch: int, current_run_id: str | None,\n"
+        "    run_verified: bool, contact_fresh: bool, lifecycle_status: str,\n"
+        ") -> dict[str, Any]:\n"
+        "    \"\"\"A bounded client report, distinct from the current server projection.\n"
+        "\n"
+        "    Legacy reports remain readable but cannot prove current client permission.\n"
+        "    Receipt/contact time never refreshes a client observation. Events describe\n"
+        "    what happened in that reported run; retaining an event does not make its\n"
+        "    historical block/cancellation current. This function never authorizes entry.\n"
+        "    \"\"\"\n"
+        "    now = _integer(now_epoch, \"now_epoch\", 0, MAX_EPOCH)\n"
+        "    runtime = _runtime({\"runtime_json\": runtime_json})\n"
+        "    raw = runtime.get(\"sl_pause_gate\")\n"
+        "    result: dict[str, Any] = dict(source=\"client_runtime\", status=\"missing\", freshness=\"unknown\",\n"
+        "        current=False, run_verified=False, effective_block=False,\n"
+        "        observed_at_utc_msc=None, age_upper_ms=None, lease_remaining_now_ms=None,\n"
+        "        observation={}, last_block=None, last_recovery=None, last_cancel=None,\n"
+        "        last_transport_failure=None, last_validation_failure=None)\n"
+        "    if raw is None:\n"
+        "        return result\n"
+        "    if not isinstance(raw, Mapping):\n"
+        "        result[\"status\"] = \"invalid\"\n"
+        "        return result\n"
+        "    fields: dict[str, Any] = {}\n"
+        "    errors = []\n"
+        "    text_fields = {\"mode\": 16, \"state\": 32, \"reason\": 256, \"server_reason\": 256, \"logical_slot\": 32,\n"
+        "                   \"run_id\": 160, \"time_source\": 48, \"validation_error\": 512}\n"
+        "    bool_fields = {\"required\", \"entry_allowed\", \"gate_ready\", \"legacy_handoff\", \"changes_overflow\", \"cancel_tracking_overflow\"}\n"
+        "    int_fields = {\"client_revision\", \"snapshot_seq\", \"client_sequence\", \"confirmed_client_sequence\", \"activation_version\",\n"
+        "                  \"state_version\", \"owner_epoch\", \"checkpoint_revision\", \"confirmed_barrier_seq\",\n"
+        "                  \"lease_remaining_ms\", \"next_poll_in_ms\", \"next_retry_in_ms\", \"last_request_rtt_ms\",\n"
+        "                  \"time_uncertainty_ms\", \"observed_at_utc_msc\", \"last_successful_refresh_utc_msc\",\n"
+        "                  \"transport_failures\", \"block_count\", \"recovery_count\", \"cancel_attempt_count\",\n"
+        "                  \"cancel_confirmed_count\", \"transport_failure_count\", \"validation_failure_count\",\n"
+        "                  \"pending_changes\", \"pending_cancel_unconfirmed\", \"last_cancel_retcode\", \"transport_error\"}\n"
+        "    for key in text_fields.keys() | bool_fields | int_fields | {\"last_http_code\"}:\n"
+        "        if key not in raw:\n"
+        "            continue\n"
+        "        value = raw[key]\n"
+        "        if key in text_fields:\n"
+        "            valid = isinstance(value, str) and len(value) <= text_fields[key] and \"\\x00\" not in value\n"
+        "        elif key in bool_fields:\n"
+        "            valid = type(value) is bool\n"
+        "        elif key == \"time_uncertainty_ms\" and value is None:\n"
+        "            valid = True\n"
+        "        else:\n"
+        "            valid = type(value) is int and (-1 if key == \"last_http_code\" else 0) <= value <= MAX_SEQUENCE\n"
+        "        if valid:\n"
+        "            fields[key] = value\n"
+        "        else:\n"
+        "            errors.append(key)\n"
+        "    result[\"observation\"] = fields\n"
+        "    revision = fields.get(\"client_revision\", 0)\n"
+        "    result[\"status\"] = \"supported\" if revision >= 4 else \"legacy\"\n"
+        "    observed = fields.get(\"observed_at_utc_msc\", 0)\n"
+        "    uncertainty = fields.get(\"time_uncertainty_ms\")\n"
+        "    valid_clock = (fields.get(\"time_source\") == \"server_anchor_monotonic\" and\n"
+        "                   type(uncertainty) is int and 0 < observed <= MAX_EPOCH*1000)\n"
+        "    result[\"observed_at_utc_msc\"] = observed or None\n"
+        "    # The database reader supplies whole seconds. Use the upper boundary so a\n"
+        "    # partially elapsed second cannot accidentally extend an observed lease.\n"
+        "    age = (now+1)*1000-observed+uncertainty if valid_clock else None\n"
+        "    result[\"age_upper_ms\"] = max(0, age) if age is not None else None\n"
+        "    same_run = bool(run_verified and current_run_id and fields.get(\"run_id\") == current_run_id)\n"
+        "    result[\"run_verified\"] = same_run and lifecycle_status == \"current\"\n"
+        "    if lifecycle_status == \"retired\":\n"
+        "        fresh = \"retired\"\n"
+        "    elif fields.get(\"run_id\") and current_run_id and fields[\"run_id\"] != current_run_id:\n"
+        "        fresh = \"run_mismatch\"\n"
+        "    elif not valid_clock or not result[\"run_verified\"] or not contact_fresh:\n"
+        "        fresh = \"unknown\"\n"
+        "    elif observed-uncertainty >= (now+1)*1000:\n"
+        "        fresh = \"future\"\n"
+        "    else:\n"
+        "        fresh = \"fresh\" if age < 15000 else \"stale\"\n"
+        "    result[\"freshness\"] = fresh\n"
+        "    result[\"current\"] = fresh == \"fresh\" and revision >= 4 and not errors\n"
+        "    if type(fields.get(\"lease_remaining_ms\")) is int and age is not None:\n"
+        "        result[\"lease_remaining_now_ms\"] = max(0, fields[\"lease_remaining_ms\"]-max(0, age))\n"
+        "    # A CLEAR snapshot with an elapsed lease cannot establish present local\n"
+        "    # permission. A recently reported technical block remains useful evidence.\n"
+        "    if fields.get(\"entry_allowed\") is True and fields.get(\"required\") is True:\n"
+        "        if result[\"lease_remaining_now_ms\"] is None:\n"
+        "            result.update(current=False, freshness=\"unknown\")\n"
+        "        elif result[\"lease_remaining_now_ms\"] == 0:\n"
+        "            result.update(current=False, freshness=\"lease_expired\")\n"
+        "    result[\"effective_block\"] = bool(result[\"current\"] and fields.get(\"required\") is True and\n"
+        "        fields.get(\"mode\") == \"ENFORCE\" and fields.get(\"entry_allowed\") is False)\n"
+        "    event_text = {\"reason\": 256, \"time_source\": 48, \"ticket\": 32, \"symbol\": 128,\n"
+        "                  \"run_id\": 160, \"instance_id\": 160, \"order_source\": 128,\n"
+        "                  \"confirmation_basis\": 128, \"validation_error\": 512}\n"
+        "    event_int = {\"utc_msc\", \"time_uncertainty_ms\", \"owner_epoch\", \"state_version\", \"checkpoint_revision\",\n"
+        "                 \"barrier_sequence\", \"client_sequence\", \"confirmed_client_sequence\", \"retcode\", \"terminal_error\", \"http_code\",\n"
+        "                 \"confirmation_utc_msc\"}\n"
+        "    event_bool = {\"confirmed_removed\", \"remove_accepted\"}\n"
+        "    for name in (\"last_block\", \"last_recovery\", \"last_cancel\", \"last_transport_failure\", \"last_validation_failure\"):\n"
+        "        event = raw.get(name)\n"
+        "        if event is None:\n"
+        "            continue\n"
+        "        if not isinstance(event, Mapping):\n"
+        "            errors.append(name)\n"
+        "            continue\n"
+        "        normalized = {}\n"
+        "        for key in event_text.keys() | event_int | event_bool:\n"
+        "            if key not in event:\n"
+        "                continue\n"
+        "            value = event[key]\n"
+        "            valid = (isinstance(value, str) and len(value) <= event_text[key] and \"\\x00\" not in value\n"
+        "                     if key in event_text else type(value) is bool if key in event_bool else\n"
+        "                     True if key in {\"time_uncertainty_ms\", \"confirmation_utc_msc\"} and value is None else\n"
+        "                     type(value) is int and (-1 if key == \"http_code\" else 0) <= value <= MAX_SEQUENCE)\n"
+        "            if valid:\n"
+        "                normalized[key] = value\n"
+        "            else:\n"
+        "                errors.append(name + \".\" + key)\n"
+        "        normalized[\"historical\"] = True\n"
+        "        normalized[\"same_current_run\"] = bool(result[\"run_verified\"] and normalized.get(\"run_id\") == current_run_id)\n"
+        "        event_time, event_uncertainty = normalized.get(\"utc_msc\", 0), normalized.get(\"time_uncertainty_ms\")\n"
+        "        event_clock = (normalized.get(\"time_source\") == \"server_anchor_monotonic\" and\n"
+        "                       type(event_uncertainty) is int and 0 < event_time <= MAX_EPOCH*1000)\n"
+        "        normalized[\"time_status\"] = (\"future\" if event_time-event_uncertainty >= (now+1)*1000 else \"anchored\") if event_clock else \"unknown\"\n"
+        "        result[name] = normalized\n"
+        "    if errors:\n"
+        "        result.update(status=\"invalid\", validation_errors=sorted(errors), current=False, effective_block=False)\n"
+        "    return result\n"
         "\n"
         "\n"
         "def _permission(values: Iterable[str]) -> str:\n"
@@ -3576,13 +3729,18 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "\n"
         "def sl_tables_available(cursor, *, writable=False) -> bool:\n"
         "    \"\"\"Catalog probe only. Absent migration must never trigger request-time DDL.\"\"\"\n"
-        "    for name in WRITE_TABLES if writable else READ_TABLES:\n"
-        "        cursor.execute(\"SELECT to_regclass(%s) AS table_name\", (\"bot_param.\" + name,))\n"
-        "        row = cursor.fetchone()\n"
-        "        value = row.get(\"table_name\") if isinstance(row, dict) else row[0]\n"
-        "        if value is None:\n"
-        "            return False\n"
-        "    return True\n"
+        "    return table_catalog_available(cursor, WRITE_TABLES if writable else READ_TABLES)\n"
+        "\n"
+        "\n"
+        "def table_catalog_available(cursor, names) -> bool:\n"
+        "    \"\"\"One uncached catalog round trip for fixed server-owned table names.\"\"\"\n"
+        "    names = tuple(names)\n"
+        "    if not names:\n"
+        "        return True\n"
+        "    cursor.execute(\"SELECT \" + \", \".join(\"to_regclass(%s) AS table_name_\" + str(i) for i in range(len(names))),\n"
+        "                   tuple(\"bot_param.\" + name for name in names))\n"
+        "    row = SLPauseReader(cursor)._one()\n"
+        "    return bool(row and all(value is not None for value in row.values()))\n"
         "\n"
         "\n"
         "def read_database_utc_now(cursor) -> datetime:\n"
@@ -4555,6 +4713,7 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "import re\n"
         "\n"
         "from _opt_bot_api_embedded.rm_sl_pause_store import BOT_KINDS, Conflict, Fenced, SLPauseReader, _text, _stored_time\n"
+        "from _opt_bot_api_embedded.rm_sl_pause_service import table_catalog_available\n"
         "\n"
         "LEASE_SECONDS = 120\n"
         "SCHEMA_SQL = (\n"
@@ -4581,15 +4740,11 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "\n"
         "\n"
         "def instance_schema_available(cursor):\n"
-        "    for name in ('rm_sl_instance_slot', 'rm_sl_instance_run'):\n"
-        "        cursor.execute('SELECT to_regclass(%s) AS table_name', ('bot_param.' + name,))\n"
-        "        if not SLPauseReader(cursor)._one()['table_name']:\n"
-        "            return False\n"
-        "    return True\n"
+        "    return table_catalog_available(cursor, ('rm_sl_instance_slot', 'rm_sl_instance_run'))\n"
         "\n"
         "\n"
-        "def read_instance_bindings(cursor, scope):\n"
-        "    if not instance_schema_available(cursor):\n"
+        "def read_instance_bindings(cursor, scope, *, schema_available=None):\n"
+        "    if not (instance_schema_available(cursor) if schema_available is None else schema_available):\n"
         "        return []\n"
         "    cursor.execute('''SELECT * FROM bot_param.rm_sl_instance_slot\n"
         "        WHERE env=%s AND broker_server=%s AND account_login=%s\n"
@@ -4675,15 +4830,16 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    return SLPauseReader(cursor)._one()\n"
         "\n"
         "\n"
-        "def claim_instance_slot(cursor, scope, bot, instance, payload, now):\n"
+        "def claim_instance_slot(cursor, scope, bot, instance, payload, now, *, bindings=None, schema_available=None):\n"
         "    \"\"\"Account lock held: fence duplicates, then atomically retire/claim a run.\"\"\"\n"
         "    logical_slot = payload.get('logical_slot')\n"
-        "    bindings = read_instance_bindings(cursor, scope)\n"
+        "    if bindings is None:\n"
+        "        bindings = read_instance_bindings(cursor, scope, schema_available=schema_available)\n"
         "    if not bindings and logical_slot is None:\n"
         "        return None\n"
         "    if logical_slot is not None:\n"
         "        validate_slot(logical_slot)\n"
-        "        if not instance_schema_available(cursor):\n"
+        "        if not (instance_schema_available(cursor) if schema_available is None else schema_available):\n"
         "            raise Conflict('instance slot schema is not installed')\n"
         "        bot_id = _text(payload.get('bot_id'), 'bot_id', 160)\n"
         "        source_id = _text(payload.get('source_id'), 'source_id', 160)\n"
@@ -4837,11 +4993,15 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    return _object(row[\"frame_json\"]) if row else None\n"
         "\n"
         "\n"
-        "def read_consumers(cursor, scope):\n"
-        "    retired_filter = ''' AND NOT EXISTS (SELECT 1 FROM bot_param.rm_sl_instance_run r\n"
+        "def _consumer_retired_filter(schema_available):\n"
+        "    return ''' AND NOT EXISTS (SELECT 1 FROM bot_param.rm_sl_instance_run r\n"
         "        WHERE r.env=c.env AND r.broker_server=c.broker_server AND r.account_login=c.account_login\n"
         "        AND r.bot_kind=c.bot_kind AND r.instance_id=c.instance_id AND r.run_id=c.run_id\n"
-        "        AND r.retired_at IS NOT NULL AND c.confirmed_client_sequence>=c.client_sequence AND c.changes_overflow=false)''' if instance_schema_available(cursor) else ''\n"
+        "        AND r.retired_at IS NOT NULL AND c.confirmed_client_sequence>=c.client_sequence AND c.changes_overflow=false)''' if schema_available else ''\n"
+        "\n"
+        "\n"
+        "def read_consumers(cursor, scope):\n"
+        "    retired_filter = _consumer_retired_filter(instance_schema_available(cursor))\n"
         "    cursor.execute('''SELECT c.* FROM bot_param.rm_sl_consumer c WHERE c.env=%s AND c.broker_server=%s AND c.account_login=%s'''\n"
         "                   + retired_filter + ' ORDER BY c.bot_kind,c.instance_id LIMIT 513', scope.params())\n"
         "    reader, result = SLPauseReader(cursor), []\n"
@@ -4986,14 +5146,61 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "                and 0 <= now_msc - frame[\"history_verified_utc_msc\"] < 120000)\n"
         "\n"
         "\n"
-        "def project_gate(cursor, scope, bot, instance, *, now=None):\n"
+        "def frame_readiness_diagnostics(frame, owner, now):\n"
+        "    \"\"\"Explain the existing readiness predicates without granting permission.\n"
+        "\n"
+        "    Keep owner and frame identities separate, including during takeover. These\n"
+        "    values are diagnostic only; the wire gate's monotonic values still belong\n"
+        "    to the frame (REL032), and _frame_ready remains the authorization predicate.\n"
+        "    \"\"\"\n"
+        "    stamp = utc_milliseconds(now)\n"
+        "    reasons = []\n"
+        "    detail = dict(observed_at_utc_msc=stamp, owner_epoch=owner[\"owner_epoch\"] if owner else None,\n"
+        "        owner_revision=owner[\"owner_revision\"] if owner else None,\n"
+        "        frame_owner_epoch=frame[\"owner_epoch\"] if frame else None,\n"
+        "        frame_owner_revision=frame[\"owner_revision\"] if frame else None,\n"
+        "        owner_lease_until_utc_msc=None, owner_lease_remaining_ms=None,\n"
+        "        history_through_age_ms=None, history_verified_age_ms=None,\n"
+        "        history_valid_until_utc_msc=None)\n"
+        "    if not owner:\n"
+        "        reasons.append(\"OWNER_MISSING\")\n"
+        "    else:\n"
+        "        lease = utc_milliseconds(_stored_time(owner[\"lease_until\"]))\n"
+        "        detail.update(owner_lease_until_utc_msc=lease, owner_lease_remaining_ms=max(0, lease-stamp))\n"
+        "        if _stored_time(owner[\"lease_until\"]) <= now:\n"
+        "            reasons.append(\"OWNER_LEASE_EXPIRED\")\n"
+        "        if not owner[\"recovery_ready\"]:\n"
+        "            reasons.append(\"OWNER_RECOVERY_PENDING\")\n"
+        "    if not frame:\n"
+        "        reasons.append(\"FRAME_MISSING\")\n"
+        "    else:\n"
+        "        if owner and frame[\"owner_epoch\"] != owner[\"owner_epoch\"]:\n"
+        "            reasons.append(\"FRAME_OWNER_EPOCH_MISMATCH\")\n"
+        "        if owner and frame[\"owner_revision\"] != owner[\"owner_revision\"]:\n"
+        "            reasons.append(\"FRAME_OWNER_REVISION_MISMATCH\")\n"
+        "        for field, label, output in ((\"processed_through_utc_msc\", \"HISTORY_WATERMARK\", \"history_through_age_ms\"),\n"
+        "                                    (\"history_verified_utc_msc\", \"HISTORY_VERIFICATION\", \"history_verified_age_ms\")):\n"
+        "            age = stamp-frame[field]\n"
+        "            detail[output] = age\n"
+        "            if age < 0:\n"
+        "                reasons.append(label + \"_IN_FUTURE\")\n"
+        "            elif age >= 120000:\n"
+        "                reasons.append(label + \"_STALE\")\n"
+        "        detail[\"history_valid_until_utc_msc\"] = min(frame[\"processed_through_utc_msc\"],\n"
+        "                                                    frame[\"history_verified_utc_msc\"]) + 120000\n"
+        "    detail.update(ready=bool(frame and owner and _frame_ready(frame, owner, now)),\n"
+        "                  reason_codes=reasons, subreason=reasons[0] if reasons else \"FRAME_READY\")\n"
+        "    return detail\n"
+        "\n"
+        "\n"
+        "def project_gate(cursor, scope, bot, instance, *, now=None, _bindings=None, _consumers=None):\n"
         "    \"\"\"Read-only projection. CLEAR is only SL permission, never global permission.\"\"\"\n"
         "    if bot not in BOT_KINDS:\n"
         "        raise ValueError(\"unknown bot group\")\n"
         "    now = now or read_database_utc_now(cursor)\n"
         "    stamp = utc_milliseconds(now)\n"
         "    activation = read_activation(cursor, scope)\n"
-        "    bindings = read_instance_bindings(cursor, scope)\n"
+        "    bindings = read_instance_bindings(cursor, scope) if _bindings is None else _bindings\n"
         "    binding = next((r for r in bindings if r['bot_kind'] == bot and r['current_instance_id'] == instance), None)\n"
         "    registered_instances = effective_inventory(_object(activation['inventory_json']), bindings)[bot] if activation else []\n"
         "    registered = instance in registered_instances\n"
@@ -5011,7 +5218,7 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        server_now_utc_msc=stamp, valid_until_utc_msc=stamp+15000,\n"
         "        history_through_utc_msc=0, pause_until_utc_msc=0, confirmed_barrier_seq=0,\n"
         "        confirmed_client_sequence=0, run_id=\"\", reason=\"NO_VERIFIED_FRAME\")\n"
-        "    consumers = read_consumers(cursor, scope)\n"
+        "    consumers = read_consumers(cursor, scope) if _consumers is None else _consumers\n"
         "    consumer = next((r for r in consumers if r[\"bot_kind\"] == bot and r[\"instance_id\"] == instance), None)\n"
         "    if consumer:\n"
         "        gate[\"confirmed_client_sequence\"] = consumer[\"confirmed_client_sequence\"]\n"
@@ -5026,8 +5233,11 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        return gate\n"
         "    owner = SLPauseReader(cursor).read_owner(scope)\n"
         "    frame = read_frame(cursor, scope, mode) if mode != \"OFF\" else None\n"
+        "    readiness = frame_readiness_diagnostics(frame, owner, now)\n"
+        "    gate.update(frame_readiness=readiness, subreason=readiness[\"subreason\"])\n"
         "    if mode == \"OFF\":\n"
         "        gate.update(state=\"CLEAR\", reason=\"EXPLICIT_ROLLBACK\" if phase == \"ROLLBACK\" else \"NOT_ENABLED\")\n"
+        "        gate[\"subreason\"] = \"CENTRAL_GATE_DISABLED\"\n"
         "        return gate\n"
         "    if frame and owner:\n"
         "        # Keep the frame's epoch with its barrier and state/checkpoint versions,\n"
@@ -5086,7 +5296,14 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "    changes, overflow = payload[\"pending_changes\"], payload[\"changes_overflow\"]\n"
         "    validate_pending_changes(changes, seq, overflow)\n"
         "    now = _lock(cursor, scope)\n"
-        "    binding = claim_instance_slot(cursor, scope, bot, instance, payload, now)\n"
+        "    schema_available = instance_schema_available(cursor)\n"
+        "    bindings = read_instance_bindings(cursor, scope, schema_available=schema_available)\n"
+        "    binding = claim_instance_slot(cursor, scope, bot, instance, payload, now,\n"
+        "                                  bindings=bindings, schema_available=schema_available)\n"
+        "    if binding and binding.get('claimed'):\n"
+        "        # Only reuse a binding snapshot taken under this same account lock.\n"
+        "        # A newly claimed slot changed it and must be read again before projection.\n"
+        "        bindings = read_instance_bindings(cursor, scope, schema_available=schema_available)\n"
         "    cursor.execute(\"SELECT * FROM bot_param.rm_sl_consumer WHERE env=%s AND broker_server=%s AND account_login=%s AND bot_kind=%s AND instance_id=%s\", (*scope.params(), bot, instance))\n"
         "    old = SLPauseReader(cursor)._one()\n"
         "    changed_run = old and old[\"run_id\"] != payload[\"run_id\"]\n"
@@ -5109,9 +5326,17 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "        pending_changes_json=EXCLUDED.pending_changes_json,pending_changes_hash=EXCLUDED.pending_changes_hash,changes_overflow=EXCLUDED.changes_overflow,\n"
         "        applied_activation_version=EXCLUDED.applied_activation_version,\n"
         "        applied_state_version=EXCLUDED.applied_state_version,\n"
-        "        legacy_handoff_applied=EXCLUDED.legacy_handoff_applied,last_seen_at=EXCLUDED.last_seen_at\"\"\",\n"
+        "        legacy_handoff_applied=EXCLUDED.legacy_handoff_applied,last_seen_at=EXCLUDED.last_seen_at RETURNING *\"\"\",\n"
         "        (*scope.params(), bot, instance, payload[\"run_id\"], seq, confirmed, json.dumps(changes), _changes_hash(changes), overflow, av, sv, payload[\"legacy_handoff_applied\"], now))\n"
-        "    return project_gate(cursor, scope, bot, instance, now=now)\n"
+        "    persisted = SLPauseReader(cursor)._one()\n"
+        "    # Preserve the original account-wide inventory bound without copying every\n"
+        "    # consumer's potentially large pending_changes JSON on each refresh.\n"
+        "    cursor.execute('''SELECT c.instance_id FROM bot_param.rm_sl_consumer c\n"
+        "        WHERE c.env=%s AND c.broker_server=%s AND c.account_login=%s'''\n"
+        "        + _consumer_retired_filter(schema_available) + ' LIMIT 1 OFFSET 512', scope.params())\n"
+        "    if cursor.fetchone() is not None:\n"
+        "        raise ValueError(\"consumer inventory exceeds limit\")\n"
+        "    return project_gate(cursor, scope, bot, instance, now=now, _bindings=bindings, _consumers=[persisted])\n"
         "\n"
         "\n"
         "def acknowledge_notifications(cursor, scope, tokens):\n"
@@ -5363,7 +5588,7 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "\n"
         "from _opt_bot_api_embedded.rm_sl_pause_clock import BrokerClockMap, utc_datetime, utc_milliseconds, validate_policy\n"
         "from _opt_bot_api_embedded.rm_sl_pause_store import BOT_KINDS, Conflict, SLPauseReader, _integer, _text, _stored_time, _json\n"
-        "from _opt_bot_api_embedded.rm_sl_pause_service import read_database_utc_now\n"
+        "from _opt_bot_api_embedded.rm_sl_pause_service import read_database_utc_now, table_catalog_available\n"
         "from _opt_bot_api_embedded.rm_sl_pause_bootstrap import export_registered_clock\n"
         "from _opt_bot_api_embedded.rm_sl_pause_recovery import (read_recovery_snapshot, validate_baseline, SOURCE_BOTS,\n"
         "    append_policy_configuration)\n"
@@ -5390,11 +5615,8 @@ _API_EMBEDDED_MODULE_SOURCES = {
         "\n"
         "\n"
         "def runtime_schema_available(cursor):\n"
-        "    for name in (\"rm_sl_runtime_frame\", \"rm_sl_activation\", \"rm_sl_consumer\", \"rm_sl_replay_baseline\", \"rm_sl_clock_archive\", \"rm_sl_control_event\", \"rm_sl_manual_resolution\"):\n"
-        "        cursor.execute(\"SELECT to_regclass(%s) AS table_name\", (\"bot_param.\" + name,))\n"
-        "        if not SLPauseReader(cursor)._one()[\"table_name\"]:\n"
-        "            return False\n"
-        "    return True\n"
+        "    return table_catalog_available(cursor, (\"rm_sl_runtime_frame\", \"rm_sl_activation\", \"rm_sl_consumer\",\n"
+        "        \"rm_sl_replay_baseline\", \"rm_sl_clock_archive\", \"rm_sl_control_event\", \"rm_sl_manual_resolution\"))\n"
         "\n"
         "\n"
         "def _clock_compatible(old, new, origin, through):\n"
@@ -5925,6 +6147,7 @@ from _opt_bot_api_embedded.config_market_tf_validation import validate_market_tf
 from _opt_bot_api_embedded.config_market_tf_status import configuration_application_status
 from _opt_bot_api_embedded.bot_entry_diagnostics import (
     validate_entry_diagnostics, merge_runtime_diagnostics, build_bot_entry_summary,
+    sl_gate_client_observation,
 )
 from _opt_bot_api_embedded.rm_sl_pause_store import (
     Scope as SLPauseScope, SLPauseStore, Conflict as SLPauseConflict, Fenced as SLPauseFenced,
@@ -5965,7 +6188,7 @@ from pydantic import BaseModel, Field, StrictInt
 
 app = FastAPI()
 
-CODE_VERSION = "v1.22"
+CODE_VERSION = "v1.23"
 print(f"🔁 New GPT-agent — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -14392,40 +14615,41 @@ async def bot_runtime_command_next(req: BotRuntimeBaseRequest, request: Request)
     conn.autocommit = False
     try:
         with conn.cursor(cursor_factory=DictCursor) as cur:
-            cur.execute(
-                """
-                WITH next_command AS (
-                    SELECT command_id
-                      FROM bot_param.bot_command
-                     WHERE env = %s
-                       AND account_login = %s
-                       AND target_bot_kind = %s
-                       AND target_bot_id = %s
-                       AND (target_instance_id IS NULL OR target_instance_id = %s)
-                       AND status = 'queued'
-                     ORDER BY priority DESC, created_at ASC, command_id ASC
-                     LIMIT 1
-                     FOR UPDATE SKIP LOCKED
-                )
-                UPDATE bot_param.bot_command c
-                   SET status = 'leased',
-                       lease_owner = %s,
-                       leased_at = now(),
-                       ack_by_instance_id = %s,
-                       ack_at = now()
-                  FROM next_command n
-                 WHERE c.command_id = n.command_id
-                 RETURNING c.command_id,
-                           c.command_type,
-                           c.command_payload,
-                           c.target_version_no,
-                           c.status,
-                           c.priority,
-                           c.created_at
-                """,
-                (env, account_login, bot_kind, bot_id, instance_id, instance_id, instance_id),
-            )
+            # A retry after a lost response must recover this instance's lease,
+            # not claim another command. Serialize simultaneous retries too.
+            lease_key = json.dumps(["bot-command-claim", env, account_login, bot_kind, bot_id, instance_id], separators=(",", ":"))
+            lease_lock = int.from_bytes(hashlib.sha256(lease_key.encode("utf-8")).digest()[:8], "big", signed=True)
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (lease_lock,))
+            # Never SKIP a lock on our own lease: an in-flight finish can still
+            # roll back after its HTTP caller timed out. Wait for that result
+            # before deciding whether another command may be claimed.
+            cur.execute("""SELECT command_id,command_type,command_payload,target_version_no,status,priority,created_at
+                FROM bot_param.bot_command WHERE env=%s AND account_login=%s
+                AND target_bot_kind=%s AND target_bot_id=%s
+                AND (target_instance_id IS NULL OR target_instance_id=%s)
+                AND status='leased' AND lease_owner=%s AND ack_by_instance_id=%s
+                ORDER BY priority DESC,created_at ASC,command_id ASC LIMIT 1 FOR UPDATE""",
+                (env, account_login, bot_kind, bot_id, instance_id, instance_id, instance_id))
             row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    """
+                    WITH next_command AS (
+                        SELECT command_id FROM bot_param.bot_command
+                         WHERE env=%s AND account_login=%s AND target_bot_kind=%s AND target_bot_id=%s
+                           AND (target_instance_id IS NULL OR target_instance_id=%s) AND status='queued'
+                         ORDER BY priority DESC,created_at ASC,command_id ASC
+                         LIMIT 1 FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE bot_param.bot_command c
+                       SET status='leased',lease_owner=%s,leased_at=now(),ack_by_instance_id=%s,ack_at=now()
+                      FROM next_command n WHERE c.command_id=n.command_id
+                     RETURNING c.command_id,c.command_type,c.command_payload,c.target_version_no,
+                               c.status,c.priority,c.created_at
+                    """,
+                    (env, account_login, bot_kind, bot_id, instance_id, instance_id, instance_id),
+                )
+                row = cur.fetchone()
             bot_runtime_touch(cur, env, account_login, instance_id, "last_command_check_at")
             scale_response = None
             if getattr(req, "account_scale", None) is not None:
@@ -14475,7 +14699,8 @@ async def bot_runtime_command_finish(req: BotRuntimeFinishRequest, request: Requ
                        result_json = %s::jsonb,
                        error_text = %s
                  WHERE command_id = %s
-                   AND (lease_owner = %s OR ack_by_instance_id = %s)
+                   AND COALESCE(lease_owner, ack_by_instance_id) = %s
+                   AND (lease_owner IS NULL OR ack_by_instance_id IS NULL OR lease_owner = ack_by_instance_id)
                    AND status IN ('queued', 'leased')
                  RETURNING command_id,
                            env,
@@ -14484,15 +14709,26 @@ async def bot_runtime_command_finish(req: BotRuntimeFinishRequest, request: Requ
                            target_bot_id,
                            command_type,
                            target_version_no,
-                           status
+                           status, result_json, error_text, finished_at
                 """,
-                (status, result_json, req.error_text, req.command_id, instance_id, instance_id),
+                (status, result_json, req.error_text, req.command_id, instance_id),
             )
             row = cur.fetchone()
+            newly_finished = row is not None
             if not row:
-                conn.rollback()
-                return bot_runtime_json_error(404, "command not found or not leased by instance")
-            if status == "done" and row["command_type"] == "SOFT_REINIT":
+                # Finishing is durable. Return the first committed result after
+                # a lost response; never rewrite its result or completion time.
+                cur.execute("""SELECT command_id,env,account_login,target_bot_kind,target_bot_id,
+                    command_type,target_version_no,status,result_json,error_text,finished_at
+                    FROM bot_param.bot_command WHERE command_id=%s AND status=%s
+                    AND COALESCE(lease_owner,ack_by_instance_id)=%s
+                    AND (lease_owner IS NULL OR ack_by_instance_id IS NULL OR lease_owner=ack_by_instance_id)""",
+                    (req.command_id, status, instance_id))
+                row = cur.fetchone()
+                if not row:
+                    conn.rollback()
+                    return bot_runtime_json_error(404, "command not found or not leased by instance with this final status")
+            if newly_finished and status == "done" and row["command_type"] == "SOFT_REINIT":
                 bot_runtime_touch(cur, row["env"], row["account_login"], instance_id, "last_reinit_at")
         conn.commit()
         return {"ok": True, "command": dict(row), "version": CODE_VERSION}
@@ -14980,7 +15216,7 @@ async def bot_runtime_entry_diagnostics(
             gate["server_now_utc_msc"] = max(gate["server_now_utc_msc"], observed_now * 1000)
             if (gate["mode"] == "ENFORCE" and gate.get("reason") != "INSTANCE_RETIRED"
                     and gate["valid_until_utc_msc"] <= (observed_now + 1) * 1000):
-                gate.update(state="UNKNOWN", reason="GATE_OBSERVATION_EXPIRED")
+                gate.update(state="UNKNOWN", reason="GATE_OBSERVATION_EXPIRED", subreason="GATE_OBSERVATION_EXPIRED")
         expected = [{"env": env, "broker_server": broker_server, "account_login": account_login,
                      "bot_kind": bot_kind, "instance_id": gate["instance_id"]} for gate in gates]
         summary = build_bot_entry_summary(rows, bot_kind=bot_kind, now_epoch=observed_now, sl_records=sl_records,
@@ -15047,11 +15283,26 @@ async def bot_runtime_entry_diagnostics(
                     if instance_id in replaced_anchors:
                         gate["replaced_by_instance_id"] = replaced_anchors[instance_id]
                 instance["sl_pause_gate"] = gate
+                instance["sl_pause_server_projection"] = gate
                 if gate["mode"] == "ENFORCE" and not retired:
                     if gate["state"] == "PAUSED" or gate["reason"] == "ACTIVATION_PREPARE":
                         instance["entry_permission"] = "blocked"
                     elif (gate["state"] != "CLEAR" or not gate["activation_ready"]) and instance["entry_permission"] != "blocked":
                         instance["entry_permission"] = "unknown"
+            client_observation = sl_gate_client_observation(
+                observed_instances.get(instance_id, {}).get("runtime_json"), now_epoch=observed_now,
+                current_run_id=consumer.get("run_id") if consumer else None,
+                run_verified=instance["run_verified"], contact_fresh=runtime_fresh,
+                lifecycle_status=lifecycle)
+            instance["sl_pause_client_observation"] = client_observation
+            if client_observation["effective_block"]:
+                instance["entry_permission"] = "blocked"
+            elif (not client_observation["current"] and instance["entry_permission"] == "allowed"
+                  and client_observation["observation"].get("required") is True
+                  and client_observation["observation"].get("mode") == "ENFORCE"):
+                # A fresh server projection cannot stand in for evidence that
+                # this run actually received it. Other known blocks stay intact.
+                instance["entry_permission"] = "unknown"
         summary["coverage"]["inventory_complete"] = complete
         summary["coverage"].update(
             expected_instance_ids=sorted(expected_ids),
